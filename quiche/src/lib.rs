@@ -9502,6 +9502,8 @@ mod cid;
 mod crypto;
 mod dgram;
 mod error;
+#[cfg(feature = "doq")]
+pub mod doq;
 #[cfg(feature = "ffi")]
 mod ffi;
 mod flowcontrol;

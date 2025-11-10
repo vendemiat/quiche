@@ -54,6 +54,8 @@ internal = []
 
 # Enable qlog support with serde_json for extension data
 qlog = ["dep:qlog", "dep:serde", "dep:serde_json", "dep:serde_with"]
+# DNS over QUIC (DoQ) support as specified in RFC 9250.
+doq = []
 
 [package.metadata.release]
 tag-prefix = ""
@@ -93,6 +95,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+domain = "0.11"
+env_logger = { workspace = true }
 mio = { workspace = true, features = ["net", "os-poll"] }
 ring = { workspace = true }
 rstest = { workspace = true }
@@ -100,3 +104,18 @@ url = { workspace = true }
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
+
+[[example]]
+name = "doq-client"
+path = "examples/doq-client.rs"
+required-features = ["doq"]
+
+[[example]]
+name = "doq-server"
+path = "examples/doq-server.rs"
+required-features = ["doq"]
+
+[[example]]
+name = "doq-zone-transfer"
+path = "examples/doq-zone-transfer.rs"
+required-features = ["doq"]
