@@ -32,10 +32,7 @@ use domain::base::iana::{Class, Opcode, Rcode, Rtype};
 use domain::base::name::Name;
 use domain::base::{Message, MessageBuilder, Question};
 
-// Re-export types from domain crate that are used in examples
-pub use domain::base::iana::{
-    Opcode as DnsOpcode, Rcode as DnsRcode, Rtype as DnsRtype,
-};
+
 
 /// Parse a DNS message using the domain crate.
 fn parse_domain_message(data: &[u8]) -> Result<Message<&[u8]>, String> {

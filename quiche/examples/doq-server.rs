@@ -43,6 +43,8 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
+use domain::base::iana::Rcode;
+
 struct PartialDnsQuery {
     data: Vec<u8>,
     expected_len: Option<usize>,
@@ -506,7 +508,7 @@ fn handle_dns_query(
                     );
                     // Send REFUSED response.
                     let response =
-                        build_dns_response(query, DnsRcode::masked_from_int(5))
+                        build_dns_response(query, Rcode::masked_from_int(5))
                             .unwrap_or_else(|_| vec![]);
                     send_dns_response(client, stream_id, &response);
                     return;
@@ -528,7 +530,7 @@ fn handle_dns_query(
 
     // For this example, we'll send a simple NXDOMAIN response.
     // In a real implementation, you would process the query and generate appropriate responses.
-    let response = build_dns_response(query, DnsRcode::masked_from_int(3))
+    let response = build_dns_response(query, Rcode::masked_from_int(3))
         .unwrap_or_else(|e| {
             error!("{} failed to build response: {}", conn_id, e);
             vec![]

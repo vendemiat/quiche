@@ -42,9 +42,11 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
+use domain::base::iana::Rtype;
+
 struct ZoneTransfer {
     zone: String,
-    transfer_type: DnsRtype,
+    transfer_type: Rtype,
     start_time: std::time::Instant,
     messages_received: usize,
     total_bytes: usize,
@@ -73,8 +75,8 @@ fn main() {
     let transfer_type_str = args.next().unwrap_or_else(|| "AXFR".to_string());
 
     let transfer_type = match transfer_type_str.to_uppercase().as_str() {
-        "AXFR" => DnsRtype::AXFR,
-        "IXFR" => DnsRtype::IXFR,
+        "AXFR" => Rtype::AXFR,
+        "IXFR" => Rtype::IXFR,
         _ => {
             eprintln!(
                 "Invalid transfer type: {} (use AXFR or IXFR)",

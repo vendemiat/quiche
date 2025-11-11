@@ -42,9 +42,11 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
+use domain::base::iana::Rtype;
+
 struct PendingQuery {
     domain: String,
-    qtype: DnsRtype,
+    qtype: Rtype,
     start_time: std::time::Instant,
 }
 
@@ -73,16 +75,16 @@ fn main() {
     let qtype_str = args.next().unwrap_or_else(|| "A".to_string());
 
     let qtype = match qtype_str.to_uppercase().as_str() {
-        "A" => DnsRtype::A,
-        "AAAA" => DnsRtype::AAAA,
-        "NS" => DnsRtype::NS,
-        "CNAME" => DnsRtype::CNAME,
-        "SOA" => DnsRtype::SOA,
-        "PTR" => DnsRtype::PTR,
-        "MX" => DnsRtype::MX,
-        "TXT" => DnsRtype::TXT,
-        "SRV" => DnsRtype::SRV,
-        "ANY" => DnsRtype::ANY,
+        "A" => Rtype::A,
+        "AAAA" => Rtype::AAAA,
+        "NS" => Rtype::NS,
+        "CNAME" => Rtype::CNAME,
+        "SOA" => Rtype::SOA,
+        "PTR" => Rtype::PTR,
+        "MX" => Rtype::MX,
+        "TXT" => Rtype::TXT,
+        "SRV" => Rtype::SRV,
+        "ANY" => Rtype::ANY,
         _ => {
             eprintln!("Unsupported query type: {}", qtype_str);
             return;
