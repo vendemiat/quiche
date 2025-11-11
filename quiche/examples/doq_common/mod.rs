@@ -32,8 +32,6 @@ use domain::base::iana::{Class, Opcode, Rcode, Rtype};
 use domain::base::name::Name;
 use domain::base::{Message, MessageBuilder, Question};
 
-
-
 /// Parse a DNS message using the domain crate.
 fn parse_domain_message(data: &[u8]) -> Result<Message<&[u8]>, String> {
     Message::from_octets(data)
@@ -114,32 +112,10 @@ impl DnsMessageInfo {
         Ok(msg.header().id())
     }
 
-    /// Check if message ID is zero as required by DoQ.
-    pub fn verify_doq_id(data: &[u8]) -> Result<(), String> {
-        let id = Self::get_id(data)?;
-        if id != 0 {
-            Err(format!("DoQ requires message ID to be 0, got {}", id))
-        } else {
-            Ok(())
-        }
-    }
-
     /// Get response code from a DNS response.
     pub fn get_response_code(data: &[u8]) -> Result<Rcode, String> {
         let msg = parse_domain_message(data)?;
         Ok(msg.header().rcode())
-    }
-
-    /// Check if this is a response message.
-    pub fn is_response(data: &[u8]) -> Result<bool, String> {
-        let msg = parse_domain_message(data)?;
-        Ok(msg.header().qr())
-    }
-
-    /// Get query count.
-    pub fn get_query_count(data: &[u8]) -> Result<u16, String> {
-        let msg = parse_domain_message(data)?;
-        Ok(msg.header_counts().qdcount())
     }
 
     /// Get answer count.
