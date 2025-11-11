@@ -46,7 +46,6 @@ use domain::base::iana::Rtype;
 
 struct ZoneTransfer {
     zone: String,
-    transfer_type: Rtype,
     start_time: std::time::Instant,
     messages_received: usize,
     total_bytes: usize,
@@ -251,7 +250,6 @@ fn main() {
                         stream_id,
                         ZoneTransfer {
                             zone: zone.clone(),
-                            transfer_type,
                             start_time: std::time::Instant::now(),
                             messages_received: 0,
                             total_bytes: 0,
