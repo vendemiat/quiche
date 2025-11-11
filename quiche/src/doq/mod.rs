@@ -38,16 +38,30 @@ pub const DOQ_ALPN: &[u8] = b"doq";
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u64)]
 pub enum DoqError {
+    /// No error. See RFC 9250 Section 4.3 (DOQ_NO_ERROR).
     NoError = 0x0,
+
+    /// Implementation error. See RFC 9250 Section 4.3 (DOQ_INTERNAL_ERROR).
     InternalError = 0x1,
+
+    /// Protocol error. See RFC 9250 Section 4.3 (DOQ_PROTOCOL_ERROR).
     ProtocolError = 0x2,
+
+    /// Request cancelled. See RFC 9250 Section 4.3 (DOQ_REQUEST_CANCELLED).
     RequestCancelled = 0x3,
+
+    /// Excessive load. See RFC 9250 Section 4.3 (DOQ_EXCESSIVE_LOAD).
     ExcessiveLoad = 0x4,
+
+    /// Unspecified error. See RFC 9250 Section 4.3 (DOQ_UNSPECIFIED_ERROR).
     UnspecifiedError = 0x5,
+
+    /// Reserved for tests. See RFC 9250 Section 4.3 (DOQ_ERROR_RESERVED).
     ErrorReserved = 0xd098ea5e,
 }
 
 impl DoqError {
+    /// Convert the error to its wire format representation.
     pub fn to_wire(self) -> u64 {
         self as u64
     }
