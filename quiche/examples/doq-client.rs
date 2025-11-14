@@ -39,11 +39,11 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 
 use quiche::doq::*;
 
+use core::str::FromStr;
+use domain::base::{iana::Rtype, Message};
+
 mod doq_common;
 use doq_common::build_dns_query;
-
-use core::str::FromStr;
-use domain::base::{iana::Rtype, message::Message};
 
 struct PendingQuery {
     domain: String,

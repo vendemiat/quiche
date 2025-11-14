@@ -28,33 +28,31 @@
 
 use std::str::FromStr;
 
-use domain::base::iana::{Class, Opcode, Rcode, Rtype};
+use domain::base::iana::{Class, Rcode, Rtype};
 use domain::base::name::Name;
-use domain::base::{Message, MessageBuilder, Question};
+use domain::base::{Message, MessageBuilder};
 
 // TODO use domain crate builder functions instead of passing around [u8]
 
 /// Build a DNS query using the domain crate.
+#[allow(unused)]
 pub fn build_dns_query(
     domain: &str, query_type: Rtype,
-) -> Result<Vec<u8>, String> {
+) -> anyhow::Result<Vec<u8>> {
     let mut builder = MessageBuilder::new_vec();
 
     // Set header
-    builder.header_mut().set_id(0); // DoQ requires ID to be 0
-    builder.header_mut().set_opcode(Opcode::from_int(0)); // QUERY
-    builder.header_mut().set_rd(true); // Recursion desired
+    let h = builder.header_mut();
+    h.set_id(0); // DoQ requires ID to be 0
+    h.set_rd(true); // Recursion desired
 
     // Move to question section
     let mut question_builder = builder.question();
 
     // Add the question
-    let domain_name = Name::<Vec<u8>>::from_str(domain)
-        .map_err(|e| format!("Invalid domain name: {}", e))?;
+    let domain_name = Name::<Vec<u8>>::from_str(domain)?;
 
-    question_builder
-        .push(Question::new(domain_name, query_type, Class::IN))
-        .map_err(|e| format!("Failed to add question: {}", e))?;
+    question_builder.push((domain_name, query_type, Class::IN))?;
 
     // Get the message
     let message = question_builder.finish();
@@ -62,33 +60,17 @@ pub fn build_dns_query(
 }
 
 /// Build a DNS response with a specific rcode.
-pub fn build_dns_response(query: &[u8], rcode: Rcode) -> Result<Vec<u8>, String> {
+#[allow(unused)]
+pub fn build_dns_response(query: &[u8], rcode: Rcode) -> anyhow::Result<Vec<u8>> {
     // Parse the query
-    let query_msg = Message::from_octets(query)
-        .map_err(|e| format!("Failed to parse DNS message: {}", e))?;
+    let query_msg = Message::from_octets(query)?;
+    let query_h = query_msg.header();
 
     // Build response
-    let mut builder = MessageBuilder::new_vec();
-
-    // Copy header fields and set response fields
-    builder.header_mut().set_id(0); // DoQ requires ID to be 0
-    builder.header_mut().set_qr(true); // This is a response
-    builder.header_mut().set_opcode(query_msg.header().opcode());
-    builder.header_mut().set_rd(query_msg.header().rd());
-    builder.header_mut().set_rcode(rcode);
-
-    // Move to question section and copy questions
-    let mut response_builder = builder.question();
-
-    for question in query_msg.question() {
-        let q =
-            question.map_err(|e| format!("Failed to read question: {}", e))?;
-        response_builder
-            .push(q)
-            .map_err(|e| format!("Failed to add question: {}", e))?;
-    }
+    let mut builder =
+        MessageBuilder::new_vec().start_answer(&query_msg, Rcode::NXDOMAIN)?;
 
     // Get the message
-    let message = response_builder.finish();
+    let message = builder.finish();
     Ok(message)
 }
