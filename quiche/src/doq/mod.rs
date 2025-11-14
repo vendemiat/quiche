@@ -24,67 +24,50 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! DNS over QUIC (DoQ) support module.
+//! DNS over QUIC (DoQ) support.
 
-use std::fmt;
 use std::io::Write;
+use thiserror::Error;
 
-/// Errors that can occur in DoQ operations.
-#[derive(Debug)]
-pub enum Error {
-    /// Not enough data to read the DNS message length field.
-    LenDataIncomplete,
-
-    /// Not enough data for the complete DNS message.
-    DNSMessageIncomplete,
-
-    /// DNS message exceeds maximum allowed size (65535 bytes).
-    DNSMessageTooLarge,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::LenDataIncomplete => write!(f, "incomplete length data"),
-            Error::DNSMessageIncomplete => write!(f, "DNS message incomplete"),
-            Error::DNSMessageTooLarge => {
-                write!(f, "DNS message too large (max 65535 bytes)")
-            },
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-/// The default port for DNS over QUIC (DoQ) as specified in RFC 9250.
-pub const DOQ_PORT: u16 = 853;
-
-/// The ALPN token for DoQ as specified in RFC 9250.
+/// The ALPN token for DoQ as specified in
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.1>
 pub const DOQ_ALPN: &[u8] = b"doq";
 
-/// DoQ error codes as specified in RFC 9250 Section 4.3.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The default port for DNS over QUIC (DoQ) as specified in
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.1.1>
+pub const DOQ_PORT: u16 = 853;
+
+/// DoQ error codes as specified in
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3>
+#[derive(Debug, Error, Clone, Copy, PartialEq)]
 #[repr(u64)]
 pub enum DoqError {
-    /// No error. See RFC 9250 Section 4.3 (DOQ_NO_ERROR).
+    /// see RFC9250 section 4.3 DOQ_NO_ERROR
+    #[error("see RFC9250 section 4.3 DOQ_NO_ERROR")]
     NoError = 0x0,
 
-    /// Implementation error. See RFC 9250 Section 4.3 (DOQ_INTERNAL_ERROR).
+    /// see RFC9250 section 4.3 DOQ_INTERNAL_ERROR
+    #[error("see RFC9250 section 4.3 DOQ_INTERNAL_ERROR")]
     InternalError = 0x1,
 
-    /// Protocol error. See RFC 9250 Section 4.3 (DOQ_PROTOCOL_ERROR).
+    /// see RFC9250 section 4.3 DOQ_PROTOCOL_ERROR
+    #[error("see RFC9250 section 4.3 DOQ_PROTOCOL_ERROR")]
     ProtocolError = 0x2,
 
-    /// Request cancelled. See RFC 9250 Section 4.3 (DOQ_REQUEST_CANCELLED).
+    /// see RFC9250 section 4.3 DOQ_REQUEST_CANCELLED
+    #[error("see RFC9250 section 4.3 DOQ_REQUEST_CANCELLED")]
     RequestCancelled = 0x3,
 
-    /// Excessive load. See RFC 9250 Section 4.3 (DOQ_EXCESSIVE_LOAD).
+    /// see RFC9250 section 4.3 DOQ_EXCESSIVE_LOAD
+    #[error("see RFC9250 section 4.3 DOQ_EXCESSIVE_LOAD")]
     ExcessiveLoad = 0x4,
 
-    /// Unspecified error. See RFC 9250 Section 4.3 (DOQ_UNSPECIFIED_ERROR).
+    /// see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR
+    #[error("see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR")]
     UnspecifiedError = 0x5,
 
-    /// Reserved for tests. See RFC 9250 Section 4.3 (DOQ_ERROR_RESERVED).
+    /// see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR
+    #[error("see RFC9250 section 4.3 DOQ_ERROR_RESERVED")]
     ErrorReserved = 0xd098ea5e,
 }
 
@@ -95,7 +78,24 @@ impl DoqError {
     }
 }
 
+/// DoQ read/write error codes.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// length is less than 2 bytes
+    #[error("length is less than 2 bytes")]
+    LenDataIncomplete,
+
+    /// DNS message is less than specified length
+    #[error("DNS message is less than specified length")]
+    DNSMessageIncomplete,
+
+    /// DNS message is too large (max 65535 bytes)
+    #[error("DNS message is too large (max 65535 bytes)")]
+    DNSMessageTooLarge,
+}
+
 /// DNS opcodes that are considered replayable for 0-RTT.
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>
 pub fn is_replayable_opcode(opcode: u8) -> bool {
     // QUERY (0) and NOTIFY (4) are safe for 0-RTT
     matches!(opcode, 0 | 4)
