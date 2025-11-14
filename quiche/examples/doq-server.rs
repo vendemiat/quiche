@@ -43,7 +43,7 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
-use domain::base::iana::Rcode;
+use domain::base::{iana::Rcode, message::Message};
 
 struct PartialDnsQuery {
     data: Vec<u8>,
@@ -98,10 +98,10 @@ fn main() {
 
     // Load certificate and key (using the example certificates).
     config
-        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .load_cert_chain_from_pem_file("quiche/examples/cert.crt")
         .unwrap();
     config
-        .load_priv_key_from_pem_file("examples/cert.key")
+        .load_priv_key_from_pem_file("quiche/examples/cert.key")
         .unwrap();
 
     config.set_max_idle_timeout(30000); // 30 seconds
@@ -483,42 +483,26 @@ fn handle_dns_query(
     client: &mut Client, stream_id: u64, query: &[u8], is_early_data: bool,
 ) {
     let conn_id = client.conn.trace_id().to_string();
+    let msg = Message::from_octets(query).unwrap();
+    let id = msg.header().id();
+    let opcode = msg.header().opcode();
 
     // Check message ID.
-    match DnsMessageInfo::get_id(query) {
-        Ok(id) => {
-            if id != 0 {
-                warn!("{} received DNS query with non-zero ID: {}", conn_id, id);
-            }
-        },
-        Err(e) => {
-            error!("{} failed to get DNS ID: {}", conn_id, e);
-            return;
-        },
+    if id != 0 {
+        warn!("{} received DNS query with non-zero ID: {}", conn_id, id);
     }
 
     // Check opcode for 0-RTT.
-    if is_early_data {
-        match DnsMessageInfo::get_opcode(query) {
-            Ok(opcode) => {
-                if !is_replayable_opcode(opcode.into()) {
-                    error!(
-                        "{} non-replayable opcode {:?} in 0-RTT data",
-                        conn_id, opcode
-                    );
-                    // Send REFUSED response.
-                    let response =
-                        build_dns_response(query, Rcode::masked_from_int(5))
-                            .unwrap_or_else(|_| vec![]);
-                    send_dns_response(client, stream_id, &response);
-                    return;
-                }
-            },
-            Err(e) => {
-                error!("{} failed to get DNS opcode: {}", conn_id, e);
-                return;
-            },
-        }
+    if is_early_data && !is_replayable_opcode(opcode.into()) {
+        error!(
+            "{} non-replayable opcode {:?} in 0-RTT data",
+            conn_id, opcode
+        );
+        // Send REFUSED response.
+        let response = build_dns_response(query, Rcode::masked_from_int(5))
+            .unwrap_or_else(|_| vec![]);
+        send_dns_response(client, stream_id, &response);
+        return;
     }
 
     info!(

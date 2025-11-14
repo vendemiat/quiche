@@ -40,9 +40,10 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 use quiche::doq::*;
 
 mod doq_common;
-use doq_common::*;
+use doq_common::build_dns_query;
 
-use domain::base::iana::Rtype;
+use core::str::FromStr;
+use domain::base::{iana::Rtype, message::Message};
 
 struct PendingQuery {
     domain: String,
@@ -74,22 +75,7 @@ fn main() {
     let domain = args.next().unwrap();
     let qtype_str = args.next().unwrap_or_else(|| "A".to_string());
 
-    let qtype = match qtype_str.to_uppercase().as_str() {
-        "A" => Rtype::A,
-        "AAAA" => Rtype::AAAA,
-        "NS" => Rtype::NS,
-        "CNAME" => Rtype::CNAME,
-        "SOA" => Rtype::SOA,
-        "PTR" => Rtype::PTR,
-        "MX" => Rtype::MX,
-        "TXT" => Rtype::TXT,
-        "SRV" => Rtype::SRV,
-        "ANY" => Rtype::ANY,
-        _ => {
-            eprintln!("Unsupported query type: {}", qtype_str);
-            return;
-        },
-    };
+    let qtype = Rtype::from_str(&qtype_str).unwrap();
 
     // Parse server address, defaulting to DoQ port
     let server_addr = if server_str.contains(':') && !server_str.starts_with('[')
@@ -323,38 +309,36 @@ fn main() {
 
                 // Parse the DNS response.
                 match read_dns_message(&stream_buf) {
-                    Ok((dns_data, _)) => {
-                        match DnsMessageInfo::get_id(dns_data) {
-                            Ok(id) if id != 0 => {
+                    Ok((dns_data, _)) => match Message::from_octets(dns_data) {
+                        Ok(msg) => {
+                            let id = msg.header().id();
+                            if id != 0 {
                                 warn!(
                                     "Received DNS response with non-zero ID: {}",
                                     id
                                 );
-                            },
-                            _ => {},
-                        }
-
-                        println!(
-                            "\nDNS Response for {} ({}):",
-                            query_info.domain, query_info.qtype
-                        );
-                        println!("  Response time: {:?}", elapsed);
-
-                        // Use the domain crate to parse and display response
-                        match DnsFormatter::format_message(dns_data) {
-                            Ok(formatted) => {
-                                println!("{}", formatted);
-                            },
-                            Err(e) => {
-                                error!("Failed to format DNS response: {}", e);
-                            },
-                        }
+                            }
+                            info!(
+                                "\nDNS Response for {} {}:",
+                                query_info.domain, query_info.qtype
+                            );
+                            println!(
+                                "{}",
+                                Message::from_octets(dns_data)
+                                    .unwrap()
+                                    .display_dig_style()
+                            );
+                        },
+                        Err(e) => {
+                            error!("Failed to parse DNS message: {}", e);
+                        },
                     },
                     Err(e) => {
-                        error!("Failed to parse DNS message: {}", e);
+                        error!("read_dns_message error: {}", e);
                     },
                 }
 
+                println!(";; Response time: {:?}", elapsed);
                 // Close the connection after receiving the response.
                 info!("Response received, closing connection");
                 conn.close(true, DoqError::NoError.to_wire(), b"done").ok();

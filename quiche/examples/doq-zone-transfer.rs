@@ -42,7 +42,7 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
-use domain::base::iana::Rtype;
+use domain::base::{iana::Rtype, message::Message};
 
 struct ZoneTransfer {
     zone: String,
@@ -61,11 +61,11 @@ fn main() {
     let cmd = &args.next().unwrap();
 
     if args.len() < 2 {
-        println!("Usage: {cmd} <server> <zone> [AXFR|IXFR]");
+        println!("Usage: {cmd} <server:port> <zone> [AXFR|IXFR]");
         println!();
         println!("Examples:");
-        println!("  {cmd} 127.0.0.1 example.com AXFR");
-        println!("  {cmd} 127.0.0.1 example.com IXFR");
+        println!("  {cmd} 127.0.0.1:853 example.com AXFR");
+        println!("  {cmd} 127.0.0.1:853 example.com IXFR");
         return;
     }
 
@@ -85,10 +85,20 @@ fn main() {
         },
     };
 
-    // Parse server address.
-    let peer_addr = match format!("{}:{}", server_str, DOQ_PORT)
-        .parse::<std::net::SocketAddr>()
+    // Parse server address, defaulting to DoQ port
+    let server_addr = if server_str.contains(':') && !server_str.starts_with('[')
     {
+        // IPv4 with port or IPv6 without brackets
+        server_str.parse::<std::net::SocketAddr>()
+    } else if server_str.starts_with('[') {
+        // IPv6 with brackets
+        server_str.parse::<std::net::SocketAddr>()
+    } else {
+        // Just an IP address, add default DoQ port
+        format!("{}:{}", server_str, DOQ_PORT).parse::<std::net::SocketAddr>()
+    };
+
+    let peer_addr = match server_addr {
         Ok(addr) => addr,
         Err(e) => {
             eprintln!("Failed to parse server address: {}", e);
@@ -298,34 +308,28 @@ fn main() {
                             pos += consumed;
                             transfer.messages_received += 1;
 
-                            match DnsMessageInfo::get_response_code(dns_data) {
-                                Ok(rcode) if rcode.to_int() != 0 => {
-                                    eprintln!(
-                                        "Transfer failed with error: {}",
-                                        format_rcode(rcode)
-                                    );
-                                    conn.close(
-                                        true,
-                                        DoqError::NoError.to_wire(),
-                                        b"done",
-                                    )
-                                    .ok();
-                                    break;
-                                },
-                                Ok(_) => {
-                                    if let Ok(answer_count) =
-                                        DnsMessageInfo::get_answer_count(dns_data)
-                                    {
-                                        debug!(
-                                            "Received zone transfer message {} ({} answers)",
-                                            transfer.messages_received, answer_count
-                                        );
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Failed to parse DNS response: {}", e);
-                                },
+                            let msg = Message::from_octets(dns_data).unwrap();
+                            let rcode = msg.header().rcode();
+                            let answer_count = msg.header_counts().ancount();
+
+                            if rcode.to_int() != 0 {
+                                eprintln!(
+                                    "Transfer failed with rcode: {}",
+                                    rcode
+                                );
+                                conn.close(
+                                    true,
+                                    DoqError::NoError.to_wire(),
+                                    b"done",
+                                )
+                                .ok();
+                                break;
                             }
+
+                            debug!(
+                                "Received zone transfer message {} ({} answers)",
+                                transfer.messages_received, answer_count
+                            );
                         },
                         Err(e) => {
                             if is_fin {
