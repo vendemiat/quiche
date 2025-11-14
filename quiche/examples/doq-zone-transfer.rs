@@ -293,7 +293,7 @@ fn main() {
                 // Parse potentially multiple DNS messages in the stream.
                 let mut pos = 0;
                 while pos < stream_buf.len() {
-                    match parse_dns_message(&stream_buf[pos..]) {
+                    match read_dns_message(&stream_buf[pos..]) {
                         Ok((dns_data, consumed)) => {
                             pos += consumed;
                             transfer.messages_received += 1;

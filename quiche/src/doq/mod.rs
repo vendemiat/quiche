@@ -26,7 +26,35 @@
 
 //! DNS over QUIC (DoQ) support module.
 
+use std::fmt;
 use std::io::Write;
+
+/// Errors that can occur in DoQ operations.
+#[derive(Debug)]
+pub enum Error {
+    /// Not enough data to read the DNS message length field.
+    LenDataIncomplete,
+
+    /// Not enough data for the complete DNS message.
+    DNSMessageIncomplete,
+
+    /// DNS message exceeds maximum allowed size (65535 bytes).
+    DNSMessageTooLarge,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::LenDataIncomplete => write!(f, "incomplete length data"),
+            Error::DNSMessageIncomplete => write!(f, "DNS message incomplete"),
+            Error::DNSMessageTooLarge => {
+                write!(f, "DNS message too large (max 65535 bytes)")
+            },
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// The default port for DNS over QUIC (DoQ) as specified in RFC 9250.
 pub const DOQ_PORT: u16 = 853;
@@ -73,21 +101,17 @@ pub fn is_replayable_opcode(opcode: u8) -> bool {
     matches!(opcode, 0 | 4)
 }
 
-/// Parse a DNS message with the 2-octet length prefix.
+/// Read a DNS message with the 2-octet length prefix.
 /// Returns the DNS message without the length prefix and the number of bytes consumed.
-pub fn parse_dns_message(data: &[u8]) -> Result<(&[u8], usize), String> {
+pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), Error> {
     if data.len() < 2 {
-        return Err("Insufficient data for length field".to_string());
+        return Err(Error::LenDataIncomplete);
     }
 
     let length = u16::from_be_bytes([data[0], data[1]]) as usize;
 
     if data.len() < 2 + length {
-        return Err(format!(
-            "Insufficient data for DNS message: expected {}, got {}",
-            length,
-            data.len() - 2
-        ));
+        return Err(Error::DNSMessageIncomplete);
     }
 
     Ok((&data[2..2 + length], 2 + length))
@@ -96,12 +120,9 @@ pub fn parse_dns_message(data: &[u8]) -> Result<(&[u8], usize), String> {
 /// Write a DNS message with the 2-octet length prefix.
 pub fn write_dns_message<W: Write>(
     writer: &mut W, dns_data: &[u8],
-) -> Result<(), std::io::Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     if dns_data.len() > 65535 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "DNS message too large",
-        ));
+        return Err(Box::new(Error::DNSMessageTooLarge));
     }
 
     let length = (dns_data.len() as u16).to_be_bytes();

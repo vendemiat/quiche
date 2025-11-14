@@ -322,7 +322,7 @@ fn main() {
                 );
 
                 // Parse the DNS response.
-                match parse_dns_message(&stream_buf) {
+                match read_dns_message(&stream_buf) {
                     Ok((dns_data, _)) => {
                         match DnsMessageInfo::get_id(dns_data) {
                             Ok(id) if id != 0 => {

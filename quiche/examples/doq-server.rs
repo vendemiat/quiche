@@ -460,7 +460,7 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
     client.partial_queries.remove(&stream_id);
 
     // Parse and handle the DNS query.
-    match parse_dns_message(&stream_data) {
+    match read_dns_message(&stream_data) {
         Ok((dns_query, _)) => {
             handle_dns_query(client, stream_id, dns_query, is_early_data);
         },
