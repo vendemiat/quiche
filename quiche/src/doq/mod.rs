@@ -80,7 +80,7 @@ impl DoqError {
 
 /// DoQ read/write error codes.
 #[derive(Debug, Error)]
-pub enum Error {
+pub enum RWError {
     /// length is less than 2 bytes
     #[error("length is less than 2 bytes")]
     LenDataIncomplete,
@@ -92,6 +92,10 @@ pub enum Error {
     /// DNS message is too large (max 65535 bytes)
     #[error("DNS message is too large (max 65535 bytes)")]
     DNSMessageTooLarge,
+
+    /// IO error
+    #[error("IO error: {0}")]
+    IOError(#[from] std::io::Error),
 }
 
 /// DNS opcodes that are considered replayable for 0-RTT.
@@ -103,15 +107,15 @@ pub fn is_replayable_opcode(opcode: u8) -> bool {
 
 /// Read a DNS message with the 2-octet length prefix.
 /// Returns the DNS message without the length prefix and the number of bytes consumed.
-pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), Error> {
+pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), RWError> {
     if data.len() < 2 {
-        return Err(Error::LenDataIncomplete);
+        return Err(RWError::LenDataIncomplete);
     }
 
     let length = u16::from_be_bytes([data[0], data[1]]) as usize;
 
     if data.len() < 2 + length {
-        return Err(Error::DNSMessageIncomplete);
+        return Err(RWError::DNSMessageIncomplete);
     }
 
     Ok((&data[2..2 + length], 2 + length))
@@ -120,9 +124,9 @@ pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), Error> {
 /// Write a DNS message with the 2-octet length prefix.
 pub fn write_dns_message<W: Write>(
     writer: &mut W, dns_data: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RWError> {
     if dns_data.len() > 65535 {
-        return Err(Box::new(Error::DNSMessageTooLarge));
+        return Err(RWError::DNSMessageTooLarge);
     }
 
     let length = (dns_data.len() as u16).to_be_bytes();
