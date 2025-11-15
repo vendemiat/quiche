@@ -134,3 +134,179 @@ pub fn write_dns_message<W: Write>(
     writer.write_all(dns_data)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_replayable_opcode() {
+        // QUERY (0) is replayable
+        assert!(is_replayable_opcode(0));
+
+        // NOTIFY (4) is replayable
+        assert!(is_replayable_opcode(4));
+
+        // Other opcodes are not replayable (opcode is 4-bit, max value 15)
+        assert!(!is_replayable_opcode(1)); // IQUERY
+        assert!(!is_replayable_opcode(2)); // STATUS
+        assert!(!is_replayable_opcode(3)); // Reserved
+        assert!(!is_replayable_opcode(5)); // UPDATE
+        assert!(!is_replayable_opcode(6)); // DNS Stateful Operations
+        assert!(!is_replayable_opcode(15)); // Max opcode value
+    }
+
+    #[test]
+    fn test_read_dns_message_success() {
+        // Valid DNS message: length prefix (0x00, 0x05) + 5 bytes of data
+        let data = vec![0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+
+        let result = read_dns_message(&data);
+        assert!(result.is_ok());
+
+        let (dns_msg, consumed) = result.unwrap();
+        assert_eq!(dns_msg, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn test_read_dns_message_zero_length() {
+        // Valid zero-length message
+        let data = vec![0x00, 0x00];
+
+        let result = read_dns_message(&data);
+        assert!(result.is_ok());
+
+        let (dns_msg, consumed) = result.unwrap();
+        assert_eq!(dns_msg.len(), 0);
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn test_read_dns_message_max_length() {
+        // Maximum length (65535 bytes)
+        let mut data = vec![0xFF, 0xFF];
+        data.extend(vec![0xAA; 65535]);
+
+        let result = read_dns_message(&data);
+        assert!(result.is_ok());
+
+        let (dns_msg, consumed) = result.unwrap();
+        assert_eq!(dns_msg.len(), 65535);
+        assert_eq!(consumed, 65537);
+    }
+
+    #[test]
+    fn test_read_dns_message_incomplete_length() {
+        // Only 1 byte - can't read length prefix
+        let data = vec![0x00];
+
+        let result = read_dns_message(&data);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RWError::LenDataIncomplete => {},
+            _ => panic!("Expected LenDataIncomplete error"),
+        }
+    }
+
+    #[test]
+    fn test_read_dns_message_empty_data() {
+        // Empty data
+        let data = vec![];
+
+        let result = read_dns_message(&data);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RWError::LenDataIncomplete => {},
+            _ => panic!("Expected LenDataIncomplete error"),
+        }
+    }
+
+    #[test]
+    fn test_read_dns_message_incomplete_message() {
+        // Length says 10 bytes, but only 5 bytes provided
+        let data = vec![0x00, 0x0A, 0x01, 0x02, 0x03, 0x04, 0x05];
+
+        let result = read_dns_message(&data);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RWError::DNSMessageIncomplete => {},
+            _ => panic!("Expected DNSMessageIncomplete error"),
+        }
+    }
+
+    #[test]
+    fn test_read_dns_message_with_trailing_data() {
+        // Valid message with extra trailing data
+        let data =
+            vec![0x00, 0x03, 0x01, 0x02, 0x03, 0xFF, 0xFF, 0xFF, 0xFF];
+
+        let result = read_dns_message(&data);
+        assert!(result.is_ok());
+
+        let (dns_msg, consumed) = result.unwrap();
+        assert_eq!(dns_msg, &[0x01, 0x02, 0x03]);
+        assert_eq!(consumed, 5); // Only consumed the actual message
+    }
+
+    #[test]
+    fn test_write_dns_message_success() {
+        let dns_data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut buffer = Vec::new();
+
+        let result = write_dns_message(&mut buffer, &dns_data);
+        assert!(result.is_ok());
+
+        // Check length prefix
+        assert_eq!(buffer[0], 0x00);
+        assert_eq!(buffer[1], 0x05);
+
+        // Check data
+        assert_eq!(&buffer[2..], &dns_data[..]);
+    }
+
+    #[test]
+    fn test_write_dns_message_zero_length() {
+        let dns_data = vec![];
+        let mut buffer = Vec::new();
+
+        let result = write_dns_message(&mut buffer, &dns_data);
+        assert!(result.is_ok());
+
+        assert_eq!(buffer, vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_write_dns_message_max_length() {
+        let dns_data = vec![0xBB; 65535];
+        let mut buffer = Vec::new();
+
+        let result = write_dns_message(&mut buffer, &dns_data);
+        assert!(result.is_ok());
+
+        // Check length prefix
+        assert_eq!(buffer[0], 0xFF);
+        assert_eq!(buffer[1], 0xFF);
+
+        // Check data
+        assert_eq!(&buffer[2..], &dns_data[..]);
+    }
+
+    #[test]
+    fn test_write_dns_message_too_large() {
+        let dns_data = vec![0xCC; 65536];
+        let mut buffer = Vec::new();
+
+        let result = write_dns_message(&mut buffer, &dns_data);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RWError::DNSMessageTooLarge => {},
+            _ => panic!("Expected DNSMessageTooLarge error"),
+        }
+    }
+
+}

@@ -28,6 +28,8 @@
 //!
 //! This example demonstrates a simple DoQ server according to RFC 9250.
 
+// TODO: Use DoH to 1.1.1.1 to process queries
+
 #[macro_use]
 extern crate log;
 
