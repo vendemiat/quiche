@@ -29,6 +29,10 @@
 //! This example demonstrates a simple DoQ server according to RFC 9250.
 
 // TODO: Use DoH to 1.1.1.1 to process queries
+// TODO: Is DoQ stream or datagram?
+//       Stream as per RFC9250
+// TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-address-validation
+// TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-padding
 
 #[macro_use]
 extern crate log;
@@ -115,7 +119,7 @@ fn main() {
     config.set_initial_max_stream_data_uni(0); // DoQ doesn't use unidirectional streams
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(0);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(true); // TODO: Why?
 
     // Enable 0-RTT.
     config.enable_early_data();
@@ -134,6 +138,24 @@ fn main() {
         let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
 
         poll.poll(&mut events, timeout).unwrap();
+
+        // TODO: handle DoqError::RequestCancelled and STOP_SENDING
+        // A STOP_SENDING frame requests that the receiving endpoint send a RESET_STREAM frame. An
+        // endpoint that receives a STOP_SENDING frame MUST send a RESET_STREAM frame if the stream
+        // is in the "Ready" or "Send" state. If the stream is in the "Data Sent" state, the
+        // endpoint MAY defer sending the RESET_STREAM frame until the packets containing
+        // outstanding data are acknowledged or declared lost. If any outstanding data is declared
+        // lost, the endpoint SHOULD send a RESET_STREAM frame instead of retransmitting the data.
+        //
+        // TODO: handle other DoQError
+        //
+        // TODO: Process SRVFAIL
+        // If a server is incapable of sending a DNS response due to an internal error, it SHOULD
+        // issue a QUIC RESET_STREAM frame. The error code SHOULD be set to DOQ_INTERNAL_ERROR. The
+        // corresponding DNS transaction MUST be abandoned.
+        //
+        // TODO: Handle all https://datatracker.ietf.org/doc/html/rfc9250#name-protocol-errors
+        // TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-alternative-error-codes
 
         // Read incoming UDP packets.
         'read: loop {
@@ -376,6 +398,8 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
 
     // Read data from the stream.
     loop {
+        // TODO: Should this be using a datagram function?
+        // No
         match client.conn.stream_recv(stream_id, &mut buf) {
             Ok((read, fin)) => {
                 if read > 0 {
@@ -492,6 +516,7 @@ fn handle_dns_query(
     // Check message ID.
     if id != 0 {
         warn!("{} received DNS query with non-zero ID: {}", conn_id, id);
+        //TODO: Actually deal with non zero msgID using DoQ errors
     }
 
     // Check opcode for 0-RTT.
@@ -501,6 +526,10 @@ fn handle_dns_query(
             conn_id, opcode
         );
         // Send REFUSED response.
+        // TODO: and use EDE "too early"
+        // https://datatracker.ietf.org/doc/html/rfc9250#name-session-resumption-and-0-rt
+        // or
+        // close connection with DOQ_PROTOCOL_ERROR
         let response = build_dns_response(query, Rcode::masked_from_int(5))
             .unwrap_or_else(|_| vec![]);
         send_dns_response(client, stream_id, &response);
@@ -556,9 +585,6 @@ fn send_dns_response(client: &mut Client, stream_id: u64, response: &[u8]) {
         },
     }
 }
-
-// Note: build_nxdomain_response and build_error_response have been removed
-// in favor of using the domain crate's build_dns_response function
 
 /// Generate a stateless retry token.
 fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
