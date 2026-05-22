@@ -510,7 +510,17 @@ fn handle_dns_query(
     client: &mut Client, stream_id: u64, query: &[u8], is_early_data: bool,
 ) {
     let conn_id = client.conn.trace_id().to_string();
-    let msg = Message::from_octets(query).unwrap();
+    let msg = match Message::from_octets(query) {
+        Ok(m) => m,
+        Err(e) => {
+            // The wire framing was valid but the DNS payload is malformed.
+            // RFC 9250 §4.4 says this should close the stream with
+            // DOQ_PROTOCOL_ERROR; for this example we just log and bail
+            // so a hostile client can't panic the server.
+            error!("{} malformed DNS query: {}", conn_id, e);
+            return;
+        },
+    };
     let id = msg.header().id();
     let opcode = msg.header().opcode();
 
