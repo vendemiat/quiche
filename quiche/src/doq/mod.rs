@@ -44,15 +44,15 @@ pub const DOQ_PORT: u16 = 853;
 pub enum DoqError {
     /// see RFC9250 section 4.3 DOQ_NO_ERROR
     #[error("see RFC9250 section 4.3 DOQ_NO_ERROR")]
-    NoError = 0x0,
+    NoError          = 0x0,
 
     /// see RFC9250 section 4.3 DOQ_INTERNAL_ERROR
     #[error("see RFC9250 section 4.3 DOQ_INTERNAL_ERROR")]
-    InternalError = 0x1,
+    InternalError    = 0x1,
 
     /// see RFC9250 section 4.3 DOQ_PROTOCOL_ERROR
     #[error("see RFC9250 section 4.3 DOQ_PROTOCOL_ERROR")]
-    ProtocolError = 0x2,
+    ProtocolError    = 0x2,
 
     /// see RFC9250 section 4.3 DOQ_REQUEST_CANCELLED
     #[error("see RFC9250 section 4.3 DOQ_REQUEST_CANCELLED")]
@@ -60,7 +60,7 @@ pub enum DoqError {
 
     /// see RFC9250 section 4.3 DOQ_EXCESSIVE_LOAD
     #[error("see RFC9250 section 4.3 DOQ_EXCESSIVE_LOAD")]
-    ExcessiveLoad = 0x4,
+    ExcessiveLoad    = 0x4,
 
     /// see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR
     #[error("see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR")]
@@ -68,7 +68,7 @@ pub enum DoqError {
 
     /// see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR
     #[error("see RFC9250 section 4.3 DOQ_ERROR_RESERVED")]
-    ErrorReserved = 0xd098ea5e,
+    ErrorReserved    = 0xd098ea5e,
 }
 
 impl DoqError {
@@ -106,7 +106,8 @@ pub fn is_replayable_opcode(opcode: u8) -> bool {
 }
 
 /// Read a DNS message with the 2-octet length prefix.
-/// Returns the DNS message without the length prefix and the number of bytes consumed.
+/// Returns the DNS message without the length prefix and the number of bytes
+/// consumed.
 pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), RWError> {
     if data.len() < 2 {
         return Err(RWError::LenDataIncomplete);
@@ -241,8 +242,7 @@ mod tests {
     #[test]
     fn test_read_dns_message_with_trailing_data() {
         // Valid message with extra trailing data
-        let data =
-            vec![0x00, 0x03, 0x01, 0x02, 0x03, 0xFF, 0xFF, 0xFF, 0xFF];
+        let data = vec![0x00, 0x03, 0x01, 0x02, 0x03, 0xFF, 0xFF, 0xFF, 0xFF];
 
         let result = read_dns_message(&data);
         assert!(result.is_ok());
@@ -308,5 +308,4 @@ mod tests {
             _ => panic!("Expected DNSMessageTooLarge error"),
         }
     }
-
 }

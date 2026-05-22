@@ -49,7 +49,8 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
-use domain::base::{iana::Rcode, message::Message};
+use domain::base::iana::Rcode;
+use domain::base::message::Message;
 
 struct PartialDnsQuery {
     data: Vec<u8>,
@@ -140,19 +141,22 @@ fn main() {
         poll.poll(&mut events, timeout).unwrap();
 
         // TODO: handle DoqError::RequestCancelled and STOP_SENDING
-        // A STOP_SENDING frame requests that the receiving endpoint send a RESET_STREAM frame. An
-        // endpoint that receives a STOP_SENDING frame MUST send a RESET_STREAM frame if the stream
-        // is in the "Ready" or "Send" state. If the stream is in the "Data Sent" state, the
-        // endpoint MAY defer sending the RESET_STREAM frame until the packets containing
-        // outstanding data are acknowledged or declared lost. If any outstanding data is declared
-        // lost, the endpoint SHOULD send a RESET_STREAM frame instead of retransmitting the data.
+        // A STOP_SENDING frame requests that the receiving endpoint send a
+        // RESET_STREAM frame. An endpoint that receives a STOP_SENDING
+        // frame MUST send a RESET_STREAM frame if the stream is in the "
+        // Ready" or "Send" state. If the stream is in the "Data Sent" state, the
+        // endpoint MAY defer sending the RESET_STREAM frame until the packets
+        // containing outstanding data are acknowledged or declared lost.
+        // If any outstanding data is declared lost, the endpoint SHOULD
+        // send a RESET_STREAM frame instead of retransmitting the data.
         //
         // TODO: handle other DoQError
         //
         // TODO: Process SRVFAIL
-        // If a server is incapable of sending a DNS response due to an internal error, it SHOULD
-        // issue a QUIC RESET_STREAM frame. The error code SHOULD be set to DOQ_INTERNAL_ERROR. The
-        // corresponding DNS transaction MUST be abandoned.
+        // If a server is incapable of sending a DNS response due to an internal
+        // error, it SHOULD issue a QUIC RESET_STREAM frame. The error
+        // code SHOULD be set to DOQ_INTERNAL_ERROR. The corresponding DNS
+        // transaction MUST be abandoned.
         //
         // TODO: Handle all https://datatracker.ietf.org/doc/html/rfc9250#name-protocol-errors
         // TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-alternative-error-codes
@@ -199,8 +203,8 @@ fn main() {
             let conn_id = conn_id.to_vec().into();
 
             // Lookup or create a connection.
-            let client = if !clients.contains_key(&hdr.dcid)
-                && !clients.contains_key(&conn_id)
+            let client = if !clients.contains_key(&hdr.dcid) &&
+                !clients.contains_key(&conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -472,13 +476,10 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
             return;
         }
 
-        client.partial_queries.insert(
-            stream_id,
-            PartialDnsQuery {
-                data: stream_data,
-                expected_len,
-            },
-        );
+        client.partial_queries.insert(stream_id, PartialDnsQuery {
+            data: stream_data,
+            expected_len,
+        });
         return;
     }
 
@@ -516,7 +517,7 @@ fn handle_dns_query(
     // Check message ID.
     if id != 0 {
         warn!("{} received DNS query with non-zero ID: {}", conn_id, id);
-        //TODO: Actually deal with non zero msgID using DoQ errors
+        // TODO: Actually deal with non zero msgID using DoQ errors
     }
 
     // Check opcode for 0-RTT.
@@ -544,7 +545,8 @@ fn handle_dns_query(
     );
 
     // For this example, we'll send a simple NXDOMAIN response.
-    // In a real implementation, you would process the query and generate appropriate responses.
+    // In a real implementation, you would process the query and generate
+    // appropriate responses.
     let response = build_dns_response(query, Rcode::masked_from_int(3))
         .unwrap_or_else(|e| {
             error!("{} failed to build response: {}", conn_id, e);
@@ -565,7 +567,7 @@ fn send_dns_response(client: &mut Client, stream_id: u64, response: &[u8]) {
     }
 
     match client.conn.stream_send(stream_id, &dns_message, true) {
-        Ok(written) => {
+        Ok(written) =>
             if written < dns_message.len() {
                 error!(
                     "{} failed to send complete response: {} < {}",
@@ -578,8 +580,7 @@ fn send_dns_response(client: &mut Client, stream_id: u64, response: &[u8]) {
                     "{} sent DNS response on stream {} ({} bytes)",
                     conn_id, stream_id, written
                 );
-            }
-        },
+            },
         Err(e) => {
             error!("{} failed to send response: {:?}", conn_id, e);
         },

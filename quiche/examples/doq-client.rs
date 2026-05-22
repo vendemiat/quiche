@@ -26,7 +26,8 @@
 
 //! DNS over QUIC (DoQ) client implementation.
 //!
-//! This example demonstrates how to send DNS queries over QUIC according to RFC 9250.
+//! This example demonstrates how to send DNS queries over QUIC according to RFC
+//! 9250.
 
 #[macro_use]
 extern crate log;
@@ -40,7 +41,8 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 use quiche::doq::*;
 
 use core::str::FromStr;
-use domain::base::{iana::Rtype, Message};
+use domain::base::iana::Rtype;
+use domain::base::Message;
 
 mod doq_common;
 use doq_common::build_dns_query;
@@ -256,14 +258,11 @@ fn main() {
                         break;
                     }
                     info!("Sent DNS query on stream {}", stream_id);
-                    pending_queries.insert(
-                        stream_id,
-                        PendingQuery {
-                            domain: domain.clone(),
-                            qtype,
-                            start_time: std::time::Instant::now(),
-                        },
-                    );
+                    pending_queries.insert(stream_id, PendingQuery {
+                        domain: domain.clone(),
+                        qtype,
+                        start_time: std::time::Instant::now(),
+                    });
                     queries_sent = true;
                 },
                 Err(e) => {

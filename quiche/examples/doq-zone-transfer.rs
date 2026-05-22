@@ -42,7 +42,8 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
-use domain::base::{iana::Rtype, message::Message};
+use domain::base::iana::Rtype;
+use domain::base::message::Message;
 
 struct ZoneTransfer {
     zone: String,
@@ -256,15 +257,12 @@ fn main() {
                         "Sent {} request on stream {}",
                         transfer_type_str, stream_id
                     );
-                    active_transfers.insert(
-                        stream_id,
-                        ZoneTransfer {
-                            zone: zone.clone(),
-                            start_time: std::time::Instant::now(),
-                            messages_received: 0,
-                            total_bytes: 0,
-                        },
-                    );
+                    active_transfers.insert(stream_id, ZoneTransfer {
+                        zone: zone.clone(),
+                        start_time: std::time::Instant::now(),
+                        messages_received: 0,
+                        total_bytes: 0,
+                    });
                     transfer_sent = true;
                 },
                 Err(e) => {
@@ -354,8 +352,8 @@ fn main() {
                     println!("  Duration: {:?}", elapsed);
                     println!(
                         "  Throughput: {:.2} KB/s",
-                        (transfer.total_bytes as f64 / 1024.0)
-                            / elapsed.as_secs_f64()
+                        (transfer.total_bytes as f64 / 1024.0) /
+                            elapsed.as_secs_f64()
                     );
 
                     active_transfers.remove(&stream_id);

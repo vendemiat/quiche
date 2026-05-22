@@ -28,9 +28,12 @@
 
 use std::str::FromStr;
 
-use domain::base::iana::{Class, Rcode, Rtype};
+use domain::base::iana::Class;
+use domain::base::iana::Rcode;
+use domain::base::iana::Rtype;
 use domain::base::name::Name;
-use domain::base::{Message, MessageBuilder};
+use domain::base::Message;
+use domain::base::MessageBuilder;
 
 // TODO use domain crate builder functions instead of passing around [u8]
 
