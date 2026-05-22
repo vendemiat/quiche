@@ -67,7 +67,6 @@ pub fn build_dns_query(
 pub fn build_dns_response(query: &[u8], rcode: Rcode) -> anyhow::Result<Vec<u8>> {
     // Parse the query
     let query_msg = Message::from_octets(query)?;
-    let query_h = query_msg.header();
 
     // Build response with the caller-supplied rcode.
     let builder = MessageBuilder::new_vec().start_answer(&query_msg, rcode)?;
