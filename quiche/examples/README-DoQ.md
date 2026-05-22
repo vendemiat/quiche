@@ -22,16 +22,16 @@ A simple DoQ client that sends DNS queries to a DoQ server.
 
 ```bash
 # Build the example
-cargo build --example doq-client --features doq -p quiche
+cargo build --example doq-client --features doq
 
 # Query an A record
-cargo run --example doq-client --features doq -p quiche -- 127.0.0.1 example.com A
+cargo run --example doq-client --features doq -- 127.0.0.1 example.com A
 
 # Query an AAAA record
-cargo run --example doq-client --features doq -p quiche -- 127.0.0.1 example.com AAAA
+cargo run --example doq-client --features doq -- 127.0.0.1 example.com AAAA
 
 # Query using IPv6
-cargo run --example doq-client --features doq -p quiche -- ::1 example.com
+cargo run --example doq-client --features doq -- ::1 example.com
 ```
 
 ### DoQ Server (`doq-server.rs`)
@@ -40,13 +40,13 @@ A basic DoQ server that responds to DNS queries. This example server returns NXD
 
 ```bash
 # Build the example
-cargo build --example doq-server --features doq -p quiche
+cargo build --example doq-server --features doq
 
 # Run the server on default port (853)
-cargo run --example doq-server --features doq -p quiche
+cargo run --example doq-server --features doq
 
 # Run on a custom address/port
-cargo run --example doq-server --features doq -p quiche -- 127.0.0.1:8853
+cargo run --example doq-server --features doq -- 127.0.0.1:8853
 ```
 
 ### Zone Transfer Client (`doq-zone-transfer.rs`)
@@ -55,13 +55,13 @@ Demonstrates DNS zone transfers (AXFR/IXFR) over DoQ.
 
 ```bash
 # Build the example
-cargo build --example doq-zone-transfer --features doq -p quiche
+cargo build --example doq-zone-transfer --features doq
 
 # Perform an AXFR zone transfer
-cargo run --example doq-zone-transfer --features doq -p quiche -- 127.0.0.1 example.com AXFR
+cargo run --example doq-zone-transfer --features doq -- 127.0.0.1 example.com AXFR
 
 # Perform an IXFR zone transfer
-cargo run --example doq-zone-transfer --features doq -p quiche -- 127.0.0.1 example.com IXFR
+cargo run --example doq-zone-transfer --features doq -- 127.0.0.1 example.com IXFR
 ```
 
 ## Common Module (`doq_common/`)
@@ -106,7 +106,7 @@ Run the DoQ unit tests (covering wire format, error codes, and the
 0-RTT replayable-opcode helper):
 
 ```bash
-cargo test --features doq -p quiche --lib doq
+cargo test --features doq --workspace --lib doq
 ```
 
 ## Production Deployment
