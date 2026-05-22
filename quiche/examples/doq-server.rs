@@ -233,7 +233,13 @@ fn main() {
                 scid.copy_from_slice(&conn_id);
                 let scid = quiche::ConnectionId::from_ref(&scid);
 
-                let token = hdr.token.as_ref().unwrap();
+                let token = match hdr.token.as_ref() {
+                    Some(t) => t,
+                    None => {
+                        error!("Initial packet missing token field");
+                        continue 'read;
+                    },
+                };
 
                 // Do stateless retry if the client didn't send a token.
                 if token.is_empty() {
