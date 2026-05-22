@@ -276,6 +276,9 @@ fn main() {
                     continue 'read;
                 }
 
+                // After Retry the client's DCID must be the scid we
+                // chose (length MAX_CONN_ID_LEN). A different length
+                // means this Initial didn't come from our Retry path.
                 if scid.len() != hdr.dcid.len() {
                     error!("Invalid destination connection ID");
                     continue 'read;
