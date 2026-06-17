@@ -128,7 +128,11 @@ fn main() {
 
     // Configure for DoQ.
     config.set_application_protos(&[DOQ_ALPN]).unwrap();
-    config.verify_peer(false); // For testing; verify in production!
+    // WARNING: Peer verification is disabled — do NOT use in production.
+    // In production, call config.load_verify_locations_from_file() with a
+    // trusted CA bundle and remove this line so the server certificate is
+    // authenticated.
+    config.verify_peer(false);
 
     config.set_max_idle_timeout(120000); // 2 minutes for zone transfers
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -174,6 +178,9 @@ fn main() {
 
     let mut transfer_sent = false;
     let mut active_transfers: HashMap<u64, ZoneTransfer> = HashMap::new();
+    // Per-stream receive buffers persist across event-loop iterations so that
+    // large zone-transfer responses are not lost when they arrive in chunks.
+    let mut stream_bufs: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut next_stream_id = 0;
 
     loop {
@@ -274,10 +281,12 @@ fn main() {
 
         // Process responses.
         for stream_id in conn.readable() {
-            let mut stream_buf = Vec::new();
+            let stream_buf = stream_bufs.entry(stream_id).or_default();
             let mut is_fin = false;
 
-            // Read all available data from the stream.
+            // Append newly arrived bytes to the persistent buffer so that
+            // large zone responses spanning multiple event-loop iterations
+            // are not lost.
             loop {
                 match conn.stream_recv(stream_id, &mut buf) {
                     Ok((read, fin)) => {
@@ -294,6 +303,13 @@ fn main() {
                     },
                 }
             }
+
+            if !is_fin {
+                // Zone response not yet complete; keep buffering.
+                continue;
+            }
+
+            let stream_buf = stream_bufs.remove(&stream_id).unwrap_or_default();
 
             if let Some(transfer) = active_transfers.get_mut(&stream_id) {
                 transfer.total_bytes += stream_buf.len();

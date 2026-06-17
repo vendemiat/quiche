@@ -116,7 +116,11 @@ fn main() {
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    // DNS messages are at most 65535 bytes + 2-byte length prefix (RFC 9250
+    // §4.6, RFC 1035 §4.2.2). Cap per-stream flow control at the protocol
+    // maximum so a misbehaving client cannot force more than one max-size
+    // message worth of buffering per stream.
+    config.set_initial_max_stream_data_bidi_remote(65537);
     config.set_initial_max_stream_data_uni(0); // DoQ doesn't use unidirectional streams
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(0);
@@ -403,9 +407,10 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
     let mut expected_len = None;
     let mut is_complete = false;
 
-    // Check if we have partial data
-    if let Some(partial) = client.partial_queries.get(&stream_id) {
-        stream_data = partial.data.clone();
+    // Take ownership of any previously buffered partial data for this stream
+    // to avoid an O(n) clone on every readable event.
+    if let Some(partial) = client.partial_queries.remove(&stream_id) {
+        stream_data = partial.data;
         expected_len = partial.expected_len;
     }
 
@@ -586,20 +591,30 @@ fn send_dns_response(client: &mut Client, stream_id: u64, response: &[u8]) {
     }
 
     match client.conn.stream_send(stream_id, &dns_message, true) {
-        Ok(written) =>
-            if written < dns_message.len() {
-                error!(
-                    "{} failed to send complete response: {} < {}",
-                    conn_id,
-                    written,
-                    dns_message.len()
-                );
-            } else {
-                info!(
-                    "{} sent DNS response on stream {} ({} bytes)",
-                    conn_id, stream_id, written
-                );
-            },
+        Ok(written) if written < dns_message.len() => {
+            // quiche accepted only part of the data; the remainder (and FIN)
+            // are lost because this example does not buffer for retry.
+            // Close the connection with DOQ_INTERNAL_ERROR rather than leaving
+            // the stream in a half-sent state.
+            error!(
+                "{} partial stream_send on stream {} ({}/{}): closing \
+                 connection",
+                conn_id,
+                stream_id,
+                written,
+                dns_message.len()
+            );
+            client
+                .conn
+                .close(true, DoqError::InternalError.to_wire(), b"partial send")
+                .ok();
+        },
+        Ok(written) => {
+            info!(
+                "{} sent DNS response on stream {} ({} bytes)",
+                conn_id, stream_id, written
+            );
+        },
         Err(e) => {
             error!("{} failed to send response: {:?}", conn_id, e);
         },
@@ -607,6 +622,14 @@ fn send_dns_response(client: &mut Client, stream_id: u64, response: &[u8]) {
 }
 
 /// Generate a stateless retry token.
+///
+/// # Security warning
+///
+/// This token is **not safe for production**. It uses a fixed prefix and plain
+/// IP/DCID bytes with no HMAC, timestamp, or server secret. An attacker who
+/// knows the format can forge a valid token for any source IP. Production
+/// servers must use an HMAC-based construction (e.g. `ring::hmac::sign` with a
+/// per-server secret) and should include a timestamp to bound token lifetime.
 fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
     let mut token = Vec::new();
 

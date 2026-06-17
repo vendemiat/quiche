@@ -17,6 +17,10 @@ default = ["qlog-gzip", "qlog-zstd"]
 fuzzing = ["quiche/fuzzing"]
 quiche_internal = ["quiche/internal"]
 
+# Enables the DNS over QUIC (DoQ) driver. See `doq` module for details.
+# Forwards to quiche's `doq` feature for wire-format primitives.
+doq = ["quiche/doq"]
+
 # Enable extra timing instrumentation for QUIC handshakes, including protocol
 # overhead and network delays.
 perf-quic-listener-metrics = []

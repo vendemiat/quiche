@@ -121,7 +121,11 @@ fn main() {
 
     // Configure for DoQ.
     config.set_application_protos(&[DOQ_ALPN]).unwrap();
-    config.verify_peer(false); // For testing; in production, verify the server!
+    // WARNING: Peer verification is disabled — do NOT use in production.
+    // In production, call config.load_verify_locations_from_file() with a
+    // trusted CA bundle and remove this line so the server certificate is
+    // authenticated.
+    config.verify_peer(false);
 
     config.set_max_idle_timeout(30000); // 30 seconds
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -170,6 +174,9 @@ fn main() {
 
     let mut queries_sent = false;
     let mut pending_queries = HashMap::new();
+    // Per-stream receive buffers persist across event-loop iterations so that
+    // responses whose bytes arrive in multiple recv() calls are not lost.
+    let mut stream_bufs: HashMap<u64, Vec<u8>> = HashMap::new();
     let query_start = std::time::Instant::now();
     let mut next_stream_id = 0;
 
@@ -274,10 +281,11 @@ fn main() {
 
         // Process readable streams (responses).
         for stream_id in conn.readable() {
-            let mut stream_buf = Vec::new();
+            let stream_buf = stream_bufs.entry(stream_id).or_default();
             let mut is_fin = false;
 
-            // Read all data from the stream.
+            // Append newly arrived bytes to the persistent buffer so that
+            // responses spanning multiple event-loop iterations are not lost.
             loop {
                 match conn.stream_recv(stream_id, &mut buf) {
                     Ok((read, fin)) => {
@@ -294,6 +302,13 @@ fn main() {
                     },
                 }
             }
+
+            if !is_fin {
+                // Response not yet complete; keep buffering.
+                continue;
+            }
+
+            let stream_buf = stream_bufs.remove(&stream_id).unwrap_or_default();
 
             if let Some(query_info) = pending_queries.remove(&stream_id) {
                 let elapsed = query_info.start_time.elapsed();
