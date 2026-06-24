@@ -28,10 +28,12 @@
 
 use std::str::FromStr;
 
+use domain::base::iana::exterr::ExtendedErrorCode;
 use domain::base::iana::Class;
 use domain::base::iana::Rcode;
 use domain::base::iana::Rtype;
 use domain::base::name::Name;
+use domain::base::opt::exterr::ExtendedError;
 use domain::base::Message;
 use domain::base::MessageBuilder;
 
@@ -62,16 +64,26 @@ pub fn build_dns_query(
     Ok(message)
 }
 
-/// Build a DNS response with a specific rcode.
+/// Build a DNS response with a specific rcode and optional EDE codes.
 #[allow(unused)]
-pub fn build_dns_response(query: &[u8], rcode: Rcode) -> anyhow::Result<Vec<u8>> {
-    // Parse the query
+pub fn build_dns_response(
+    query: &[u8], rcode: Rcode, ede_codes: Vec<ExtendedErrorCode>,
+) -> anyhow::Result<Vec<u8>> {
     let query_msg = Message::from_octets(query)?;
 
-    // Build response with the caller-supplied rcode.
-    let builder = MessageBuilder::new_vec().start_answer(&query_msg, rcode)?;
+    let mut additional = MessageBuilder::new_vec()
+        .start_answer(&query_msg, rcode)?
+        .additional();
 
-    // Get the message
-    let message = builder.finish();
-    Ok(message)
+    if !ede_codes.is_empty() {
+        additional.opt(|opt| {
+            for code in &ede_codes {
+                let ede: ExtendedError<Vec<u8>> = (*code).into();
+                opt.push(&ede)?;
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(additional.finish())
 }

@@ -29,8 +29,6 @@
 //! This example demonstrates a simple DoQ server according to RFC 9250.
 
 // TODO: Use DoH to 1.1.1.1 to process queries
-// TODO: Is DoQ stream or datagram?
-//       Stream as per RFC9250
 // TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-address-validation
 // TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-padding
 
@@ -49,6 +47,7 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
+use domain::base::iana::exterr::ExtendedErrorCode;
 use domain::base::iana::Rcode;
 use domain::base::message::Message;
 
@@ -73,16 +72,23 @@ fn main() {
     let mut args = std::env::args();
     let cmd = &args.next().unwrap();
 
-    if args.len() > 1 {
-        println!("Usage: {cmd} [address:port]");
+    if args.len() > 3 {
+        println!("Usage: {cmd} [address:port] [cert_path] [key_path]");
         println!();
-        println!("Default: 127.0.0.1:{}", DOQ_PORT);
+        println!("Defaults: 127.0.0.1:{}, quiche/examples/cert.crt, quiche/examples/cert.key", DOQ_PORT);
         return;
     }
 
     let listen_addr = args
         .next()
         .unwrap_or_else(|| format!("127.0.0.1:{}", DOQ_PORT));
+
+    let cert_path = args
+        .next()
+        .unwrap_or_else(|| "quiche/examples/cert.crt".to_string());
+    let key_path = args
+        .next()
+        .unwrap_or_else(|| "quiche/examples/cert.key".to_string());
 
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();
@@ -103,13 +109,9 @@ fn main() {
     // Configure for DoQ.
     config.set_application_protos(&[DOQ_ALPN]).unwrap();
 
-    // Load certificate and key (using the example certificates).
-    config
-        .load_cert_chain_from_pem_file("quiche/examples/cert.crt")
-        .unwrap();
-    config
-        .load_priv_key_from_pem_file("quiche/examples/cert.key")
-        .unwrap();
+    // Load certificate and key.
+    config.load_cert_chain_from_pem_file(&cert_path).unwrap();
+    config.load_priv_key_from_pem_file(&key_path).unwrap();
 
     config.set_max_idle_timeout(30000); // 30 seconds
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -124,7 +126,8 @@ fn main() {
     config.set_initial_max_stream_data_uni(0); // DoQ doesn't use unidirectional streams
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(0);
-    config.set_disable_active_migration(true); // TODO: Why?
+    // RFC 9250 §5.5.4: disable migration for privacy.
+    config.set_disable_active_migration(true);
 
     // Enable 0-RTT.
     config.enable_early_data();
@@ -402,105 +405,71 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
     let conn_id = client.conn.trace_id().to_string();
     debug!("{} stream {} is readable", conn_id, stream_id);
 
+    // Take ownership of any previously buffered partial data.
+    let (mut stream_data, mut expected_len) = client
+        .partial_queries
+        .remove(&stream_id)
+        .map(|p| (p.data, p.expected_len))
+        .unwrap_or_default();
+
+    // Read all available data from the stream.
     let mut buf = [0; 65535];
-    let mut stream_data = Vec::new();
-    let mut expected_len = None;
-    let mut is_complete = false;
-
-    // Take ownership of any previously buffered partial data for this stream
-    // to avoid an O(n) clone on every readable event.
-    if let Some(partial) = client.partial_queries.remove(&stream_id) {
-        stream_data = partial.data;
-        expected_len = partial.expected_len;
-    }
-
-    // Read data from the stream.
+    let mut fin = false;
     loop {
-        // TODO: Should this be using a datagram function?
-        // No
         match client.conn.stream_recv(stream_id, &mut buf) {
-            Ok((read, fin)) => {
-                if read > 0 {
-                    stream_data.extend_from_slice(&buf[..read]);
-                    debug!(
-                        "{} received {} bytes on stream {} (total: {})",
-                        conn_id,
-                        read,
-                        stream_id,
-                        stream_data.len()
-                    );
-                }
-
-                // Check if we have enough data to parse the length.
-                if expected_len.is_none() && stream_data.len() >= 2 {
-                    let len = u16::from_be_bytes([stream_data[0], stream_data[1]])
-                        as usize;
-                    expected_len = Some(2 + len);
-                    debug!(
-                        "{} expecting {} bytes total on stream {}",
-                        conn_id,
-                        2 + len,
-                        stream_id
-                    );
-                }
-
-                // Check if we have a complete DNS message.
-                if let Some(expected) = expected_len {
-                    if stream_data.len() >= expected || fin {
-                        if stream_data.len() < expected && fin {
-                            error!(
-                                "{} incomplete DNS message on stream {}: {} < {}",
-                                conn_id,
-                                stream_id,
-                                stream_data.len(),
-                                expected
-                            );
-                            client
-                                .conn
-                                .stream_send(
-                                    stream_id,
-                                    b"\x00\x00", // Empty response
-                                    true,
-                                )
-                                .ok();
-                            client.partial_queries.remove(&stream_id);
-                            return;
-                        }
-
-                        is_complete = true;
-                        break;
-                    }
-                }
-
-                if read == 0 || fin {
+            Ok((0, _)) => break,
+            Ok((n, f)) => {
+                stream_data.extend_from_slice(&buf[..n]);
+                if f {
+                    fin = true;
                     break;
                 }
             },
             Err(quiche::Error::Done) => break,
             Err(e) => {
                 error!("{} stream recv error: {:?}", conn_id, e);
-                break;
+                return;
             },
         }
     }
 
-    // Update partial state if not complete
+    // Parse the 2-octet length prefix if not yet known.
+    if expected_len.is_none() && stream_data.len() >= 2 {
+        let len = u16::from_be_bytes([stream_data[0], stream_data[1]]) as usize;
+        expected_len = Some(2 + len);
+    }
+
+    // Check whether we have a complete message.
+    let is_complete =
+        expected_len.map_or(false, |expected| stream_data.len() >= expected);
+
     if !is_complete {
-        if stream_data.is_empty() {
+        if fin {
+            // Stream FIN'd before the full message arrived — protocol error
+            // per RFC 9250 §4.3.3.
+            error!("{} incomplete DNS message on stream {}", conn_id, stream_id);
+            client
+                .conn
+                .close(
+                    true,
+                    DoqError::ProtocolError.to_wire(),
+                    b"incomplete dns message",
+                )
+                .ok();
             return;
         }
 
-        client.partial_queries.insert(stream_id, PartialDnsQuery {
-            data: stream_data,
-            expected_len,
-        });
+        // Still waiting for more data; save partial state.
+        if !stream_data.is_empty() {
+            client.partial_queries.insert(stream_id, PartialDnsQuery {
+                data: stream_data,
+                expected_len,
+            });
+        }
         return;
     }
 
-    // Process complete message
-    client.partial_queries.remove(&stream_id);
-
-    // Parse and handle the DNS query.
+    // Process the complete message.
     match read_dns_message(&stream_data) {
         Ok((dns_query, _)) => {
             handle_dns_query(client, stream_id, dns_query, is_early_data);
@@ -509,10 +478,10 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
             error!("{} failed to parse DNS message: {}", conn_id, e);
             client
                 .conn
-                .stream_send(
-                    stream_id,
-                    b"\x00\x00", // Empty response
+                .close(
                     true,
+                    DoqError::ProtocolError.to_wire(),
+                    b"dns parse error",
                 )
                 .ok();
         },
@@ -538,10 +507,19 @@ fn handle_dns_query(
     let id = msg.header().id();
     let opcode = msg.header().opcode();
 
-    // Check message ID.
+    // Check message ID — RFC 9250 §4.2.1 requires ID 0; §4.3.3 says a
+    // non-zero ID is a fatal protocol error.
     if id != 0 {
-        warn!("{} received DNS query with non-zero ID: {}", conn_id, id);
-        // TODO: Actually deal with non zero msgID using DoQ errors
+        error!("{} received DNS query with non-zero ID: {}", conn_id, id);
+        client
+            .conn
+            .close(
+                true,
+                DoqError::ProtocolError.to_wire(),
+                b"non-zero message id",
+            )
+            .ok();
+        return;
     }
 
     // Check opcode for 0-RTT.
@@ -550,13 +528,13 @@ fn handle_dns_query(
             "{} non-replayable opcode {:?} in 0-RTT data",
             conn_id, opcode
         );
-        // Send REFUSED response.
-        // TODO: and use EDE "too early"
-        // https://datatracker.ietf.org/doc/html/rfc9250#name-session-resumption-and-0-rt
-        // or
-        // close connection with DOQ_PROTOCOL_ERROR
-        let response = build_dns_response(query, Rcode::masked_from_int(5))
-            .unwrap_or_else(|_| vec![]);
+        // RFC 9250 §4.5: reply with REFUSED + EDE "Too Early" (code 26,
+        // registered in §8.3:
+        // <https://datatracker.ietf.org/doc/html/rfc9250#section-8.3>).
+        let response = build_dns_response(query, Rcode::REFUSED, vec![
+            ExtendedErrorCode::from_int(26),
+        ])
+        .unwrap_or_else(|_| vec![]);
         send_dns_response(client, stream_id, &response);
         return;
     }
@@ -571,7 +549,7 @@ fn handle_dns_query(
     // For this example, we'll send a simple NXDOMAIN response.
     // In a real implementation, you would process the query and generate
     // appropriate responses.
-    let response = build_dns_response(query, Rcode::masked_from_int(3))
+    let response = build_dns_response(query, Rcode::NXDOMAIN, vec![])
         .unwrap_or_else(|e| {
             error!("{} failed to build response: {}", conn_id, e);
             vec![]

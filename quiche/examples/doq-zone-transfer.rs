@@ -86,18 +86,12 @@ fn main() {
         },
     };
 
-    // Parse server address, defaulting to DoQ port
-    let server_addr = if server_str.contains(':') && !server_str.starts_with('[')
-    {
-        // IPv4 with port or IPv6 without brackets
-        server_str.parse::<std::net::SocketAddr>()
-    } else if server_str.starts_with('[') {
-        // IPv6 with brackets
-        server_str.parse::<std::net::SocketAddr>()
-    } else {
-        // Just an IP address, add default DoQ port
-        format!("{}:{}", server_str, DOQ_PORT).parse::<std::net::SocketAddr>()
-    };
+    // Parse server address, defaulting to DoQ port if none given.
+    let server_addr = server_str.parse::<std::net::SocketAddr>().or_else(|_| {
+        server_str
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, DOQ_PORT))
+    });
 
     let peer_addr = match server_addr {
         Ok(addr) => addr,
@@ -292,7 +286,7 @@ fn main() {
                     Ok((read, fin)) => {
                         stream_buf.extend_from_slice(&buf[..read]);
                         is_fin = fin;
-                        if read == 0 {
+                        if fin || read == 0 {
                             break;
                         }
                     },

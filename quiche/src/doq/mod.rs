@@ -39,7 +39,7 @@ pub const DOQ_PORT: u16 = 853;
 
 /// DoQ error codes as specified in
 /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3>
-#[derive(Debug, Error, Clone, Copy, PartialEq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum DoqError {
     /// see RFC9250 section 4.3 DOQ_NO_ERROR
@@ -66,7 +66,7 @@ pub enum DoqError {
     #[error("see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR")]
     UnspecifiedError = 0x5,
 
-    /// see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR
+    /// see RFC9250 section 4.3 DOQ_ERROR_RESERVED
     #[error("see RFC9250 section 4.3 DOQ_ERROR_RESERVED")]
     ErrorReserved    = 0xd098ea5e,
 }
