@@ -127,6 +127,7 @@ fn main() {
     // trusted CA bundle and remove this line so the server certificate is
     // authenticated.
     config.verify_peer(false);
+    warn!("Peer verification disabled — do NOT use in production");
 
     config.set_max_idle_timeout(30000); // 30 seconds
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -337,12 +338,7 @@ fn main() {
                                 "\nDNS Response for {} {}:",
                                 query_info.domain, query_info.qtype
                             );
-                            println!(
-                                "{}",
-                                Message::from_octets(dns_data)
-                                    .unwrap()
-                                    .display_dig_style()
-                            );
+                            println!("{}", msg.display_dig_style());
                         },
                         Err(e) => {
                             error!("Failed to parse DNS message: {}", e);

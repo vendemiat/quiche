@@ -78,9 +78,9 @@ impl DoqError {
     }
 }
 
-/// DoQ read/write error codes.
+/// DoQ DNS wire-format read/write errors.
 #[derive(Debug, Error)]
-pub enum RWError {
+pub enum DnsWireError {
     /// length is less than 2 bytes
     #[error("length is less than 2 bytes")]
     LenDataIncomplete,
@@ -108,15 +108,15 @@ pub fn is_replayable_opcode(opcode: u8) -> bool {
 /// Read a DNS message with the 2-octet length prefix.
 /// Returns the DNS message without the length prefix and the number of bytes
 /// consumed.
-pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), RWError> {
+pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), DnsWireError> {
     if data.len() < 2 {
-        return Err(RWError::LenDataIncomplete);
+        return Err(DnsWireError::LenDataIncomplete);
     }
 
     let length = u16::from_be_bytes([data[0], data[1]]) as usize;
 
     if data.len() < 2 + length {
-        return Err(RWError::DNSMessageIncomplete);
+        return Err(DnsWireError::DNSMessageIncomplete);
     }
 
     Ok((&data[2..2 + length], 2 + length))
@@ -125,9 +125,9 @@ pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), RWError> {
 /// Write a DNS message with the 2-octet length prefix.
 pub fn write_dns_message<W: Write>(
     writer: &mut W, dns_data: &[u8],
-) -> Result<(), RWError> {
+) -> Result<(), DnsWireError> {
     if dns_data.len() > 65535 {
-        return Err(RWError::DNSMessageTooLarge);
+        return Err(DnsWireError::DNSMessageTooLarge);
     }
 
     let length = (dns_data.len() as u16).to_be_bytes();
@@ -206,7 +206,7 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            RWError::LenDataIncomplete => {},
+            DnsWireError::LenDataIncomplete => {},
             _ => panic!("Expected LenDataIncomplete error"),
         }
     }
@@ -220,7 +220,7 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            RWError::LenDataIncomplete => {},
+            DnsWireError::LenDataIncomplete => {},
             _ => panic!("Expected LenDataIncomplete error"),
         }
     }
@@ -234,7 +234,7 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            RWError::DNSMessageIncomplete => {},
+            DnsWireError::DNSMessageIncomplete => {},
             _ => panic!("Expected DNSMessageIncomplete error"),
         }
     }
@@ -304,7 +304,7 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            RWError::DNSMessageTooLarge => {},
+            DnsWireError::DNSMessageTooLarge => {},
             _ => panic!("Expected DNSMessageTooLarge error"),
         }
     }

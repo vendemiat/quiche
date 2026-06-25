@@ -41,6 +41,7 @@ use std::net;
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const MAX_CLIENTS: usize = 1024;
 
 use quiche::doq::*;
 
@@ -172,7 +173,11 @@ fn main() {
         'read: loop {
             if events.is_empty() {
                 debug!("timed out");
-                clients.values_mut().for_each(|c| c.conn.on_timeout());
+                for c in clients.values_mut() {
+                    if c.conn.timeout().is_some_and(|t| t.is_zero()) {
+                        c.conn.on_timeout();
+                    }
+                }
                 break 'read;
             }
 
@@ -218,6 +223,15 @@ fn main() {
                     continue 'read;
                 }
 
+                if clients.len() >= MAX_CLIENTS {
+                    warn!(
+                        "rejecting new connection from {}: {} active",
+                        from,
+                        clients.len()
+                    );
+                    continue 'read;
+                }
+
                 if !quiche::version_is_supported(hdr.version) {
                     warn!("Doing version negotiation");
 
@@ -252,7 +266,7 @@ fn main() {
                 if token.is_empty() {
                     warn!("Doing stateless retry");
 
-                    let new_token = mint_token(&hdr, &from);
+                    let new_token = mint_token(&hdr, &from, &conn_id_seed);
 
                     let len = quiche::retry(
                         &hdr.scid,
@@ -276,7 +290,7 @@ fn main() {
                     continue 'read;
                 }
 
-                let odcid = validate_token(&from, token);
+                let odcid = validate_token(&from, token, &conn_id_seed);
 
                 if odcid.is_none() {
                     error!("Invalid address validation token");
@@ -334,19 +348,11 @@ fn main() {
 
             debug!("{} processed {} bytes", client.conn.trace_id(), read);
 
-            // Process 0-RTT data if available.
-            if client.conn.is_in_early_data() {
-                debug!("{} processing 0-RTT data", client.conn.trace_id());
+            let is_early_data = client.conn.is_in_early_data();
 
+            if is_early_data || client.conn.is_established() {
                 for stream_id in client.conn.readable() {
-                    handle_stream(client, stream_id, true);
-                }
-            }
-
-            if client.conn.is_established() {
-                // Handle readable streams.
-                for stream_id in client.conn.readable() {
-                    handle_stream(client, stream_id, false);
+                    handle_stream(client, stream_id, is_early_data);
                 }
             }
         }
@@ -441,7 +447,7 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
 
     // Check whether we have a complete message.
     let is_complete =
-        expected_len.map_or(false, |expected| stream_data.len() >= expected);
+        expected_len.is_some_and(|expected| stream_data.len() >= expected);
 
     if !is_complete {
         if fin {
@@ -549,11 +555,21 @@ fn handle_dns_query(
     // For this example, we'll send a simple NXDOMAIN response.
     // In a real implementation, you would process the query and generate
     // appropriate responses.
-    let response = build_dns_response(query, Rcode::NXDOMAIN, vec![])
-        .unwrap_or_else(|e| {
+    let response = match build_dns_response(query, Rcode::NXDOMAIN, vec![]) {
+        Ok(r) => r,
+        Err(e) => {
             error!("{} failed to build response: {}", conn_id, e);
-            vec![]
-        });
+            client
+                .conn
+                .stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Write,
+                    DoqError::InternalError.to_wire(),
+                )
+                .ok();
+            return;
+        },
+    };
     send_dns_response(client, stream_id, &response);
 }
 
@@ -601,51 +617,52 @@ fn send_dns_response(client: &mut Client, stream_id: u64, response: &[u8]) {
 
 /// Generate a stateless retry token.
 ///
-/// # Security warning
-///
-/// This token is **not safe for production**. It uses a fixed prefix and plain
-/// IP/DCID bytes with no HMAC, timestamp, or server secret. An attacker who
-/// knows the format can forge a valid token for any source IP. Production
-/// servers must use an HMAC-based construction (e.g. `ring::hmac::sign` with a
-/// per-server secret) and should include a timestamp to bound token lifetime.
-fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
-    let mut token = Vec::new();
-
-    token.extend_from_slice(b"quiche");
-
+/// The token is HMAC-signed with the server's connection ID key so that
+/// an attacker cannot forge a valid token for a different source address.
+fn mint_token(
+    hdr: &quiche::Header, src: &net::SocketAddr, key: &ring::hmac::Key,
+) -> Vec<u8> {
     let addr = match src.ip() {
         std::net::IpAddr::V4(a) => a.octets().to_vec(),
         std::net::IpAddr::V6(a) => a.octets().to_vec(),
     };
 
-    token.extend_from_slice(&addr);
-    token.extend_from_slice(&hdr.dcid);
+    let mut body = Vec::new();
+    body.extend_from_slice(&addr);
+    body.extend_from_slice(&hdr.dcid);
 
+    let tag = ring::hmac::sign(key, &body);
+
+    let mut token = Vec::new();
+    token.extend_from_slice(tag.as_ref());
+    token.extend_from_slice(&body);
     token
 }
 
-/// Validate a stateless retry token.
+/// Validate a stateless retry token and return the original DCID.
 fn validate_token<'a>(
-    src: &net::SocketAddr, token: &'a [u8],
+    src: &net::SocketAddr, token: &'a [u8], key: &ring::hmac::Key,
 ) -> Option<quiche::ConnectionId<'a>> {
-    if token.len() < 6 {
+    let tag_len = ring::hmac::HMAC_SHA256.digest_algorithm().output_len();
+    if token.len() < tag_len {
         return None;
     }
 
-    if &token[..6] != b"quiche" {
+    let (tag, body) = token.split_at(tag_len);
+
+    // Verify the HMAC to prevent token forgery.
+    if ring::hmac::verify(key, body, tag).is_err() {
         return None;
     }
-
-    let token = &token[6..];
 
     let addr = match src.ip() {
         std::net::IpAddr::V4(a) => a.octets().to_vec(),
         std::net::IpAddr::V6(a) => a.octets().to_vec(),
     };
 
-    if token.len() < addr.len() || &token[..addr.len()] != addr.as_slice() {
+    if body.len() < addr.len() || &body[..addr.len()] != addr.as_slice() {
         return None;
     }
 
-    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+    Some(quiche::ConnectionId::from_ref(&body[addr.len()..]))
 }

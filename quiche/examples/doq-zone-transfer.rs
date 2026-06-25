@@ -127,6 +127,7 @@ fn main() {
     // trusted CA bundle and remove this line so the server certificate is
     // authenticated.
     config.verify_peer(false);
+    warn!("Peer verification disabled — do NOT use in production");
 
     config.set_max_idle_timeout(120000); // 2 minutes for zone transfers
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -316,7 +317,13 @@ fn main() {
                             pos += consumed;
                             transfer.messages_received += 1;
 
-                            let msg = Message::from_octets(dns_data).unwrap();
+                            let msg = match Message::from_octets(dns_data) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    eprintln!("Malformed DNS message: {}", e);
+                                    break;
+                                },
+                            };
                             let rcode = msg.header().rcode();
                             let answer_count = msg.header_counts().ancount();
 
