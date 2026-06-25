@@ -26,7 +26,7 @@
 
 //! DNS zone transfer over QUIC (DoQ) client example.
 //!
-//! This example demonstrates how to perform AXFR/IXFR zone transfers over DoQ.
+//! This example demonstrates how to perform AXFR zone transfers over DoQ.
 
 #[macro_use]
 extern crate log;
@@ -34,6 +34,9 @@ extern crate log;
 use ring::rand::*;
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufWriter;
+use std::io::Write;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -42,14 +45,23 @@ use quiche::doq::*;
 mod doq_common;
 use doq_common::*;
 
+use domain::base::iana::Rcode;
 use domain::base::iana::Rtype;
 use domain::base::message::Message;
+use domain::rdata::AllRecordData;
 
 struct ZoneTransfer {
     zone: String,
     start_time: std::time::Instant,
     messages_received: usize,
     total_bytes: usize,
+    records_written: usize,
+    // Set when the server returns a non-zero RCODE or an unparseable message.
+    failed: bool,
+    // Records are streamed to this file as each message is parsed, so the full
+    // zone is persisted without ever holding the whole transfer in memory.
+    out_path: String,
+    out: BufWriter<File>,
 }
 
 fn main() {
@@ -62,41 +74,25 @@ fn main() {
     let cmd = &args.next().unwrap();
 
     if args.len() < 2 {
-        println!("Usage: {cmd} <server:port> <zone> [AXFR|IXFR]");
+        println!("Usage: {cmd} <server> <zone>");
         println!();
         println!("Examples:");
-        println!("  {cmd} 127.0.0.1:853 example.com AXFR");
-        println!("  {cmd} 127.0.0.1:853 example.com IXFR");
+        println!("  {cmd} 127.0.0.1 example.com");
+        println!("  {cmd} 127.0.0.1:853 example.com");
+        println!("  {cmd} [::1] example.com");
+        println!("  {cmd} ns.example.com example.com");
         return;
     }
 
     let server_str = args.next().unwrap();
     let zone = args.next().unwrap();
-    let transfer_type_str = args.next().unwrap_or_else(|| "AXFR".to_string());
 
-    let transfer_type = match transfer_type_str.to_uppercase().as_str() {
-        "AXFR" => Rtype::AXFR,
-        "IXFR" => Rtype::IXFR,
-        _ => {
-            eprintln!(
-                "Invalid transfer type: {} (use AXFR or IXFR)",
-                transfer_type_str
-            );
-            return;
-        },
-    };
-
-    // Parse server address, defaulting to DoQ port if none given.
-    let server_addr = server_str.parse::<std::net::SocketAddr>().or_else(|_| {
-        server_str
-            .parse::<std::net::IpAddr>()
-            .map(|ip| std::net::SocketAddr::new(ip, DOQ_PORT))
-    });
-
-    let peer_addr = match server_addr {
-        Ok(addr) => addr,
+    // Resolve the server address (accepts IPs, bracketed IPv6, and host names)
+    // and derive the TLS SNI server name, defaulting to the DoQ port.
+    let (peer_addr, server_name) = match resolve_server(&server_str, DOQ_PORT) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("Failed to parse server address: {}", e);
+            eprintln!("Failed to resolve server address '{}': {}", server_str, e);
             return;
         },
     };
@@ -147,9 +143,10 @@ fn main() {
 
     let local_addr = socket.local_addr().unwrap();
 
-    // Create the QUIC connection.
+    // Create the QUIC connection. The SNI server name is set only for host
+    // names (RFC 6066 forbids IP-literal SNI).
     let mut conn = quiche::connect(
-        Some(&peer_addr.to_string()),
+        server_name.as_deref(),
         &scid,
         local_addr,
         peer_addr,
@@ -158,8 +155,8 @@ fn main() {
     .unwrap();
 
     info!(
-        "Connecting to {} for {} zone transfer of {}",
-        peer_addr, transfer_type_str, zone
+        "Connecting to {} for AXFR zone transfer of {}",
+        peer_addr, zone
     );
 
     // Initial handshake.
@@ -221,22 +218,16 @@ fn main() {
 
         // Send zone transfer request once connected.
         if conn.is_established() && !transfer_sent {
-            info!(
-                "Connection established, sending {} request",
-                transfer_type_str
-            );
+            info!("Connection established, sending AXFR request");
 
             // Build the zone transfer query.
-            let query = match build_dns_query(&zone, transfer_type) {
+            let query = match build_dns_query(&zone, Rtype::AXFR) {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("Failed to build zone transfer query: {}", e);
                     break;
                 },
             };
-
-            // For IXFR, we would normally add SOA record in the authority section
-            // to indicate the current serial number. This is simplified here.
 
             // Prepare the message with length prefix.
             let mut dns_message = Vec::new();
@@ -255,15 +246,33 @@ fn main() {
                         error!("Failed to send complete query");
                         break;
                     }
-                    info!(
-                        "Sent {} request on stream {}",
-                        transfer_type_str, stream_id
-                    );
+                    info!("Sent AXFR request on stream {}", stream_id);
+
+                    // Stream received records straight to a zone file so the
+                    // full zone is written out without buffering it in memory.
+                    let stem = zone.trim_end_matches('.');
+                    let stem = if stem.is_empty() { "root" } else { stem };
+                    let out_path = format!("{stem}.zone");
+                    let file = match File::create(&out_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to create zone file {}: {}",
+                                out_path, e
+                            );
+                            break;
+                        },
+                    };
+
                     active_transfers.insert(stream_id, ZoneTransfer {
                         zone: zone.clone(),
                         start_time: std::time::Instant::now(),
                         messages_received: 0,
                         total_bytes: 0,
+                        records_written: 0,
+                        failed: false,
+                        out_path,
+                        out: BufWriter::new(file),
                     });
                     transfer_sent = true;
                 },
@@ -274,14 +283,16 @@ fn main() {
             }
         }
 
-        // Process responses.
+        // Process responses. Each complete DNS message is parsed and its
+        // records streamed to the zone file as soon as it arrives, then its
+        // bytes are discarded. The persistent buffer therefore only ever holds
+        // an in-flight partial message (< one max DNS message, ~64 KiB) rather
+        // than the entire zone, so memory stays bounded regardless of zone
+        // size.
         for stream_id in conn.readable() {
-            let stream_buf = stream_bufs.entry(stream_id).or_default();
             let mut is_fin = false;
 
-            // Append newly arrived bytes to the persistent buffer so that
-            // large zone responses spanning multiple event-loop iterations
-            // are not lost.
+            let stream_buf = stream_bufs.entry(stream_id).or_default();
             loop {
                 match conn.stream_recv(stream_id, &mut buf) {
                     Ok((read, fin)) => {
@@ -299,72 +310,78 @@ fn main() {
                 }
             }
 
-            if !is_fin {
-                // Zone response not yet complete; keep buffering.
-                continue;
-            }
-
-            let stream_buf = stream_bufs.remove(&stream_id).unwrap_or_default();
-
+            let mut transfer_failed = false;
             if let Some(transfer) = active_transfers.get_mut(&stream_id) {
-                transfer.total_bytes += stream_buf.len();
+                // Parse and emit every complete message currently buffered.
+                let mut consumed_total = 0;
+                // Stops once there are not enough bytes for another full
+                // message; the remainder is kept for the next iteration.
+                while let Ok((dns_data, consumed)) =
+                    read_dns_message(&stream_buf[consumed_total..])
+                {
+                    consumed_total += consumed;
+                    transfer.messages_received += 1;
+                    transfer.total_bytes += consumed;
 
-                // Parse potentially multiple DNS messages in the stream.
-                let mut pos = 0;
-                while pos < stream_buf.len() {
-                    match read_dns_message(&stream_buf[pos..]) {
-                        Ok((dns_data, consumed)) => {
-                            pos += consumed;
-                            transfer.messages_received += 1;
-
-                            let msg = match Message::from_octets(dns_data) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    eprintln!("Malformed DNS message: {}", e);
-                                    break;
-                                },
-                            };
-                            let rcode = msg.header().rcode();
-                            let answer_count = msg.header_counts().ancount();
-
-                            if rcode.to_int() != 0 {
-                                eprintln!(
-                                    "Transfer failed with rcode: {}",
-                                    rcode
-                                );
-                                conn.close(
-                                    true,
-                                    DoqError::NoError.to_wire(),
-                                    b"done",
-                                )
-                                .ok();
-                                break;
-                            }
-
-                            debug!(
-                                "Received zone transfer message {} ({} answers)",
-                                transfer.messages_received, answer_count
-                            );
+                    match write_message_records(transfer, dns_data) {
+                        Ok(rcode) if rcode == Rcode::NOERROR => {},
+                        Ok(rcode) => {
+                            eprintln!("Transfer failed with rcode: {rcode}");
+                            transfer.failed = true;
+                            transfer_failed = true;
+                            break;
                         },
                         Err(e) => {
-                            if is_fin {
-                                // Stream finished, we're done.
-                                break;
-                            }
-                            error!("Failed to parse DNS message: {}", e);
+                            eprintln!("Failed to process DNS message: {}", e);
+                            transfer.failed = true;
+                            transfer_failed = true;
                             break;
                         },
                     }
                 }
 
-                if is_fin {
-                    let elapsed = transfer.start_time.elapsed();
-                    println!("\n{} Transfer Complete:", transfer_type_str);
+                // Discard fully processed bytes, keeping only the partial tail.
+                stream_buf.drain(..consumed_total);
+            }
+
+            if transfer_failed {
+                conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
+            }
+
+            if !is_fin {
+                // Zone response not yet complete; keep buffering the tail.
+                continue;
+            }
+
+            // Stream finished: flush the zone file and finalize the transfer.
+            stream_bufs.remove(&stream_id);
+
+            if let Some(mut transfer) = active_transfers.remove(&stream_id) {
+                if let Err(e) = transfer.out.flush() {
+                    eprintln!("Failed to flush zone file: {}", e);
+                }
+
+                let elapsed = transfer.start_time.elapsed();
+                if transfer.failed {
+                    // The server rejected the request (e.g. NOTIMPL/REFUSED) or
+                    // sent a malformed message; remove the empty/partial file.
+                    let _ = std::fs::remove_file(&transfer.out_path);
+                    println!("\nAXFR Transfer FAILED:");
                     println!("  Zone: {}", transfer.zone);
                     println!(
                         "  Messages received: {}",
                         transfer.messages_received
                     );
+                    println!("  Duration: {:?}", elapsed);
+                } else {
+                    println!("\nAXFR Transfer Complete:");
+                    println!("  Zone: {}", transfer.zone);
+                    println!(
+                        "  Messages received: {}",
+                        transfer.messages_received
+                    );
+                    println!("  Records written: {}", transfer.records_written);
+                    println!("  Zone file: {}", transfer.out_path);
                     println!("  Total bytes: {}", transfer.total_bytes);
                     println!("  Duration: {:?}", elapsed);
                     println!(
@@ -372,15 +389,12 @@ fn main() {
                         (transfer.total_bytes as f64 / 1024.0) /
                             elapsed.as_secs_f64()
                     );
+                }
 
-                    active_transfers.remove(&stream_id);
-
-                    // Close the connection if no more transfers.
-                    if active_transfers.is_empty() {
-                        info!("All transfers complete, closing connection");
-                        conn.close(true, DoqError::NoError.to_wire(), b"done")
-                            .ok();
-                    }
+                // Close the connection if no more transfers.
+                if active_transfers.is_empty() {
+                    info!("All transfers complete, closing connection");
+                    conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
                 }
             }
         }
@@ -411,4 +425,31 @@ fn main() {
             break;
         }
     }
+}
+
+/// Parse a single DNS message and append its answer-section records to the
+/// transfer's zone file in presentation (zone-file) format.
+///
+/// Records are written out as they are parsed and never retained, so the full
+/// zone is persisted to disk without ever buffering it in memory. Returns the
+/// message RCODE so the caller can detect a failed transfer (a non-zero RCODE).
+fn write_message_records(
+    transfer: &mut ZoneTransfer, dns_data: &[u8],
+) -> Result<Rcode, Box<dyn std::error::Error>> {
+    let msg = Message::from_octets(dns_data)?;
+
+    let rcode = msg.header().rcode();
+    if rcode != Rcode::NOERROR {
+        return Ok(rcode);
+    }
+
+    for record in msg.answer()? {
+        let record = record?;
+        if let Some(record) = record.into_record::<AllRecordData<_, _>>()? {
+            writeln!(transfer.out, "{record}")?;
+            transfer.records_written += 1;
+        }
+    }
+
+    Ok(rcode)
 }

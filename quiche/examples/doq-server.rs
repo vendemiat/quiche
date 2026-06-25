@@ -43,6 +43,15 @@ use ring::rand::*;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const MAX_CLIENTS: usize = 1024;
 
+// Upper bound on the total bytes a single client may buffer across all of its
+// incomplete (partial) DNS queries. QUIC flow control already caps each stream
+// at 65537 bytes, but without an application-level limit a slow-loris client
+// could open many streams and dribble bytes to pin ~6.5 MB per connection. Cap
+// the aggregate so abandoned/slow streams cannot accumulate unbounded memory;
+// exceeding it is treated as DOQ_EXCESSIVE_LOAD
+// (<https://datatracker.ietf.org/doc/html/rfc9250#section-4.3>).
+const MAX_PARTIAL_QUERY_BYTES: usize = 256 * 1024;
+
 use quiche::doq::*;
 
 mod doq_common;
@@ -131,6 +140,16 @@ fn main() {
     config.set_disable_active_migration(true);
 
     // Enable 0-RTT.
+    //
+    // WARNING: 0-RTT data is replayable by an on-path attacker. This example
+    // gates non-replayable opcodes via `is_replayable_opcode` (RFC 9250 §4.5)
+    // and otherwise just returns NXDOMAIN with no backend work, so replay has
+    // no effect here. In production, even the opcodes §4.5 permits in 0-RTT are
+    // not consequence-free when replayed: a replayed QUERY still forces repeated
+    // (potentially expensive) resolution/validation and skews rate-limit and
+    // metrics accounting, and a replayed NOTIFY can repeatedly trigger zone
+    // transfers. A production server MUST bound replay-induced load with an
+    // anti-replay cache and/or rate limiting before acting on 0-RTT queries.
     config.enable_early_data();
 
     let rng = SystemRandom::new();
@@ -352,7 +371,7 @@ fn main() {
 
             if is_early_data || client.conn.is_established() {
                 for stream_id in client.conn.readable() {
-                    handle_stream(client, stream_id, is_early_data);
+                    handle_stream(client, stream_id, is_early_data, &mut buf);
                 }
             }
         }
@@ -407,7 +426,12 @@ fn main() {
 }
 
 /// Handle incoming data on a stream.
-fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
+///
+/// `buf` is a caller-provided scratch buffer (reused across calls) used to
+/// drain the stream, avoiding a 64 KiB stack allocation per invocation.
+fn handle_stream(
+    client: &mut Client, stream_id: u64, is_early_data: bool, buf: &mut [u8],
+) {
     let conn_id = client.conn.trace_id().to_string();
     debug!("{} stream {} is readable", conn_id, stream_id);
 
@@ -419,10 +443,9 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
         .unwrap_or_default();
 
     // Read all available data from the stream.
-    let mut buf = [0; 65535];
     let mut fin = false;
     loop {
-        match client.conn.stream_recv(stream_id, &mut buf) {
+        match client.conn.stream_recv(stream_id, buf) {
             Ok((0, _)) => break,
             Ok((n, f)) => {
                 stream_data.extend_from_slice(&buf[..n]);
@@ -467,6 +490,29 @@ fn handle_stream(client: &mut Client, stream_id: u64, is_early_data: bool) {
 
         // Still waiting for more data; save partial state.
         if !stream_data.is_empty() {
+            // Enforce a per-client cap on buffered partial-query bytes so a
+            // slow-loris client cannot pin unbounded memory across many
+            // streams. The entry for this stream was already removed above, so
+            // the running total excludes it.
+            let buffered: usize =
+                client.partial_queries.values().map(|p| p.data.len()).sum();
+
+            if buffered + stream_data.len() > MAX_PARTIAL_QUERY_BYTES {
+                error!(
+                    "{} exceeded partial-query buffer limit ({} bytes)",
+                    conn_id, MAX_PARTIAL_QUERY_BYTES
+                );
+                client
+                    .conn
+                    .close(
+                        true,
+                        DoqError::ExcessiveLoad.to_wire(),
+                        b"excessive buffered data",
+                    )
+                    .ok();
+                return;
+            }
+
             client.partial_queries.insert(stream_id, PartialDnsQuery {
                 data: stream_data,
                 expected_len,

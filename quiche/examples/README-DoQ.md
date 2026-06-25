@@ -32,7 +32,15 @@ cargo run --example doq-client --features doq -- 127.0.0.1 example.com AAAA
 
 # Query using IPv6
 cargo run --example doq-client --features doq -- ::1 example.com
+
+# Query a public DoQ server by host name (h.root-servers.net supports DoQ)
+cargo run --example doq-client --features doq -- h.root-servers.net . SOA
 ```
+
+The server argument accepts an IP (`192.0.2.1`), an IP with port
+(`192.0.2.1:853`), a bracketed IPv6 literal (`[::1]` or `[::1]:853`), or a host
+name (`h.root-servers.net`), which is resolved via the system resolver and used
+as the TLS SNI.
 
 ### DoQ Server (`doq-server.rs`)
 
@@ -51,18 +59,20 @@ cargo run --example doq-server --features doq -- 127.0.0.1:8853
 
 ### Zone Transfer Client (`doq-zone-transfer.rs`)
 
-Demonstrates DNS zone transfers (AXFR/IXFR) over DoQ.
+Demonstrates DNS AXFR zone transfers over DoQ.
 
 ```bash
 # Build the example
 cargo build --example doq-zone-transfer --features doq
 
 # Perform an AXFR zone transfer
-cargo run --example doq-zone-transfer --features doq -- 127.0.0.1 example.com AXFR
-
-# Perform an IXFR zone transfer
-cargo run --example doq-zone-transfer --features doq -- 127.0.0.1 example.com IXFR
+cargo run --example doq-zone-transfer --features doq -- 127.0.0.1 example.com
 ```
+
+Received records are parsed incrementally and streamed to a zone file named
+`<zone>.zone` (e.g. `example.com.zone`, or `root.zone` for the root zone) in the
+current directory, so the full zone is written to disk without buffering the
+entire transfer in memory.
 
 ## Common Module (`doq_common/`)
 
@@ -106,7 +116,7 @@ Run the DoQ unit tests (covering wire format, error codes, and the
 0-RTT replayable-opcode helper):
 
 ```bash
-cargo test --features doq --workspace --lib doq
+cargo test --features doq --workspace --lib -- doq
 ```
 
 ## Production Deployment

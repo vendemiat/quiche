@@ -46,6 +46,7 @@ use domain::base::Message;
 
 mod doq_common;
 use doq_common::build_dns_query;
+use doq_common::resolve_server;
 
 struct PendingQuery {
     domain: String,
@@ -68,8 +69,9 @@ fn main() {
         println!("Examples:");
         println!("  {cmd} 127.0.0.1 example.com");
         println!("  {cmd} 127.0.0.1 example.com A");
-        println!("  {cmd} 127.0.0.1 example.com AAAA");
+        println!("  {cmd} 127.0.0.1:853 example.com AAAA");
         println!("  {cmd} [::1] example.com");
+        println!("  {cmd} h.root-servers.net . SOA");
         return;
     }
 
@@ -86,17 +88,12 @@ fn main() {
         },
     };
 
-    // Parse server address, defaulting to DoQ port if none given.
-    let server_addr = server_str.parse::<std::net::SocketAddr>().or_else(|_| {
-        server_str
-            .parse::<std::net::IpAddr>()
-            .map(|ip| std::net::SocketAddr::new(ip, DOQ_PORT))
-    });
-
-    let peer_addr = match server_addr {
-        Ok(addr) => addr,
+    // Resolve the server address (accepts IPs, bracketed IPv6, and host names)
+    // and derive the TLS SNI server name, defaulting to the DoQ port.
+    let (peer_addr, server_name) = match resolve_server(&server_str, DOQ_PORT) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("Failed to parse server address: {}", e);
+            eprintln!("Failed to resolve server address '{}': {}", server_str, e);
             return;
         },
     };
@@ -145,9 +142,10 @@ fn main() {
 
     let local_addr = socket.local_addr().unwrap();
 
-    // Create the QUIC connection.
+    // Create the QUIC connection. The SNI server name is set only for host
+    // names (RFC 6066 forbids IP-literal SNI).
     let mut conn = quiche::connect(
-        Some(&peer_addr.to_string()),
+        server_name.as_deref(),
         &scid,
         local_addr,
         peer_addr,

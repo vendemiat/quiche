@@ -26,8 +26,8 @@
 
 //! DNS over QUIC (DoQ) support.
 
+use std::fmt;
 use std::io::Write;
-use thiserror::Error;
 
 /// The ALPN token for DoQ as specified in
 /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.1>
@@ -39,35 +39,28 @@ pub const DOQ_PORT: u16 = 853;
 
 /// DoQ error codes as specified in
 /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3>
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum DoqError {
-    /// see RFC9250 section 4.3 DOQ_NO_ERROR
-    #[error("see RFC9250 section 4.3 DOQ_NO_ERROR")]
+    /// No error (DOQ_NO_ERROR, RFC 9250 §4.3).
     NoError          = 0x0,
 
-    /// see RFC9250 section 4.3 DOQ_INTERNAL_ERROR
-    #[error("see RFC9250 section 4.3 DOQ_INTERNAL_ERROR")]
+    /// Internal error (DOQ_INTERNAL_ERROR, RFC 9250 §4.3).
     InternalError    = 0x1,
 
-    /// see RFC9250 section 4.3 DOQ_PROTOCOL_ERROR
-    #[error("see RFC9250 section 4.3 DOQ_PROTOCOL_ERROR")]
+    /// Protocol error (DOQ_PROTOCOL_ERROR, RFC 9250 §4.3).
     ProtocolError    = 0x2,
 
-    /// see RFC9250 section 4.3 DOQ_REQUEST_CANCELLED
-    #[error("see RFC9250 section 4.3 DOQ_REQUEST_CANCELLED")]
+    /// Request cancelled (DOQ_REQUEST_CANCELLED, RFC 9250 §4.3).
     RequestCancelled = 0x3,
 
-    /// see RFC9250 section 4.3 DOQ_EXCESSIVE_LOAD
-    #[error("see RFC9250 section 4.3 DOQ_EXCESSIVE_LOAD")]
+    /// Excessive load (DOQ_EXCESSIVE_LOAD, RFC 9250 §4.3).
     ExcessiveLoad    = 0x4,
 
-    /// see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR
-    #[error("see RFC9250 section 4.3 DOQ_UNSPECIFIED_ERROR")]
+    /// Unspecified error (DOQ_UNSPECIFIED_ERROR, RFC 9250 §4.3).
     UnspecifiedError = 0x5,
 
-    /// see RFC9250 section 4.3 DOQ_ERROR_RESERVED
-    #[error("see RFC9250 section 4.3 DOQ_ERROR_RESERVED")]
+    /// Reserved error for testing (DOQ_ERROR_RESERVED, RFC 9250 §4.3).
     ErrorReserved    = 0xd098ea5e,
 }
 
@@ -78,30 +71,74 @@ impl DoqError {
     }
 }
 
+impl fmt::Display for DoqError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            DoqError::NoError => "no error",
+            DoqError::InternalError => "internal error",
+            DoqError::ProtocolError => "protocol error",
+            DoqError::RequestCancelled => "request cancelled",
+            DoqError::ExcessiveLoad => "excessive load",
+            DoqError::UnspecifiedError => "unspecified error",
+            DoqError::ErrorReserved => "reserved error",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl std::error::Error for DoqError {}
+
 /// DoQ DNS wire-format read/write errors.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum DnsWireError {
     /// length is less than 2 bytes
-    #[error("length is less than 2 bytes")]
     LenDataIncomplete,
 
     /// DNS message is less than specified length
-    #[error("DNS message is less than specified length")]
-    DNSMessageIncomplete,
+    DnsMessageIncomplete,
 
     /// DNS message is too large (max 65535 bytes)
-    #[error("DNS message is too large (max 65535 bytes)")]
-    DNSMessageTooLarge,
+    DnsMessageTooLarge,
 
     /// IO error
-    #[error("IO error: {0}")]
-    IOError(#[from] std::io::Error),
+    IoError(std::io::Error),
 }
 
-/// DNS opcodes that are considered replayable for 0-RTT.
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>
+impl fmt::Display for DnsWireError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DnsWireError::LenDataIncomplete =>
+                write!(f, "length is less than 2 bytes"),
+            DnsWireError::DnsMessageIncomplete =>
+                write!(f, "DNS message is less than specified length"),
+            DnsWireError::DnsMessageTooLarge =>
+                write!(f, "DNS message is too large (max 65535 bytes)"),
+            DnsWireError::IoError(e) => write!(f, "IO error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DnsWireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DnsWireError::IoError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for DnsWireError {
+    fn from(e: std::io::Error) -> Self {
+        DnsWireError::IoError(e)
+    }
+}
+
+/// Returns whether a DNS opcode is considered replayable in 0-RTT data.
+///
+/// The `opcode` is the 4-bit DNS OPCODE field (values 0-15) as defined in
+/// RFC 1035 §4.1.1. QUERY (0) and NOTIFY (4) are safe for 0-RTT per
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>.
 pub fn is_replayable_opcode(opcode: u8) -> bool {
-    // QUERY (0) and NOTIFY (4) are safe for 0-RTT
     matches!(opcode, 0 | 4)
 }
 
@@ -116,7 +153,7 @@ pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), DnsWireError> {
     let length = u16::from_be_bytes([data[0], data[1]]) as usize;
 
     if data.len() < 2 + length {
-        return Err(DnsWireError::DNSMessageIncomplete);
+        return Err(DnsWireError::DnsMessageIncomplete);
     }
 
     Ok((&data[2..2 + length], 2 + length))
@@ -127,7 +164,7 @@ pub fn write_dns_message<W: Write>(
     writer: &mut W, dns_data: &[u8],
 ) -> Result<(), DnsWireError> {
     if dns_data.len() > 65535 {
-        return Err(DnsWireError::DNSMessageTooLarge);
+        return Err(DnsWireError::DnsMessageTooLarge);
     }
 
     let length = (dns_data.len() as u16).to_be_bytes();
@@ -234,8 +271,8 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            DnsWireError::DNSMessageIncomplete => {},
-            _ => panic!("Expected DNSMessageIncomplete error"),
+            DnsWireError::DnsMessageIncomplete => {},
+            _ => panic!("Expected DnsMessageIncomplete error"),
         }
     }
 
@@ -304,8 +341,8 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            DnsWireError::DNSMessageTooLarge => {},
-            _ => panic!("Expected DNSMessageTooLarge error"),
+            DnsWireError::DnsMessageTooLarge => {},
+            _ => panic!("Expected DnsMessageTooLarge error"),
         }
     }
 }
