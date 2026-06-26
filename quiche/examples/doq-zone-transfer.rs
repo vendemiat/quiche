@@ -40,6 +40,12 @@ use std::io::Write;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+/// How long to wait for the server's REQUIRED STREAM FIN (RFC 9250 §4.2) after
+/// the closing SOA has been received, before treating the stream as "dangling"
+/// (RFC 9250 §4.2) and tearing the connection down with DOQ_PROTOCOL_ERROR
+/// (RFC 9250 §4.3.3 — "does not indicate the expected STREAM FIN").
+const FIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 use quiche::doq::*;
 
 mod doq_common;
@@ -58,6 +64,21 @@ struct ZoneTransfer {
     records_written: usize,
     // Set when the server returns a non-zero RCODE or an unparseable message.
     failed: bool,
+    // Number of SOA records seen. Per RFC 5936, an AXFR response is bracketed
+    // by the zone's SOA: the first SOA is the zone apex SOA (written to the
+    // file), and the second SOA marks the end of the transfer and MUST NOT be
+    // written — a zone file has exactly one SOA.
+    soa_seen: u32,
+    // Set once the closing SOA has been seen, i.e. the zone DATA is complete.
+    // Note: the DoQ response is only fully terminated once the server also
+    // sends the STREAM FIN (RFC 9250 §4.2); this flag alone is not enough.
+    complete: bool,
+    // When the closing SOA was seen, used to bound how long we wait for the
+    // server's required STREAM FIN before declaring a dangling stream.
+    complete_at: Option<std::time::Instant>,
+    // Set if data arrives after the closing SOA (RFC 5936 forbids this; it is
+    // a fatal DoQ protocol error per RFC 9250 §4.3.3).
+    protocol_error: bool,
     // Records are streamed to this file as each message is parsed, so the full
     // zone is persisted without ever holding the whole transfer in memory.
     out_path: String,
@@ -176,7 +197,19 @@ fn main() {
     let mut next_stream_id = 0;
 
     loop {
-        poll.poll(&mut events, conn.timeout()).unwrap();
+        // Wake no later than the dangling-stream grace deadline so a transfer
+        // whose data is complete but whose STREAM FIN never arrives can be
+        // torn down promptly (RFC 9250 §4.2/§4.3.3) rather than lingering
+        // until the idle timeout.
+        let mut timeout = conn.timeout();
+        let now = std::time::Instant::now();
+        for t in active_transfers.values() {
+            if let Some(at) = t.complete_at {
+                let remaining = (at + FIN_GRACE).saturating_duration_since(now);
+                timeout = Some(timeout.map_or(remaining, |c| c.min(remaining)));
+            }
+        }
+        poll.poll(&mut events, timeout).unwrap();
 
         // Read incoming UDP packets.
         'read: loop {
@@ -271,6 +304,10 @@ fn main() {
                         total_bytes: 0,
                         records_written: 0,
                         failed: false,
+                        soa_seen: 0,
+                        complete: false,
+                        complete_at: None,
+                        protocol_error: false,
                         out_path,
                         out: BufWriter::new(file),
                     });
@@ -310,7 +347,6 @@ fn main() {
                 }
             }
 
-            let mut transfer_failed = false;
             if let Some(transfer) = active_transfers.get_mut(&stream_id) {
                 // Parse and emit every complete message currently buffered.
                 let mut consumed_total = 0;
@@ -328,15 +364,19 @@ fn main() {
                         Ok(rcode) => {
                             eprintln!("Transfer failed with rcode: {rcode}");
                             transfer.failed = true;
-                            transfer_failed = true;
                             break;
                         },
                         Err(e) => {
                             eprintln!("Failed to process DNS message: {}", e);
                             transfer.failed = true;
-                            transfer_failed = true;
                             break;
                         },
+                    }
+
+                    // Data after the closing SOA is a fatal DoQ protocol error
+                    // (RFC 9250 §4.3.3); stop processing this stream.
+                    if transfer.protocol_error {
+                        break;
                     }
                 }
 
@@ -344,12 +384,18 @@ fn main() {
                 stream_buf.drain(..consumed_total);
             }
 
-            if transfer_failed {
-                conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
-            }
-
-            if !is_fin {
-                // Zone response not yet complete; keep buffering the tail.
+            // A transfer ends only on the QUIC STREAM FIN — which the server
+            // MUST send after the last response (RFC 9250 §4.2) — or on a DNS
+            // failure / DoQ protocol error. The closing SOA confirms the zone
+            // DATA is complete but is NOT itself the end of the DoQ response,
+            // so we never finalize on it alone; the "dangling" case (closing
+            // SOA seen, FIN missing) is bounded by the grace timer in the main
+            // loop.
+            let done = active_transfers
+                .get(&stream_id)
+                .map(|t| is_fin || t.failed || t.protocol_error)
+                .unwrap_or(false);
+            if !done {
                 continue;
             }
 
@@ -363,8 +409,8 @@ fn main() {
 
                 let elapsed = transfer.start_time.elapsed();
                 if transfer.failed {
-                    // The server rejected the request (e.g. NOTIMPL/REFUSED) or
-                    // sent a malformed message; remove the empty/partial file.
+                    // DNS-level failure (non-zero RCODE) or malformed message;
+                    // a transaction failure, not a DoQ protocol error.
                     let _ = std::fs::remove_file(&transfer.out_path);
                     println!("\nAXFR Transfer FAILED:");
                     println!("  Zone: {}", transfer.zone);
@@ -373,7 +419,43 @@ fn main() {
                         transfer.messages_received
                     );
                     println!("  Duration: {:?}", elapsed);
+                    conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
+                } else if transfer.protocol_error {
+                    // Data after the closing SOA (RFC 5936 §2.2 forbids it):
+                    // fatal DoQ protocol error (RFC 9250 §4.3.3).
+                    let _ = std::fs::remove_file(&transfer.out_path);
+                    println!("\nAXFR Transfer FAILED (protocol error):");
+                    println!("  Zone: {}", transfer.zone);
+                    println!("  Reason: data received after the closing SOA");
+                    println!("  Duration: {:?}", elapsed);
+                    conn.close(
+                        true,
+                        DoqError::ProtocolError.to_wire(),
+                        b"data after soa",
+                    )
+                    .ok();
+                } else if !transfer.complete {
+                    // STREAM FIN before the closing SOA: truncated transfer.
+                    // RFC 9250 §4.3.3 ("STREAM FIN before receiving all the
+                    // expected responses") -> DOQ_PROTOCOL_ERROR.
+                    let _ = std::fs::remove_file(&transfer.out_path);
+                    println!("\nAXFR Transfer INCOMPLETE (truncated):");
+                    println!("  Zone: {}", transfer.zone);
+                    println!(
+                        "  Messages received: {}",
+                        transfer.messages_received
+                    );
+                    println!("  Records written: {}", transfer.records_written);
+                    println!("  Reason: STREAM FIN before the closing SOA");
+                    println!("  Duration: {:?}", elapsed);
+                    conn.close(
+                        true,
+                        DoqError::ProtocolError.to_wire(),
+                        b"truncated",
+                    )
+                    .ok();
                 } else {
+                    // closing SOA + STREAM FIN: a clean, complete transfer.
                     println!("\nAXFR Transfer Complete:");
                     println!("  Zone: {}", transfer.zone);
                     println!(
@@ -389,14 +471,47 @@ fn main() {
                         (transfer.total_bytes as f64 / 1024.0) /
                             elapsed.as_secs_f64()
                     );
-                }
 
-                // Close the connection if no more transfers.
-                if active_transfers.is_empty() {
-                    info!("All transfers complete, closing connection");
-                    conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
+                    // Client is done; close per RFC 9250 §4.4 with
+                    // DOQ_NO_ERROR once nothing else is in flight.
+                    if active_transfers.is_empty() {
+                        info!("All transfers complete, closing connection");
+                        conn.close(true, DoqError::NoError.to_wire(), b"done")
+                            .ok();
+                    }
                 }
             }
+        }
+
+        // Tear down any "dangling" stream (RFC 9250 §4.2): the closing SOA was
+        // received (zone data is complete) but the server has not sent the
+        // REQUIRED STREAM FIN within the grace period. RFC 9250 §4.3.3 treats a
+        // missing expected FIN as a fatal protocol error, so the connection is
+        // aborted with DOQ_PROTOCOL_ERROR. The zone data itself is complete, so
+        // the file is kept.
+        let now = std::time::Instant::now();
+        let dangling: Vec<u64> = active_transfers
+            .iter()
+            .filter(|(_, t)| {
+                t.complete_at
+                    .is_some_and(|at| now.duration_since(at) >= FIN_GRACE)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dangling {
+            stream_bufs.remove(&id);
+            if let Some(mut transfer) = active_transfers.remove(&id) {
+                let _ = transfer.out.flush();
+                println!("\nAXFR data complete, but server omitted STREAM FIN:");
+                println!("  Zone: {}", transfer.zone);
+                println!("  Records written: {}", transfer.records_written);
+                println!("  Zone file: {}", transfer.out_path);
+                println!(
+                    "  Tearing down with DOQ_PROTOCOL_ERROR (RFC 9250 §4.3.3)"
+                );
+            }
+            conn.close(true, DoqError::ProtocolError.to_wire(), b"missing fin")
+                .ok();
         }
 
         // Generate outgoing QUIC packets.
@@ -425,6 +540,30 @@ fn main() {
             break;
         }
     }
+
+    // If the loop exited (connection closed/timed out) with transfers still in
+    // flight, classify each by how far it got. A transfer that received the
+    // closing SOA has complete, valid zone data (the file is kept) but never
+    // saw the STREAM FIN; one that did not is truncated (the partial file is
+    // discarded so an incomplete zone — which would still have a single SOA and
+    // look superficially valid — is not left on disk).
+    for (_, mut transfer) in active_transfers.drain() {
+        let _ = transfer.out.flush();
+        if transfer.complete {
+            println!("\nAXFR data complete, but connection closed before FIN:");
+            println!("  Zone: {}", transfer.zone);
+            println!("  Records written: {}", transfer.records_written);
+            println!("  Zone file: {}", transfer.out_path);
+            println!("  Note: missing STREAM FIN (RFC 9250 §4.3.3)");
+        } else {
+            let _ = std::fs::remove_file(&transfer.out_path);
+            println!("\nAXFR Transfer INCOMPLETE (truncated):");
+            println!("  Zone: {}", transfer.zone);
+            println!("  Messages received: {}", transfer.messages_received);
+            println!("  Records written: {}", transfer.records_written);
+            println!("  Reason: connection closed before the closing SOA");
+        }
+    }
 }
 
 /// Parse a single DNS message and append its answer-section records to the
@@ -443,8 +582,31 @@ fn write_message_records(
         return Ok(rcode);
     }
 
+    // We already saw the closing SOA, yet more data arrived: nothing may
+    // follow the closing SOA (RFC 5936 §2.2). Treat it as a fatal DoQ
+    // protocol error (RFC 9250 §4.3.3).
+    if transfer.complete {
+        transfer.protocol_error = true;
+        return Ok(rcode);
+    }
+
     for record in msg.answer()? {
         let record = record?;
+        let is_soa = record.rtype() == Rtype::SOA;
+
+        // An AXFR stream is bracketed by the zone's SOA (RFC 5936 §2.2). The
+        // first SOA is the zone apex SOA and is written; the second SOA is the
+        // end-of-transfer marker and must NOT be written, otherwise the
+        // resulting zone file would contain two SOA records and be invalid.
+        if is_soa {
+            transfer.soa_seen += 1;
+            if transfer.soa_seen >= 2 {
+                transfer.complete = true;
+                transfer.complete_at = Some(std::time::Instant::now());
+                break;
+            }
+        }
+
         if let Some(record) = record.into_record::<AllRecordData<_, _>>()? {
             writeln!(transfer.out, "{record}")?;
             transfer.records_written += 1;
