@@ -142,8 +142,8 @@ fn main() {
 
     let local_addr = socket.local_addr().unwrap();
 
-    // Create the QUIC connection. The SNI server name is set only for host
-    // names (RFC 6066 forbids IP-literal SNI).
+    // Create the QUIC connection. server_name is the TLS SNI, which
+    // resolve_server() leaves unset (None) for IP-literal targets.
     let mut conn = quiche::connect(
         server_name.as_deref(),
         &scid,

@@ -26,7 +26,8 @@
 
 //! DNS over QUIC (DoQ) server implementation.
 //!
-//! This example demonstrates a simple DoQ server according to RFC 9250.
+//! This example demonstrates a simple DoQ server according to
+//! <https://datatracker.ietf.org/doc/html/rfc9250>.
 
 // TODO: Use DoH to 1.1.1.1 to process queries
 // TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-address-validation
@@ -128,24 +129,27 @@ fn main() {
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
-    // DNS messages are at most 65535 bytes + 2-byte length prefix (RFC 9250
-    // §4.6, RFC 1035 §4.2.2). Cap per-stream flow control at the protocol
-    // maximum so a misbehaving client cannot force more than one max-size
-    // message worth of buffering per stream.
+    // DNS messages are at most 65535 bytes + 2-byte length prefix. Cap
+    // per-stream flow control at the protocol maximum so a misbehaving client
+    // cannot force more than one max-size message worth of buffering per
+    // stream.
+    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.6>
+    // <https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2>
     config.set_initial_max_stream_data_bidi_remote(65537);
     config.set_initial_max_stream_data_uni(0); // DoQ doesn't use unidirectional streams
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(0);
-    // RFC 9250 §5.5.4: disable migration for privacy.
+    // Disable migration for privacy.
+    // <https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.4>
     config.set_disable_active_migration(true);
 
     // Enable 0-RTT.
     //
     // WARNING: 0-RTT data is replayable by an on-path attacker. This example
-    // gates non-replayable opcodes via `is_replayable_opcode` (RFC 9250 §4.5)
-    // and otherwise just returns NXDOMAIN with no backend work, so replay has
-    // no effect here. In production, even the opcodes §4.5 permits in 0-RTT are
-    // not consequence-free when replayed: a replayed QUERY still forces repeated
+    // gates non-replayable opcodes via `is_replayable_opcode` and otherwise
+    // just returns NXDOMAIN with no backend work, so replay has no effect here.
+    // In production, even the opcodes permitted in 0-RTT are not
+    // consequence-free when replayed: a replayed QUERY still forces repeated
     // (potentially expensive) resolution/validation and skews rate-limit and
     // metrics accounting, and a replayed NOTIFY can repeatedly trigger zone
     // transfers. A production server MUST bound replay-induced load with an
@@ -474,8 +478,7 @@ fn handle_stream(
 
     if !is_complete {
         if fin {
-            // Stream FIN'd before the full message arrived — protocol error
-            // per RFC 9250 §4.3.3.
+            // Stream FIN'd before the full message arrived — protocol error.
             error!("{} incomplete DNS message on stream {}", conn_id, stream_id);
             client
                 .conn
@@ -549,9 +552,9 @@ fn handle_dns_query(
         Ok(m) => m,
         Err(e) => {
             // The wire framing was valid but the DNS payload is malformed.
-            // RFC 9250 §4.4 says this should close the stream with
-            // DOQ_PROTOCOL_ERROR; for this example we just log and bail
-            // so a hostile client can't panic the server.
+            // This should abort the connection with DOQ_PROTOCOL_ERROR; for
+            // this example we just log and bail so a hostile client can't panic
+            // the server.
             error!("{} malformed DNS query: {}", conn_id, e);
             return;
         },
@@ -559,8 +562,9 @@ fn handle_dns_query(
     let id = msg.header().id();
     let opcode = msg.header().opcode();
 
-    // Check message ID — RFC 9250 §4.2.1 requires ID 0; §4.3.3 says a
-    // non-zero ID is a fatal protocol error.
+    // Check message ID: ID 0 is required; a non-zero ID is a fatal protocol
+    // error.
+    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1>
     if id != 0 {
         error!("{} received DNS query with non-zero ID: {}", conn_id, id);
         client
@@ -580,9 +584,9 @@ fn handle_dns_query(
             "{} non-replayable opcode {:?} in 0-RTT data",
             conn_id, opcode
         );
-        // RFC 9250 §4.5: reply with REFUSED + EDE "Too Early" (code 26,
-        // registered in §8.3:
-        // <https://datatracker.ietf.org/doc/html/rfc9250#section-8.3>).
+        // Reply with REFUSED + EDE "Too Early" (code 26).
+        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>
+        // <https://datatracker.ietf.org/doc/html/rfc9250#section-8.3>
         let response = build_dns_response(query, Rcode::REFUSED, vec![
             ExtendedErrorCode::from_int(26),
         ])

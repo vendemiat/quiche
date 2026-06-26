@@ -42,25 +42,26 @@ pub const DOQ_PORT: u16 = 853;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum DoqError {
-    /// No error (DOQ_NO_ERROR, RFC 9250 §4.3).
+    /// No error (DOQ_NO_ERROR).
     NoError          = 0x0,
 
-    /// Internal error (DOQ_INTERNAL_ERROR, RFC 9250 §4.3).
+    /// Internal error (DOQ_INTERNAL_ERROR).
     InternalError    = 0x1,
 
-    /// Protocol error (DOQ_PROTOCOL_ERROR, RFC 9250 §4.3).
+    /// Protocol error (DOQ_PROTOCOL_ERROR). Conditions are enumerated in
+    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
     ProtocolError    = 0x2,
 
-    /// Request cancelled (DOQ_REQUEST_CANCELLED, RFC 9250 §4.3).
+    /// Request cancelled (DOQ_REQUEST_CANCELLED).
     RequestCancelled = 0x3,
 
-    /// Excessive load (DOQ_EXCESSIVE_LOAD, RFC 9250 §4.3).
+    /// Excessive load (DOQ_EXCESSIVE_LOAD).
     ExcessiveLoad    = 0x4,
 
-    /// Unspecified error (DOQ_UNSPECIFIED_ERROR, RFC 9250 §4.3).
+    /// Unspecified error (DOQ_UNSPECIFIED_ERROR).
     UnspecifiedError = 0x5,
 
-    /// Reserved error for testing (DOQ_ERROR_RESERVED, RFC 9250 §4.3).
+    /// Reserved error for testing (DOQ_ERROR_RESERVED).
     ErrorReserved    = 0xd098ea5e,
 }
 
@@ -136,7 +137,8 @@ impl From<std::io::Error> for DnsWireError {
 /// Returns whether a DNS opcode is considered replayable in 0-RTT data.
 ///
 /// The `opcode` is the 4-bit DNS OPCODE field (values 0-15) as defined in
-/// RFC 1035 §4.1.1. QUERY (0) and NOTIFY (4) are safe for 0-RTT per
+/// <https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1>. QUERY (0)
+/// and NOTIFY (4) are safe for 0-RTT per
 /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>.
 pub fn is_replayable_opcode(opcode: u8) -> bool {
     matches!(opcode, 0 | 4)

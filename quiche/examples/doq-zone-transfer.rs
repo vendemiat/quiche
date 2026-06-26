@@ -40,10 +40,11 @@ use std::io::Write;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-/// How long to wait for the server's REQUIRED STREAM FIN (RFC 9250 §4.2) after
-/// the closing SOA has been received, before treating the stream as "dangling"
-/// (RFC 9250 §4.2) and tearing the connection down with DOQ_PROTOCOL_ERROR
-/// (RFC 9250 §4.3.3 — "does not indicate the expected STREAM FIN").
+/// How long to wait for the server's REQUIRED STREAM FIN after the closing SOA
+/// has been received, before treating the stream as "dangling" and tearing the
+/// connection down with DOQ_PROTOCOL_ERROR.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
 const FIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 use quiche::doq::*;
@@ -64,20 +65,23 @@ struct ZoneTransfer {
     records_written: usize,
     // Set when the server returns a non-zero RCODE or an unparseable message.
     failed: bool,
-    // Number of SOA records seen. Per RFC 5936, an AXFR response is bracketed
-    // by the zone's SOA: the first SOA is the zone apex SOA (written to the
-    // file), and the second SOA marks the end of the transfer and MUST NOT be
-    // written — a zone file has exactly one SOA.
+    // Number of SOA records seen. An AXFR response is bracketed by the zone's
+    // SOA: the first SOA is the zone apex SOA (written to the file), and the
+    // second SOA marks the end of the transfer and MUST NOT be written — a zone
+    // file has exactly one SOA.
+    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
     soa_seen: u32,
     // Set once the closing SOA has been seen, i.e. the zone DATA is complete.
     // Note: the DoQ response is only fully terminated once the server also
-    // sends the STREAM FIN (RFC 9250 §4.2); this flag alone is not enough.
+    // sends the STREAM FIN; this flag alone is not enough.
+    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
     complete: bool,
     // When the closing SOA was seen, used to bound how long we wait for the
     // server's required STREAM FIN before declaring a dangling stream.
     complete_at: Option<std::time::Instant>,
-    // Set if data arrives after the closing SOA (RFC 5936 forbids this; it is
-    // a fatal DoQ protocol error per RFC 9250 §4.3.3).
+    // Set if data arrives after the closing SOA, which is forbidden; it is a
+    // fatal DoQ protocol error.
+    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
     protocol_error: bool,
     // Records are streamed to this file as each message is parsed, so the full
     // zone is persisted without ever holding the whole transfer in memory.
@@ -164,8 +168,8 @@ fn main() {
 
     let local_addr = socket.local_addr().unwrap();
 
-    // Create the QUIC connection. The SNI server name is set only for host
-    // names (RFC 6066 forbids IP-literal SNI).
+    // Create the QUIC connection. server_name is the TLS SNI, which
+    // resolve_server() leaves unset (None) for IP-literal targets.
     let mut conn = quiche::connect(
         server_name.as_deref(),
         &scid,
@@ -199,8 +203,8 @@ fn main() {
     loop {
         // Wake no later than the dangling-stream grace deadline so a transfer
         // whose data is complete but whose STREAM FIN never arrives can be
-        // torn down promptly (RFC 9250 §4.2/§4.3.3) rather than lingering
-        // until the idle timeout.
+        // torn down promptly rather than lingering until the idle timeout.
+        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
         let mut timeout = conn.timeout();
         let now = std::time::Instant::now();
         for t in active_transfers.values() {
@@ -373,8 +377,8 @@ fn main() {
                         },
                     }
 
-                    // Data after the closing SOA is a fatal DoQ protocol error
-                    // (RFC 9250 §4.3.3); stop processing this stream.
+                    // Data after the closing SOA is a fatal DoQ protocol error;
+                    // stop processing this stream.
                     if transfer.protocol_error {
                         break;
                     }
@@ -385,12 +389,13 @@ fn main() {
             }
 
             // A transfer ends only on the QUIC STREAM FIN — which the server
-            // MUST send after the last response (RFC 9250 §4.2) — or on a DNS
-            // failure / DoQ protocol error. The closing SOA confirms the zone
-            // DATA is complete but is NOT itself the end of the DoQ response,
-            // so we never finalize on it alone; the "dangling" case (closing
+            // MUST send after the last response — or on a DNS failure / DoQ
+            // protocol error. The closing SOA confirms the zone DATA is
+            // complete but is NOT itself the end of the DoQ response, so we
+            // never finalize on it alone; the "dangling" case (closing
             // SOA seen, FIN missing) is bounded by the grace timer in the main
             // loop.
+            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
             let done = active_transfers
                 .get(&stream_id)
                 .map(|t| is_fin || t.failed || t.protocol_error)
@@ -421,8 +426,9 @@ fn main() {
                     println!("  Duration: {:?}", elapsed);
                     conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
                 } else if transfer.protocol_error {
-                    // Data after the closing SOA (RFC 5936 §2.2 forbids it):
-                    // fatal DoQ protocol error (RFC 9250 §4.3.3).
+                    // Data after the closing SOA is forbidden: a fatal DoQ
+                    // protocol error.
+                    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
                     let _ = std::fs::remove_file(&transfer.out_path);
                     println!("\nAXFR Transfer FAILED (protocol error):");
                     println!("  Zone: {}", transfer.zone);
@@ -435,9 +441,9 @@ fn main() {
                     )
                     .ok();
                 } else if !transfer.complete {
-                    // STREAM FIN before the closing SOA: truncated transfer.
-                    // RFC 9250 §4.3.3 ("STREAM FIN before receiving all the
-                    // expected responses") -> DOQ_PROTOCOL_ERROR.
+                    // STREAM FIN before the closing SOA: truncated transfer
+                    // ("STREAM FIN before receiving all the expected
+                    // responses") -> DOQ_PROTOCOL_ERROR.
                     let _ = std::fs::remove_file(&transfer.out_path);
                     println!("\nAXFR Transfer INCOMPLETE (truncated):");
                     println!("  Zone: {}", transfer.zone);
@@ -472,8 +478,9 @@ fn main() {
                             elapsed.as_secs_f64()
                     );
 
-                    // Client is done; close per RFC 9250 §4.4 with
-                    // DOQ_NO_ERROR once nothing else is in flight.
+                    // Client is done; close with DOQ_NO_ERROR once nothing
+                    // else is in flight.
+                    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.4>
                     if active_transfers.is_empty() {
                         info!("All transfers complete, closing connection");
                         conn.close(true, DoqError::NoError.to_wire(), b"done")
@@ -483,12 +490,12 @@ fn main() {
             }
         }
 
-        // Tear down any "dangling" stream (RFC 9250 §4.2): the closing SOA was
-        // received (zone data is complete) but the server has not sent the
-        // REQUIRED STREAM FIN within the grace period. RFC 9250 §4.3.3 treats a
-        // missing expected FIN as a fatal protocol error, so the connection is
-        // aborted with DOQ_PROTOCOL_ERROR. The zone data itself is complete, so
-        // the file is kept.
+        // Tear down any "dangling" stream: the closing SOA was received (zone
+        // data is complete) but the server has not sent the REQUIRED STREAM FIN
+        // within the grace period, so the connection is aborted with
+        // DOQ_PROTOCOL_ERROR. The zone data itself is complete, so the file is
+        // kept.
+        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
         let now = std::time::Instant::now();
         let dangling: Vec<u64> = active_transfers
             .iter()
@@ -506,9 +513,7 @@ fn main() {
                 println!("  Zone: {}", transfer.zone);
                 println!("  Records written: {}", transfer.records_written);
                 println!("  Zone file: {}", transfer.out_path);
-                println!(
-                    "  Tearing down with DOQ_PROTOCOL_ERROR (RFC 9250 §4.3.3)"
-                );
+                println!("  Tearing down with DOQ_PROTOCOL_ERROR");
             }
             conn.close(true, DoqError::ProtocolError.to_wire(), b"missing fin")
                 .ok();
@@ -554,7 +559,7 @@ fn main() {
             println!("  Zone: {}", transfer.zone);
             println!("  Records written: {}", transfer.records_written);
             println!("  Zone file: {}", transfer.out_path);
-            println!("  Note: missing STREAM FIN (RFC 9250 §4.3.3)");
+            println!("  Note: missing STREAM FIN");
         } else {
             let _ = std::fs::remove_file(&transfer.out_path);
             println!("\nAXFR Transfer INCOMPLETE (truncated):");
@@ -583,8 +588,8 @@ fn write_message_records(
     }
 
     // We already saw the closing SOA, yet more data arrived: nothing may
-    // follow the closing SOA (RFC 5936 §2.2). Treat it as a fatal DoQ
-    // protocol error (RFC 9250 §4.3.3).
+    // follow the closing SOA. Treat it as a fatal DoQ protocol error.
+    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
     if transfer.complete {
         transfer.protocol_error = true;
         return Ok(rcode);
@@ -594,10 +599,11 @@ fn write_message_records(
         let record = record?;
         let is_soa = record.rtype() == Rtype::SOA;
 
-        // An AXFR stream is bracketed by the zone's SOA (RFC 5936 §2.2). The
-        // first SOA is the zone apex SOA and is written; the second SOA is the
-        // end-of-transfer marker and must NOT be written, otherwise the
-        // resulting zone file would contain two SOA records and be invalid.
+        // An AXFR stream is bracketed by the zone's SOA. The first SOA is the
+        // zone apex SOA and is written; the second SOA is the end-of-transfer
+        // marker and must NOT be written, otherwise the resulting zone file
+        // would contain two SOA records and be invalid.
+        // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
         if is_soa {
             transfer.soa_seen += 1;
             if transfer.soa_seen >= 2 {

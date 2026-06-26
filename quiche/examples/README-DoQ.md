@@ -80,7 +80,7 @@ The `doq_common/mod.rs` module provides shared utilities for DoQ examples:
 
 - DoQ constants (port 853, ALPN token "doq")
 - DNS message parsing and serialization with 2-octet length prefix
-- DoQ error codes as specified in RFC 9250
+- DoQ error codes as specified in [RFC 9250](https://datatracker.ietf.org/doc/html/rfc9250#section-4.3)
 - DNS query building utilities
 - Helper functions for DNS message manipulation
 
@@ -88,7 +88,7 @@ The `doq_common/mod.rs` module provides shared utilities for DoQ examples:
 
 ### RFC 9250 Compliance
 
-The implementation follows these key requirements from RFC 9250:
+The implementation follows these key requirements from [RFC 9250](https://datatracker.ietf.org/doc/html/rfc9250):
 
 1. **ALPN Token**: Uses "doq" for Application-Layer Protocol Negotiation
 2. **Default Port**: UDP port 853 (not 53)
