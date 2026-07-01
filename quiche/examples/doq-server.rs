@@ -356,7 +356,7 @@ fn main() {
             };
 
             let recv_info = quiche::RecvInfo {
-                to: socket.local_addr().unwrap(),
+                to: local_addr,
                 from,
             };
 

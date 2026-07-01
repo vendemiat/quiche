@@ -205,7 +205,7 @@ fn main() {
             debug!("got {} bytes", len);
 
             let recv_info = quiche::RecvInfo {
-                to: socket.local_addr().unwrap(),
+                to: local_addr,
                 from,
             };
 
