@@ -60,7 +60,9 @@ pub fn resolve_server(
         return Ok((addr, None));
     }
 
-    // bare IPv4/IPv6 literal without a port
+    // bare IPv4/IPv6 literal without a port (e.g. "::1:853" is a valid
+    // IPv6 address, not "::1" + port 853, and resolves to
+    // [::1:853]:<default_port> here)
     if let Ok(ip) = server.parse::<IpAddr>() {
         return Ok((SocketAddr::new(ip, default_port), None));
     }
