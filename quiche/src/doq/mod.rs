@@ -29,6 +29,13 @@
 use std::fmt;
 use std::io::Write;
 
+mod connection;
+
+pub use connection::Connection;
+pub use connection::Error;
+pub use connection::Event;
+pub use connection::Result;
+
 /// The ALPN token for DoQ as specified in
 /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.1>
 pub const DOQ_ALPN: &[u8] = b"doq";
@@ -147,7 +154,9 @@ pub fn is_replayable_opcode(opcode: u8) -> bool {
 /// Read a DNS message with the 2-octet length prefix.
 /// Returns the DNS message without the length prefix and the number of bytes
 /// consumed.
-pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), DnsWireError> {
+pub fn read_dns_message(
+    data: &[u8],
+) -> std::result::Result<(&[u8], usize), DnsWireError> {
     if data.len() < 2 {
         return Err(DnsWireError::LenDataIncomplete);
     }
@@ -164,7 +173,7 @@ pub fn read_dns_message(data: &[u8]) -> Result<(&[u8], usize), DnsWireError> {
 /// Write a DNS message with the 2-octet length prefix.
 pub fn write_dns_message<W: Write>(
     writer: &mut W, dns_data: &[u8],
-) -> Result<(), DnsWireError> {
+) -> std::result::Result<(), DnsWireError> {
     if dns_data.len() > 65535 {
         return Err(DnsWireError::DnsMessageTooLarge);
     }

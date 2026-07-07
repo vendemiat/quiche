@@ -579,7 +579,7 @@ fn main() {
 /// message RCODE so the caller can detect a failed transfer (a non-zero RCODE).
 fn write_message_records(
     transfer: &mut ZoneTransfer, dns_data: &[u8],
-) -> Result<Rcode, Box<dyn std::error::Error>> {
+) -> std::result::Result<Rcode, Box<dyn std::error::Error>> {
     let msg = Message::from_octets(dns_data)?;
 
     let rcode = msg.header().rcode();
