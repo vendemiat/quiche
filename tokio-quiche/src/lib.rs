@@ -114,6 +114,8 @@
 pub extern crate quiche;
 
 pub mod buf_factory;
+#[cfg(feature = "doq")]
+pub mod doq;
 pub mod http3;
 pub mod metrics;
 pub mod quic;
