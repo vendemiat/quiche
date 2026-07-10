@@ -172,15 +172,15 @@ pub fn read_dns_message(
 
 /// Write a DNS message with the 2-octet length prefix.
 pub fn write_dns_message<W: Write>(
-    writer: &mut W, dns_data: &[u8],
+    writer: &mut W, data: &[u8],
 ) -> std::result::Result<(), DnsWireError> {
-    if dns_data.len() > 65535 {
+    if data.len() > 65535 {
         return Err(DnsWireError::DnsMessageTooLarge);
     }
 
-    let length = (dns_data.len() as u16).to_be_bytes();
+    let length = (data.len() as u16).to_be_bytes();
     writer.write_all(&length)?;
-    writer.write_all(dns_data)?;
+    writer.write_all(data)?;
     Ok(())
 }
 
