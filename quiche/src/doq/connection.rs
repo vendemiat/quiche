@@ -116,7 +116,7 @@ pub enum Event {
         /// The raw DNS message bytes, with the 2-octet length prefix
         /// already stripped. Not parsed or validated in any way — DNS
         /// content is the consumer's responsibility, not the transport's.
-        dns_bytes: Vec<u8>,
+        data: Vec<u8>,
 
         /// Whether these bytes arrived while the QUIC connection was still
         /// in early data (0-RTT). See
@@ -135,7 +135,7 @@ pub enum Event {
     Response {
         /// The raw DNS message bytes, with the 2-octet length prefix
         /// already stripped.
-        dns_bytes: Vec<u8>,
+        data: Vec<u8>,
     },
 
     /// STREAM FIN was observed on a stream after all currently-complete
@@ -146,11 +146,9 @@ pub enum Event {
 
     /// The peer reset the stream (`RESET_STREAM`) or asked the local side to
     /// stop sending (`STOP_SENDING`). The raw wire error code is passed
-    /// through unmapped: there is no `DoqError::from_wire` yet (see the
-    /// `quiche::doq` module docs for why), so a caller that needs the
-    /// unknown-code mapping in
+    /// through unmapped; a caller that needs the unknown-code mapping in
     /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4> must do
-    /// it itself for now.
+    /// it itself.
     Reset(u64),
 }
 
@@ -175,6 +173,18 @@ struct StreamState {
     /// any further bytes on it are recognized as a protocol-error second
     /// query rather than silently ignored.
     query_emitted: bool,
+
+    /// Framed response bytes queued for sending but not yet accepted by the
+    /// QUIC send buffer. Holds only the not-yet-written remainder: each
+    /// partial write drains the bytes it accepted off the front. A single
+    /// framed message may only partially fit in the stream's current
+    /// capacity, so its tail lives here until the stream is writable again.
+    send_buf: Vec<u8>,
+
+    /// Set once the final response has been queued (via `send_response` with
+    /// `fin = true`); the STREAM FIN is delivered once `send_buf` fully
+    /// drains. Once set, no further responses are accepted on this stream.
+    send_fin: bool,
 }
 
 impl StreamState {
@@ -256,51 +266,120 @@ impl Connection {
         Err(Error::Done)
     }
 
-    /// Sends a DNS response message on `stream_id`, framed with the 2-octet
-    /// length prefix.
+    /// Queues a DNS response message on `stream_id`, framed with the 2-octet
+    /// length prefix, and writes as much of it as the stream's current send
+    /// capacity allows.
     ///
-    /// `dns_bytes` is sent verbatim: no padding or other mutation. `fin`
-    /// marks this as the last response for the transaction and closes the
-    /// stream's send side; a zone-transfer stream sends one or more calls
-    /// with `fin = false` followed by a final call with `fin = true`.
+    /// `data` is sent verbatim: no padding or other mutation. `fin` marks
+    /// this as the last response for the transaction; a zone-transfer stream
+    /// sends one or more calls with `fin = false` followed by a final call
+    /// with `fin = true`.
     ///
-    /// Unlike a byte-stream API, a DoQ message can't be split across
-    /// multiple length prefixes, so this call is all-or-nothing with
-    /// respect to the current stream capacity: if the stream doesn't
-    /// currently have enough send capacity for the whole framed message,
-    /// nothing is written and `Err(Error::Done)` is returned. The caller
-    /// (the driver) should retry the same call once the stream is reported
-    /// writable again.
+    /// A framed message that doesn't fit in the stream's current capacity is
+    /// written partially and the remainder is buffered; the caller should
+    /// invoke [`flush_response`](Self::flush_response) once the stream is
+    /// reported writable again to send more. Splitting a single framed
+    /// message across several QUIC stream writes is transparent to the peer,
+    /// which reassembles the length prefix and body from the ordered byte
+    /// stream exactly as DNS over TCP does (see
+    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2> and
+    /// <https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2>). Use
+    /// [`response_pending`](Self::response_pending) to tell whether queued
+    /// bytes remain.
     ///
-    /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen as
-    /// a query stream, or has already been completed or reset — this is a
-    /// normal race with the peer, not a bug, and callers should treat it as
-    /// a no-op.
+    /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen as a
+    /// query stream, has already been completed (its final response was
+    /// queued with `fin = true`), or has been reset — a normal race with the
+    /// peer, not a bug, to be treated as a no-op. Returns
+    /// `Err(Error::MessageTooLarge)` if `data` is larger than the 65535 bytes
+    /// the 2-octet length prefix can represent.
     pub fn send_response<F: BufFactory>(
-        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
-        dns_bytes: &[u8], fin: bool,
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64, data: &[u8],
+        fin: bool,
     ) -> Result<()> {
-        if !self.streams.contains_key(&stream_id) {
-            return Err(Error::UnknownStream);
-        }
+        let state = match self.streams.get_mut(&stream_id) {
+            // A stream whose final response is already queued is treated as
+            // completed and no longer accepts responses.
+            Some(s) if !s.send_fin => s,
+            _ => return Err(Error::UnknownStream),
+        };
 
-        let mut framed = Vec::with_capacity(2 + dns_bytes.len());
-        write_dns_message(&mut framed, dns_bytes)
+        // `write_dns_message` checks the 65535-byte limit before writing, so
+        // it never leaves a partial frame in `send_buf` on error. The new
+        // message is appended after any not-yet-written remainder already
+        // queued on this stream.
+        write_dns_message(&mut state.send_buf, data)
             .map_err(|_| Error::MessageTooLarge)?;
+        state.send_fin = fin;
 
-        match conn.stream_capacity(stream_id) {
-            Ok(cap) if cap >= framed.len() => {},
-            Ok(_) => return Err(Error::Done),
-            Err(e) => return Err(e.into()),
+        self.flush_response(conn, stream_id)
+    }
+
+    /// Writes as many queued response bytes for `stream_id` as the stream's
+    /// current send capacity allows, delivering the STREAM FIN only once the
+    /// final queued byte is written.
+    ///
+    /// Call this when the stream is reported writable to drain a response
+    /// that [`send_response`](Self::send_response) couldn't write in one go.
+    /// quiche clears the FIN flag on any capacity-truncated write, so passing
+    /// the whole remaining buffer on each call delivers the FIN exactly when
+    /// the last byte is accepted.
+    ///
+    /// Returns `Ok(())` whether or not any bytes were written (a stream with
+    /// no capacity is a normal, retryable condition); use
+    /// [`response_pending`](Self::response_pending) to tell whether data
+    /// remains queued. Returns `Err(Error::UnknownStream)` if the stream
+    /// isn't tracked, or a [`Error::TransportError`] if the peer stopped the
+    /// stream (`STOP_SENDING`) — see
+    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>.
+    pub fn flush_response<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> Result<()> {
+        let state = match self.streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return Err(Error::UnknownStream),
+        };
+
+        if state.send_buf.is_empty() && !state.send_fin {
+            return Ok(());
         }
 
-        conn.stream_send(stream_id, &framed, fin)?;
+        match conn.stream_send(stream_id, &state.send_buf, state.send_fin) {
+            Ok(sent) => {
+                // Drop the bytes quiche accepted; `send_buf` keeps only the
+                // not-yet-written remainder.
+                state.send_buf.drain(..sent);
 
-        if fin {
-            self.streams.remove(&stream_id);
+                if state.send_buf.is_empty() {
+                    // The whole queued buffer has been written. Because
+                    // quiche only keeps the FIN flag on a write it accepts in
+                    // full, an empty buffer means the FIN (if any) was
+                    // delivered on this call and the transaction is complete.
+                    if state.send_fin {
+                        self.streams.remove(&stream_id);
+                    }
+                }
+
+                Ok(())
+            },
+
+            // No capacity right now; retry when the stream is writable again.
+            Err(crate::Error::Done) => Ok(()),
+
+            Err(e) => Err(e.into()),
         }
+    }
 
-        Ok(())
+    /// Returns `true` if `stream_id` has queued response bytes not yet
+    /// accepted by the QUIC layer.
+    ///
+    /// A driver uses this to decide whether to wait for the stream to become
+    /// writable before pulling the next response from the application, so the
+    /// per-stream buffer stays bounded to roughly one in-flight message.
+    pub fn response_pending(&self, stream_id: u64) -> bool {
+        self.streams
+            .get(&stream_id)
+            .is_some_and(|s| !s.send_buf.is_empty())
     }
 
     /// Abandons the transaction on `stream_id`, sending `RESET_STREAM` with
@@ -445,7 +524,7 @@ impl Connection {
         }
 
         match read_dns_message(&state.recv_buf) {
-            Ok((dns_bytes, consumed)) => {
+            Ok((data, consumed)) => {
                 // Bytes beyond the first complete message are a second
                 // query framed on the same stream, see
                 // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>,
@@ -458,12 +537,12 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                let dns_bytes = dns_bytes.to_vec();
+                let data = data.to_vec();
                 let is_0rtt = state.is_0rtt;
                 state.query_emitted = true;
                 state.recv_buf.clear();
 
-                Ok(vec![Event::Query { dns_bytes, is_0rtt }])
+                Ok(vec![Event::Query { data, is_0rtt }])
             },
 
             Err(DnsWireError::LenDataIncomplete) |
@@ -496,9 +575,9 @@ impl Connection {
 
         loop {
             match read_dns_message(&state.recv_buf) {
-                Ok((dns_bytes, consumed)) => {
+                Ok((data, consumed)) => {
                     events.push(Event::Response {
-                        dns_bytes: dns_bytes.to_vec(),
+                        data: data.to_vec(),
                     });
                     state.recv_buf.drain(..consumed);
                 },
@@ -545,9 +624,9 @@ mod tests {
         config
     }
 
-    fn framed(dns_bytes: &[u8]) -> Vec<u8> {
+    fn framed(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        write_dns_message(&mut out, dns_bytes).unwrap();
+        write_dns_message(&mut out, data).unwrap();
         out
     }
 
@@ -578,7 +657,7 @@ mod tests {
         assert_eq!(
             server.poll(&mut pipe.server),
             Ok((0, Event::Query {
-                dns_bytes: b"hello".to_vec(),
+                data: b"hello".to_vec(),
                 is_0rtt: false,
             }))
         );
@@ -695,19 +774,19 @@ mod tests {
         assert_eq!(
             client.poll(&mut pipe.client),
             Ok((0, Event::Response {
-                dns_bytes: b"answer 1".to_vec()
+                data: b"answer 1".to_vec()
             }))
         );
         assert_eq!(
             client.poll(&mut pipe.client),
             Ok((0, Event::Response {
-                dns_bytes: b"answer 2".to_vec()
+                data: b"answer 2".to_vec()
             }))
         );
         assert_eq!(
             client.poll(&mut pipe.client),
             Ok((0, Event::Response {
-                dns_bytes: b"answer 3".to_vec()
+                data: b"answer 3".to_vec()
             }))
         );
         assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Finished)));
@@ -791,7 +870,7 @@ mod tests {
         assert_eq!(
             server.poll(&mut pipe.server),
             Ok((0, Event::Query {
-                dns_bytes: b"hello".to_vec(),
+                data: b"hello".to_vec(),
                 is_0rtt: false,
             }))
         );
@@ -804,7 +883,7 @@ mod tests {
         assert_eq!(
             client.poll(&mut pipe.client),
             Ok((0, Event::Response {
-                dns_bytes: b"world".to_vec()
+                data: b"world".to_vec()
             }))
         );
         assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Finished)));
@@ -814,5 +893,239 @@ mod tests {
             server.send_response(&mut pipe.server, 0, b"again", true),
             Err(Error::UnknownStream)
         );
+    }
+
+    /// A `Config` whose server-facing send window on stream 0 is small
+    /// enough to force `send_response` into a partial write, while leaving
+    /// the client's own send path and the connection-level flow control
+    /// unconstrained.
+    fn small_window_config() -> crate::Config {
+        let mut config = Pipe::default_config("cubic").unwrap();
+        config
+            .set_application_protos(&[super::super::DOQ_ALPN])
+            .unwrap();
+        config.set_initial_max_data(10_000);
+        // Deliberately small: the server's send window on the
+        // client-initiated stream 0 is governed by the client's advertised
+        // `bidi_local` limit, so this forces `send_response` to only write
+        // part of a large response in one go.
+        config.set_initial_max_stream_data_bidi_local(20);
+        // Large: keeps the client's own query stream unconstrained, so only
+        // the server's response path is under test.
+        config.set_initial_max_stream_data_bidi_remote(10_000);
+        config
+    }
+
+    /// Drains `server`'s buffered response on `stream_id` across as many
+    /// `flush_response`/`Pipe::advance` round trips as it takes for the
+    /// small window in [`small_window_config`] to grow enough, polling
+    /// `client` after each round trip and collecting every event it
+    /// produces along the way. Bounded so a regression that never drains
+    /// fails the test instead of hanging it.
+    fn drain_response(
+        pipe: &mut Pipe, server: &mut Connection, client: &mut Connection,
+        stream_id: u64,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut iterations = 0;
+
+        loop {
+            pipe.advance().unwrap();
+
+            loop {
+                match client.poll(&mut pipe.client) {
+                    Ok((_, ev)) => events.push(ev),
+                    Err(Error::Done) => break,
+                    Err(e) => panic!("unexpected client poll error: {e:?}"),
+                }
+            }
+
+            pipe.advance().unwrap();
+
+            if !server.response_pending(stream_id) {
+                break;
+            }
+
+            server.flush_response(&mut pipe.server, stream_id).unwrap();
+
+            iterations += 1;
+            assert!(iterations < 50, "drain loop did not terminate");
+        }
+
+        events
+    }
+
+    #[test]
+    fn send_response_partial_write_drains_across_flushes() {
+        let mut config = small_window_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+
+        pipe.client.stream_send(0, &framed(b"query"), true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"query".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+
+        let body = vec![0xAB; 200];
+
+        assert_eq!(
+            server.send_response(&mut pipe.server, 0, &body, true),
+            Ok(())
+        );
+        assert!(
+            server.response_pending(0),
+            "200 bytes shouldn't fit in the 20-byte window in one write"
+        );
+
+        let events = drain_response(&mut pipe, &mut server, &mut client, 0);
+
+        assert!(!server.response_pending(0));
+        assert_eq!(events, vec![
+            Event::Response { data: body },
+            Event::Finished,
+        ]);
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+    }
+
+    #[test]
+    fn fin_not_delivered_until_response_fully_drained() {
+        let mut config = small_window_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+
+        pipe.client.stream_send(0, &framed(b"query"), true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"query".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+
+        let body = vec![0xAB; 200];
+
+        server
+            .send_response(&mut pipe.server, 0, &body, true)
+            .unwrap();
+        assert!(
+            server.response_pending(0),
+            "200 bytes shouldn't fit in the 20-byte window in one write"
+        );
+
+        // Only the first partial write has reached the client so far, so
+        // the framed message is still incomplete: even though quiche
+        // cleared the QUIC-level FIN flag on the truncated write, the
+        // client must not report `Finished` yet.
+        pipe.advance().unwrap();
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+
+        let events = drain_response(&mut pipe, &mut server, &mut client, 0);
+
+        assert!(!server.response_pending(0));
+        assert_eq!(events, vec![
+            Event::Response { data: body },
+            Event::Finished,
+        ]);
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+    }
+
+    #[test]
+    fn send_response_after_partial_final_is_unknown_stream() {
+        let mut config = small_window_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        pipe.client.stream_send(0, &framed(b"query"), true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"query".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+
+        let body = vec![0xAB; 200];
+
+        server
+            .send_response(&mut pipe.server, 0, &body, true)
+            .unwrap();
+        assert!(
+            server.response_pending(0),
+            "200 bytes shouldn't fit in the 20-byte window in one write"
+        );
+
+        // `send_fin` is already set even though bytes are still buffered,
+        // so a second response on the same stream is rejected up front.
+        assert_eq!(
+            server.send_response(&mut pipe.server, 0, b"too late", true),
+            Err(Error::UnknownStream)
+        );
+    }
+
+    #[test]
+    fn multi_response_partial_writes() {
+        let mut config = small_window_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+
+        pipe.client
+            .stream_send(0, &framed(b"axfr query"), true)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"axfr query".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+
+        let body1 = vec![0x11; 150];
+        let body2 = vec![0x22; 150];
+        let body3 = vec![0x33; 150];
+
+        server
+            .send_response(&mut pipe.server, 0, &body1, false)
+            .unwrap();
+        server
+            .send_response(&mut pipe.server, 0, &body2, false)
+            .unwrap();
+        server
+            .send_response(&mut pipe.server, 0, &body3, true)
+            .unwrap();
+        assert!(server.response_pending(0));
+
+        let events = drain_response(&mut pipe, &mut server, &mut client, 0);
+
+        assert!(!server.response_pending(0));
+        assert_eq!(events, vec![
+            Event::Response { data: body1 },
+            Event::Response { data: body2 },
+            Event::Response { data: body3 },
+            Event::Finished,
+        ]);
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
     }
 }
