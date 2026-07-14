@@ -69,6 +69,11 @@ use std::fmt;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+mod driver;
+
+pub use driver::DoqController;
+pub use driver::DoqServerDriver;
+
 // Re-export the quiche wire-format primitives so consumers only need to depend
 // on `tokio_quiche::doq`.
 #[doc(no_inline)]
