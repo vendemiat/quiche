@@ -707,16 +707,19 @@ impl Future for WaitForResponder {
     fn poll(
         mut self: Pin<&mut Self>, cx: &mut Context<'_>,
     ) -> Poll<Self::Output> {
-        // Unwrap is OK: `rx` is only `None` after the first `Poll::Ready`,
+        // Expect is OK: `rx` is only `None` after the first `Poll::Ready`,
         // which is fine to panic for a non-fused future (same contract as
         // `WaitForDownstreamData` in `http3/driver/streams.rs`).
         self.rx
             .as_mut()
-            .unwrap()
+            .expect("WaitForResponder polled after completion")
             .poll_recv(cx)
             .map(|message| ResponderReady {
                 stream_id: self.stream_id,
-                rx: self.rx.take().unwrap(),
+                rx: self
+                    .rx
+                    .take()
+                    .expect("WaitForResponder polled after completion"),
                 message,
             })
     }
