@@ -58,6 +58,13 @@ const RESPONDER_CAPACITY: usize = 16;
 #[cfg(any(test, debug_assertions))]
 const RESPONDER_CAPACITY: usize = 1;
 
+// Extra `EVENT_CAPACITY` headroom for `DoqEvent::HandshakeConfirmed`, which
+// can be pending in the channel at the same time as a full burst of
+// `Query` events (reads are processed before writes each iteration, and
+// `HandshakeConfirmed` is only sent from `process_writes`). See
+// `DoqServerDriver::new` for the rest of the sizing rationale.
+const EVENT_CAPACITY_MARGIN: u64 = 1;
+
 /// Per-query tracking, keyed by `stream_id` in
 /// [`DoqServerDriver::streams`]: the sole source of truth for whether a
 /// query is still live, mirroring `H3Driver::stream_map`/`StreamCtx`.
@@ -91,8 +98,10 @@ pub struct DoqServerDriver {
     /// `ApplicationOverQuic::on_conn_established`.
     conn: Option<doq::Connection>,
 
-    /// Sends [`DoqEvent`]s to the paired [`DoqController`].
-    event_sender: mpsc::UnboundedSender<DoqEvent>,
+    /// Sends [`DoqEvent`]s to the paired [`DoqController`]. Bounded (see
+    /// [`DoqServerDriver::new`]) so a stalled consumer can't pin unbounded
+    /// memory.
+    event_sender: mpsc::Sender<DoqEvent>,
     /// Receives [`DoqCommand`]s from the paired [`DoqController`].
     cmd_recv: mpsc::UnboundedReceiver<DoqCommand>,
 
@@ -122,12 +131,40 @@ impl DoqServerDriver {
     /// The driver should then be passed to
     /// [`InitialQuicConnection`](crate::quic::InitialQuicConnection)'s
     /// `start` method. Unlike [`H3Driver`](crate::http3::driver::H3Driver),
-    /// this takes no settings: DoQ's only connection-level knobs
-    /// (`initial_max_streams_bidi`, `max_idle_timeout`) are existing
-    /// [`QuicSettings`](crate::settings::QuicSettings) fields, set before
+    /// this takes no general settings: DoQ's other connection-level knob
+    /// (`max_idle_timeout`) is an existing
+    /// [`QuicSettings`](crate::settings::QuicSettings) field, set before
     /// this driver is created.
-    pub fn new() -> (Self, DoqController) {
-        let (event_sender, event_recv) = mpsc::unbounded_channel();
+    ///
+    /// `initial_max_streams_bidi` must be the same value configured on the
+    /// [`QuicSettings`](crate::settings::QuicSettings)/[`quiche::Config`]
+    /// used for this connection. It sizes the bounded `DoqEvent` channel:
+    /// a `DoqEvent::Query` is emitted once per stream, exactly when that
+    /// stream's query is fully received, and quiche only credits back a
+    /// stream-limit slot once the stream is fully complete in both
+    /// directions (`Stream::is_complete()`, `quiche/src/stream/mod.rs`) —
+    /// i.e. once the driver has fully sent its response. So the number of
+    /// streams that have produced a `Query` event but not yet finished
+    /// responding can never exceed `initial_max_streams_bidi`, and sizing
+    /// the channel to that (plus `EVENT_CAPACITY_MARGIN` for
+    /// `HandshakeConfirmed`) means it only ever fills up because the
+    /// consumer has stopped draining it, not because of a legitimate
+    /// concurrent-query burst (RFC 9250
+    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.1>
+    /// recommends clients send all their queries concurrently).
+    ///
+    /// This bound relies on quiche's specific policy of only replenishing
+    /// the stream limit as streams complete
+    /// (`quiche/src/stream/mod.rs`'s `collect()`). RFC 9000
+    /// <https://datatracker.ietf.org/doc/html/rfc9000#section-4.6> leaves
+    /// that replenishment policy up to the implementation, so this is a
+    /// quiche-implementation guarantee, not a protocol one; revisit if
+    /// that policy ever changes.
+    pub fn new(initial_max_streams_bidi: u64) -> (Self, DoqController) {
+        let event_capacity = initial_max_streams_bidi
+            .saturating_add(EVENT_CAPACITY_MARGIN)
+            as usize;
+        let (event_sender, event_recv) = mpsc::channel(event_capacity);
         let (cmd_sender, cmd_recv) = mpsc::unbounded_channel();
 
         (
@@ -188,19 +225,30 @@ impl DoqServerDriver {
         match event {
             doq::Event::Query { data, is_0rtt } => {
                 let (tx, rx) = mpsc::channel(RESPONDER_CAPACITY);
-                self.check_out_into_waiting(stream_id, rx);
 
-                // A dropped event receiver is handled by the
-                // `event_sender.closed()` arm in `wait_for_data`, which
-                // closes the connection. A single failed send here is not
-                // itself fatal.
-                let _ = self.event_sender.send(DoqEvent::Query {
+                match self.event_sender.try_send(DoqEvent::Query {
                     data: Bytes::from(data),
                     is_0rtt,
                     responder: DoqResponder::new(tx),
-                });
+                }) {
+                    Ok(()) => {
+                        self.check_out_into_waiting(stream_id, rx);
+                        Ok(())
+                    },
 
-                Ok(())
+                    // The consumer isn't draining events fast enough.
+                    // Rather than grow this channel without bound, fail
+                    // the connection so a stalled consumer can't pin
+                    // unbounded memory.
+                    Err(mpsc::error::TrySendError::Full(_)) =>
+                        Err("DoQ event channel is full; consumer too slow".into()),
+
+                    // A dropped event receiver is handled by the
+                    // `event_sender.closed()` arm in `wait_for_data`,
+                    // which closes the connection; this is just the send
+                    // that lost the race.
+                    Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+                }
             },
 
             // Peer `RESET_STREAM` observed while reading (see
@@ -459,7 +507,7 @@ pub struct DoqController {
     cmd_sender: mpsc::UnboundedSender<DoqCommand>,
     /// Receives [`DoqEvent`]s from the paired [`DoqServerDriver`]. Can be
     /// extracted and used independently of the [`DoqController`].
-    event_recv: Option<mpsc::UnboundedReceiver<DoqEvent>>,
+    event_recv: Option<mpsc::Receiver<DoqEvent>>,
 }
 
 impl DoqController {
@@ -468,15 +516,13 @@ impl DoqController {
     /// via [`take_event_receiver`](Self::take_event_receiver).
     pub fn event_receiver_mut(
         &mut self,
-    ) -> Option<&mut mpsc::UnboundedReceiver<DoqEvent>> {
+    ) -> Option<&mut mpsc::Receiver<DoqEvent>> {
         self.event_recv.as_mut()
     }
 
     /// Takes the [`DoqEvent`] receiver for the paired [`DoqServerDriver`],
     /// or `None` if it has already been taken.
-    pub fn take_event_receiver(
-        &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<DoqEvent>> {
+    pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<DoqEvent>> {
         self.event_recv.take()
     }
 
@@ -553,7 +599,7 @@ impl ApplicationOverQuic for DoqServerDriver {
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         if !self.handshake_confirmed {
             self.handshake_confirmed = true;
-            let _ = self.event_sender.send(DoqEvent::HandshakeConfirmed);
+            let _ = self.event_sender.try_send(DoqEvent::HandshakeConfirmed);
         }
 
         while let Some(stream_id) = qconn.stream_writable_next() {
@@ -577,7 +623,7 @@ impl ApplicationOverQuic for DoqServerDriver {
         &mut self, _qconn: &mut QuicheConnection, _metrics: &M,
         _connection_result: &QuicResult<()>,
     ) {
-        let _ = self.event_sender.send(DoqEvent::ConnectionClosed);
+        let _ = self.event_sender.try_send(DoqEvent::ConnectionClosed);
     }
 
     /// Waits for the next responder message, connection-level command, or

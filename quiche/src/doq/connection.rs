@@ -51,6 +51,19 @@ use super::DnsWireError;
 /// A specialized [`Result`] type for [`Connection`] operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Maximum unconsumed bytes a server-role stream may buffer while waiting
+/// for STREAM FIN: a DoQ message plus its 2-octet length prefix, see
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>. A
+/// server-role stream carries at most one query (see
+/// [`Connection::drain_server_stream`]), so legitimate traffic never needs
+/// more; a peer that keeps streaming bytes past this without completing or
+/// finishing its query is exceeding its budget rather than making progress.
+///
+/// Not applied to the client role: a zone-transfer stream may legitimately
+/// have several complete responses buffered at once before
+/// [`Connection::drain_client_stream`] runs.
+const MAX_SERVER_RECV_BUF_LEN: usize = 65535 + 2;
+
 /// An error while driving a [`Connection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -464,15 +477,28 @@ impl Connection {
         let mut buf = [0; 4096];
 
         loop {
+            // Sampled before `stream_recv` so a handshake that completes
+            // between data arrival and this call doesn't make 0-RTT data
+            // look like it arrived after the handshake was confirmed. Only
+            // matters for the first read on a stream (`or_insert_with`
+            // below), but that's exactly the read that sets the flag.
+            let is_0rtt = conn.is_in_early_data();
+
             match conn.stream_recv(stream_id, &mut buf) {
                 Ok((len, fin)) => {
-                    let is_0rtt = conn.is_in_early_data();
                     let state = self
                         .streams
                         .entry(stream_id)
                         .or_insert_with(|| StreamState::new(is_0rtt));
 
                     state.recv_buf.extend_from_slice(&buf[..len]);
+
+                    if self.is_server &&
+                        state.recv_buf.len() > MAX_SERVER_RECV_BUF_LEN
+                    {
+                        self.streams.remove(&stream_id);
+                        return Err(Error::ProtocolError);
+                    }
 
                     if fin {
                         // Once FIN is delivered, quiche may immediately
@@ -557,7 +583,13 @@ impl Connection {
                 Ok(Vec::new())
             },
 
-            Err(_) => Ok(Vec::new()),
+            // Neither variant is currently reachable from
+            // `read_dns_message` on this path, but match them explicitly
+            // rather than falling through a catch-all: a future
+            // `DnsWireError` variant added there must be treated as a real
+            // error here, not silently as "no events yet".
+            Err(DnsWireError::DnsMessageTooLarge) |
+            Err(DnsWireError::IoError(_)) => Err(Error::ProtocolError),
         }
     }
 

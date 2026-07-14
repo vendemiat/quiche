@@ -552,10 +552,19 @@ fn handle_dns_query(
         Ok(m) => m,
         Err(e) => {
             // The wire framing was valid but the DNS payload is malformed.
-            // This should abort the connection with DOQ_PROTOCOL_ERROR; for
-            // this example we just log and bail so a hostile client can't panic
-            // the server.
+            // Close the connection with DOQ_PROTOCOL_ERROR rather than just
+            // returning, otherwise the stream stays open and a client
+            // sending many malformed-but-framed queries exhausts the
+            // server's stream budget.
             error!("{} malformed DNS query: {}", conn_id, e);
+            client
+                .conn
+                .close(
+                    true,
+                    DoqError::ProtocolError.to_wire(),
+                    b"malformed dns message",
+                )
+                .ok();
             return;
         },
     };

@@ -146,7 +146,11 @@ impl From<std::io::Error> for DnsWireError {
 /// The `opcode` is the 4-bit DNS OPCODE field (values 0-15) as defined in
 /// <https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1>. QUERY (0)
 /// and NOTIFY (4) are safe for 0-RTT per
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>.
+/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>. See
+/// <https://datatracker.ietf.org/doc/html/rfc9250#appendix-A> for why
+/// NOTIFY is included: implementations already throttle the SOA/XFR
+/// queries a NOTIFY triggers, so a replayed NOTIFY has negligible impact
+/// in practice.
 pub fn is_replayable_opcode(opcode: u8) -> bool {
     matches!(opcode, 0 | 4)
 }
