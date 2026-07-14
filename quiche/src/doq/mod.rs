@@ -98,6 +98,7 @@ impl std::error::Error for DoqError {}
 
 /// DoQ DNS wire-format read/write errors.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DnsWireError {
     /// length is less than 2 bytes
     LenDataIncomplete,
