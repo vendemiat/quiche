@@ -282,8 +282,11 @@ impl DoqServerDriver {
     /// Stops tracking `stream_id`'s query, if any, so its responder's
     /// `closed()` future resolves for the consumer.
     ///
-    /// Used both for peer cancellation (`Event::Reset`) and a `StreamStopped`
-    /// write error.
+    /// Used for peer cancellation (`Event::Reset`, see
+    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>). A
+    /// `StreamStopped` write error is handled inline in
+    /// `handle_write_error` instead, since that path already owns `rx` and
+    /// doesn't need the `waiting` scan below.
     fn cancel_responder(&mut self, stream_id: u64) {
         let Some(state) = self.streams.get(&stream_id) else {
             return;
