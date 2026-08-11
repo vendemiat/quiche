@@ -70,6 +70,10 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 mod driver;
+#[cfg(test)]
+pub mod test_utils;
+#[cfg(test)]
+mod tests;
 
 pub use driver::DoqController;
 pub use driver::DoqServerDriver;
