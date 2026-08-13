@@ -149,9 +149,9 @@ impl DoqDriverTestHelper {
 
     /// Opens a fresh client-initiated bidi stream and sends `data` on it,
     /// framed with the DoQ length prefix and FIN, exactly as a real DoQ
-    /// query is sent (RFC 9250
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>: one
-    /// query per stream). Returns the stream ID used.
+    /// query is sent. RFC 9250, Section 4.2 requires one query per stream.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// Returns the stream ID used.
     pub fn peer_send_query(&mut self, data: &[u8]) -> anyhow::Result<u64> {
         let stream_id = self.next_stream_id();
 

@@ -32,9 +32,8 @@
 //! bytes into framed DNS messages (and back) without parsing DNS content
 //! itself. It is shared by the blocking-mio DoQ examples and the async
 //! `tokio-quiche` drivers so the per-stream reassembly and the protocol-error
-//! matrix in
-//! <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3> are
-//! implemented exactly once.
+//! matrix in RFC 9250, Section 4.3.3 are implemented exactly once.
+//! https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -52,12 +51,12 @@ use super::DnsWireError;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Maximum unconsumed bytes a server-role stream may buffer while waiting
-/// for STREAM FIN: a DoQ message plus its 2-octet length prefix, see
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>. A
-/// server-role stream carries at most one query (see
+/// for STREAM FIN: a DoQ message plus its 2-octet length prefix, per RFC 9250,
+/// Section 4.2. A server-role stream carries at most one query (see
 /// [`Connection::drain_server_stream`]), so legitimate traffic never needs
 /// more; a peer that keeps streaming bytes past this without completing or
 /// finishing its query is exceeding its budget rather than making progress.
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
 ///
 /// Not applied to the client role: a zone-transfer stream may legitimately
 /// have several complete responses buffered at once before
@@ -71,13 +70,13 @@ pub enum Error {
     Done,
 
     /// A QUIC-stream-usage or DoQ-framing rule was violated in a way that is
-    /// fatal to the connection, per
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>: a
-    /// client-initiated unidirectional stream, a server-initiated stream
-    /// seen by a client-role `Connection`, STREAM FIN before a full message
-    /// arrived, or a second message framed on a stream that already carried
-    /// one. The caller should close the QUIC connection with
-    /// `DoqError::ProtocolError`.
+    /// fatal to the connection, per RFC 9250, Section 4.3.3.
+    /// These include a client-initiated unidirectional stream, a
+    /// server-initiated stream seen by a client-role `Connection`, STREAM
+    /// FIN before a full message arrived, or a second message framed on a
+    /// stream that already carried one. The caller should close the QUIC
+    /// connection with `DoqError::ProtocolError`.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     ProtocolError,
 
     /// A DNS message passed to [`Connection::send_response`] is larger than
@@ -132,11 +131,12 @@ pub enum Event {
         data: Vec<u8>,
 
         /// Whether these bytes arrived while the QUIC connection was still
-        /// in early data (0-RTT). See
-        /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>,
-        /// which restricts which DNS opcodes may be safely acted on before
+        /// in early data (0-RTT). RFC 9250, Section 4.5 restricts which
+        /// operations may proceed before handshake confirmation, which
+        /// restricts which DNS opcodes may be safely acted on before
         /// the handshake is confirmed; that policy decision belongs to the
         /// consumer, not the transport.
+        /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
         is_0rtt: bool,
     },
 
@@ -159,9 +159,9 @@ pub enum Event {
 
     /// The peer reset the stream (`RESET_STREAM`) or asked the local side to
     /// stop sending (`STOP_SENDING`). The raw wire error code is passed
-    /// through unmapped; a caller that needs the unknown-code mapping in
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4> must do
-    /// it itself.
+    /// through unmapped; a caller that needs the unknown-code mapping in RFC
+    /// 9250, Section 4.3.4 must do it itself.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
     Reset(u64),
 }
 
@@ -176,8 +176,8 @@ struct StreamState {
     fin_received: bool,
 
     /// Whether the QUIC connection was in early data when the first byte on
-    /// this stream arrived (captures `is_0rtt`, see
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>).
+    /// this stream arrived (captures `is_0rtt`, per RFC 9250, Section 4.5).
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
     is_0rtt: bool,
 
     /// Server role only: set once the query on this stream has been
@@ -214,10 +214,10 @@ impl StreamState {
 /// `Connection` sits directly on top of a `quiche::Connection` (like
 /// [`crate::h3::Connection`] does for HTTP/3): it owns per-stream byte
 /// reassembly, DoQ's 2-octet length-prefix framing, stream-role
-/// classification, and the parts of the
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>
-/// protocol-error matrix that are detectable from QUIC-stream usage and
+/// classification, and the parts of the RFC 9250, Section 4.3.3 protocol-error
+/// matrix that are detectable from QUIC-stream usage and
 /// framing alone. It does **not** parse DNS message content.
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
 pub struct Connection {
     is_server: bool,
     streams: HashMap<u64, StreamState>,
@@ -244,10 +244,9 @@ impl Connection {
     ///
     /// Returns `Err(Error::Done)` when there is currently no event to
     /// report. Returns `Err(Error::ProtocolError)` when a fatal protocol
-    /// violation per
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3> is
-    /// detected; the caller should close the connection with
-    /// `DoqError::ProtocolError`.
+    /// violation per RFC 9250, Section 4.3.3 is detected; the caller should
+    /// close the connection with `DoqError::ProtocolError`.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     pub fn poll<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>,
     ) -> Result<(u64, Event)> {
@@ -294,11 +293,12 @@ impl Connection {
     /// reported writable again to send more. Splitting a single framed
     /// message across several QUIC stream writes is transparent to the peer,
     /// which reassembles the length prefix and body from the ordered byte
-    /// stream exactly as DNS over TCP does (see
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2> and
-    /// <https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2>). Use
-    /// [`response_pending`](Self::response_pending) to tell whether queued
+    /// stream exactly as DNS over TCP does (RFC 9250, Section 4.2; RFC 1035,
+    /// Section 4.2.2).
+    /// Use [`response_pending`](Self::response_pending) to tell whether queued
     /// bytes remain.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2
     ///
     /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen as a
     /// query stream, has already been completed (its final response was

@@ -149,17 +149,17 @@ impl DoqServerDriver {
     /// the channel to that (plus `EVENT_CAPACITY_MARGIN` for
     /// `HandshakeConfirmed`) means it only ever fills up because the
     /// consumer has stopped draining it, not because of a legitimate
-    /// concurrent-query burst (RFC 9250
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.1>
-    /// recommends clients send all their queries concurrently).
+    /// concurrent-query burst. RFC 9250, Section 5.5.1 recommends clients
+    /// send all their queries concurrently.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.1
     ///
     /// This bound relies on quiche's specific policy of only replenishing
     /// the stream limit as streams complete
-    /// (`quiche/src/stream/mod.rs`'s `collect()`). RFC 9000
-    /// <https://datatracker.ietf.org/doc/html/rfc9000#section-4.6> leaves
-    /// that replenishment policy up to the implementation, so this is a
+    /// (`quiche/src/stream/mod.rs`'s `collect()`). RFC 9000, Section 4.6
+    /// leaves that replenishment policy up to the implementation, so this is a
     /// quiche-implementation guarantee, not a protocol one; revisit if
     /// that policy ever changes.
+    /// https://datatracker.ietf.org/doc/html/rfc9000#section-4.6
     pub fn new(initial_max_streams_bidi: u64) -> (Self, DoqController) {
         let event_capacity = initial_max_streams_bidi
             .saturating_add(EVENT_CAPACITY_MARGIN)
@@ -251,8 +251,8 @@ impl DoqServerDriver {
                 }
             },
 
-            // Peer `RESET_STREAM` observed while reading (see
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>).
+            // Handle peer RESET_STREAM as required by RFC 9250, Section 4.3.1.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
             //
             // Two cases:
             // 1. The client gave up before finishing the query. We never made a
@@ -282,11 +282,11 @@ impl DoqServerDriver {
     /// Stops tracking `stream_id`'s query, if any, so its responder's
     /// `closed()` future resolves for the consumer.
     ///
-    /// Used for peer cancellation (`Event::Reset`, see
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>). A
-    /// `StreamStopped` write error is handled inline in
+    /// Used for peer cancellation (`Event::Reset`) per RFC 9250, Section 4.3.1.
+    /// A `StreamStopped` write error is handled inline in
     /// `handle_write_error` instead, since that path already owns `rx` and
     /// doesn't need the `waiting` scan below.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     fn cancel_responder(&mut self, stream_id: u64) {
         let Some(state) = self.streams.get(&stream_id) else {
             return;
@@ -317,8 +317,8 @@ impl DoqServerDriver {
         }
     }
 
-    /// Resets `stream_id` with `error` (see
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2>),
+    /// Resets `stream_id` with `error` per RFC 9250, Section 4.3.2.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     /// stopping the driver from sending any more of the response.
     ///
     /// Two errors are treated as benign no-ops rather than fatal:
@@ -454,8 +454,9 @@ impl DoqServerDriver {
                 Ok(())
             },
 
-            // The peer asked us to stop sending on this stream (see
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>).
+            // Stop sending when requested by the peer.
+            // See RFC 9250, Section 4.3.1.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
             // Per-stream, not fatal.
             doq::Error::TransportError(quiche::Error::StreamStopped(_)) => {
                 drop(rx);
@@ -566,8 +567,9 @@ impl ApplicationOverQuic for DoqServerDriver {
 
                 Err(doq::Error::Done) => break,
 
-                // Fatal per
-                // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
+                // Close the connection for these violations.
+                // See RFC 9250, Section 4.3.3.
+                // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
                 // Covers a unidirectional or server-initiated stream, a
                 // truncated FIN, or a second query framed on the same
                 // stream.
@@ -583,8 +585,8 @@ impl ApplicationOverQuic for DoqServerDriver {
                 // `poll()` never returns `MessageTooLarge` or
                 // `UnknownStream`; those come only from `send_response` or
                 // `reset_stream`. Any other `TransportError` is
-                // connection-fatal by default, per
-                // <https://datatracker.ietf.org/doc/html/rfc9000#section-11>:
+                // connection-fatal by default, per RFC 9000, Section 11.
+                // https://datatracker.ietf.org/doc/html/rfc9000#section-11
                 // transport-level errors are connection-scoped, and only
                 // application-level errors can be isolated to one stream.
                 Err(err) => return Err(err.into()),

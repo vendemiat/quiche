@@ -36,16 +36,16 @@ pub use connection::Error;
 pub use connection::Event;
 pub use connection::Result;
 
-/// The ALPN token for DoQ as specified in
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.1>
+/// Set the DoQ ALPN token required by RFC 9250, Section 4.1.
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.1
 pub const DOQ_ALPN: &[u8] = b"doq";
 
-/// The default port for DNS over QUIC (DoQ) as specified in
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.1.1>
+/// Set the DoQ default port required by RFC 9250, Section 4.1.1.
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.1.1
 pub const DOQ_PORT: u16 = 853;
 
-/// DoQ error codes as specified in
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3>
+/// Define DoQ error codes from RFC 9250, Section 4.3.
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum DoqError {
@@ -55,8 +55,8 @@ pub enum DoqError {
     /// Internal error (DOQ_INTERNAL_ERROR).
     InternalError    = 0x1,
 
-    /// Protocol error (DOQ_PROTOCOL_ERROR). Conditions are enumerated in
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
+    /// Signal protocol violations enumerated by RFC 9250, Section 4.3.3.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     ProtocolError    = 0x2,
 
     /// Request cancelled (DOQ_REQUEST_CANCELLED).
@@ -144,12 +144,14 @@ impl From<std::io::Error> for DnsWireError {
 
 /// Returns whether a DNS opcode is considered replayable in 0-RTT data.
 ///
-/// The `opcode` is the 4-bit DNS OPCODE field (values 0-15) as defined in
-/// <https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1>. QUERY (0)
-/// and NOTIFY (4) are safe for 0-RTT per
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>. See
-/// <https://datatracker.ietf.org/doc/html/rfc9250#appendix-A> for why
-/// NOTIFY is included: implementations already throttle the SOA/XFR
+/// The `opcode` is the 4-bit DNS OPCODE field defined by RFC 1035, Section
+/// 4.1.1.
+/// https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1
+/// Treat QUERY (0) and NOTIFY (4) as safe for 0-RTT per RFC 9250, Section 4.5.
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+/// RFC 9250, Appendix A explains why NOTIFY is included.
+/// https://datatracker.ietf.org/doc/html/rfc9250#appendix-A
+/// Implementations already throttle the SOA/XFR
 /// queries a NOTIFY triggers, so a replayed NOTIFY has negligible impact
 /// in practice.
 pub fn is_replayable_opcode(opcode: u8) -> bool {

@@ -43,22 +43,22 @@
 //!
 //! Unlike [`H3Driver`](crate::http3::driver::H3Driver), `DoqServerDriver`
 //! does **not** parse or frame DNS messages itself: all per-stream
-//! reassembly, DoQ's 2-octet length-prefix framing, and the
-//! [RFC 9250 §4.3.3](https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3)
-//! protocol-error matrix live in [`quiche::doq::Connection`], a synchronous,
-//! IO-less object shared with the blocking-mio DoQ examples. This driver is a
-//! thin pump over that `Connection`.
+//! reassembly, DoQ's 2-octet length-prefix framing, and the RFC 9250, Section
+//! 4.3.3 protocol-error matrix live in [`quiche::doq::Connection`], a
+//! synchronous, IO-less object shared with the blocking-mio DoQ examples. This
+//! driver is a thin pump over that `Connection`.
+//! https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
 //!
 //! Each [`DoqEvent::Query`] carries a dedicated [`DoqResponder`] bound to that
 //! query's stream; the consumer replies through it and never handles a raw
 //! `stream_id`. DoQ maps **exactly one query per client-initiated
-//! bidirectional stream** (RFC 9250
-//! [§4.2](https://datatracker.ietf.org/doc/html/rfc9250#section-4.2)), but a
-//! single query may receive **one or more** responses (zone transfers, RFC
-//! 9250
-//! [§5.7](https://datatracker.ietf.org/doc/html/rfc9250#section-5.7)); the
-//! consumer calls [`DoqResponder::send`] once per response message, marking
+//! bidirectional stream** (RFC 9250, Section 4.2), but a single query may
+//! receive **one or more** responses (zone transfers, RFC
+//! 9250, Section 5.7).
+//! The consumer calls [`DoqResponder::send`] once per response message, marking
 //! the last one with `fin = true`.
+//! https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+//! https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
 //!
 //! The wire-format primitives (`DoqError`, `read_dns_message`,
 //! `write_dns_message`, `is_replayable_opcode`, `DOQ_ALPN`, `DOQ_PORT`) live in
@@ -160,9 +160,9 @@ impl DoqResponder {
     /// `data` is the raw DNS message *without* the length prefix and is sent
     /// verbatim (no padding or other mutation). `fin` marks the last response
     /// of the transaction: a single-response query sends one call with
-    /// `fin = true`, while a zone transfer (RFC 9250
-    /// [§5.7](https://datatracker.ietf.org/doc/html/rfc9250#section-5.7)) sends
-    /// one or more `fin = false` calls followed by a final `fin = true`.
+    /// `fin = true`, while a zone transfer per RFC 9250, Section 5.7 sends one
+    /// or more `fin = false` calls followed by a final `fin = true`.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
     ///
     /// Awaits channel capacity, applying backpressure to a producer that
     /// outruns the driver. Returns [`StreamClosed`] if the transaction is no
@@ -175,9 +175,9 @@ impl DoqResponder {
     }
 
     /// Abandons the transaction, asking the driver to send `RESET_STREAM` with
-    /// the given DoQ error code (RFC 9250
-    /// [§4.3.2](https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2),
-    /// typically [`DoqError::InternalError`]).
+    /// the given DoQ error code (RFC 9250, Section 4.3.2), typically
+    /// [`DoqError::InternalError`].
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     ///
     /// Returns [`StreamClosed`] if the transaction is no longer live.
     pub async fn reset(&self, error: DoqError) -> Result<(), StreamClosed> {
@@ -215,12 +215,12 @@ pub enum DoqEvent {
 
         /// Whether the query was received in 0-RTT (early data).
         ///
-        /// Per RFC 9250
-        /// [§4.5](https://datatracker.ietf.org/doc/html/rfc9250#section-4.5), a
-        /// non-replayable transaction received in 0-RTT MUST NOT be processed
+        /// RFC 9250, Section 4.5 requires that a non-replayable transaction
+        /// received in 0-RTT MUST NOT be processed
         /// immediately. The driver does not parse opcodes itself; it surfaces
         /// this flag so the consumer can enforce the replay rules (see
         /// [`is_replayable_opcode`]).
+        /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
         is_0rtt: bool,
 
         /// The per-query handle used to send the response(s); bound to this
@@ -231,11 +231,11 @@ pub enum DoqEvent {
     /// The QUIC handshake has been confirmed (the connection is no longer only
     /// in early data).
     ///
-    /// Per RFC 9250
-    /// [§4.5](https://datatracker.ietf.org/doc/html/rfc9250#section-4.5), a
-    /// consumer that deferred non-replayable 0-RTT queries (rather than
+    /// RFC 9250, Section 4.5 allows a consumer that deferred non-replayable
+    /// 0-RTT queries (rather than
     /// rejecting them outright) can use this event as the signal to process
     /// its queue.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
     HandshakeConfirmed,
 
     /// The QUIC connection has closed. No further events will be emitted and
@@ -253,15 +253,16 @@ pub enum DoqEvent {
 pub enum DoqCommand {
     /// Close the whole connection with a DoQ error code and reason.
     ///
-    /// Used for fatal protocol violations (RFC 9250
-    /// [§4.3.3](https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3))
-    /// and for normal shutdown ([`DoqError::NoError`]).
+    /// Used for fatal protocol violations (RFC 9250, Section 4.3.3) and for
+    /// normal shutdown ([`DoqError::NoError`]).
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     ///
     /// `reason` is an opaque byte string (the QUIC CONNECTION_CLOSE reason
-    /// phrase, RFC 9000 §19.19). It matches the byte-oriented
+    /// phrase, RFC 9000, Section 19.19). It matches the byte-oriented
     /// [`quiche::Connection::close`] API and the crate's existing
     /// [`ConnectionShutdownBehaviour`](crate::quic::ConnectionShutdownBehaviour)
     /// `reason` field.
+    /// https://datatracker.ietf.org/doc/html/rfc9000#section-19.19
     CloseConnection {
         /// The DoQ error code (wire-encoded via [`DoqError::to_wire`]).
         error: DoqError,
