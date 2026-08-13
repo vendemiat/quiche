@@ -469,8 +469,17 @@ impl Connection {
     /// layer into the stream's reassembly buffer.
     ///
     /// Returns `Ok(Some(error))` if the peer reset the stream with the given
-    /// wire error code, dropping the stream's state; the caller should
-    /// surface this as `Event::Reset(error)` without draining further.
+    /// wire error code, dropping the stream's state and not draining any
+    /// further; the caller should surface this as `Event::Reset(error)`. If
+    /// the server's own reset below fails instead, this returns that error.
+    /// Per RFC 9250, Section 4.3.1:
+    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>,
+    /// "Servers MUST NOT continue processing a DNS transaction if they
+    /// receive a RESET_STREAM request from the client before the client
+    /// indicates the STREAM FIN. The server MUST issue a RESET_STREAM to
+    /// indicate that the transaction is abandoned unless: it has already
+    /// done so for another reason or it has already both sent the
+    /// response and indicated the STREAM FIN."
     fn read_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<Option<u64>> {
@@ -520,7 +529,41 @@ impl Connection {
                 Err(crate::Error::Done) => break,
 
                 Err(crate::Error::StreamReset(error)) => {
+                    // If the client had already sent FIN, this branch
+                    // isn't entered at all: a RESET_STREAM matching the
+                    // already-known final size doesn't resurface as
+                    // `StreamReset` from `stream_recv` (it keeps
+                    // returning `Done`), so there is nothing to check for
+                    // that case here.
+                    //
+                    // We don't check whether this stream was already
+                    // reset (e.g. via `reset_stream`) because calling
+                    // `stream_shutdown` again below is a no-op.
+                    //
+                    // We only check whether the server already sent the
+                    // response with FIN. `self.streams` no longer has an
+                    // entry for it in that case (`flush_response` removes
+                    // it once fully drained), so we ask `conn` directly
+                    // instead: the RESET_STREAM being handled here always
+                    // finishes the receive side, so for this
+                    // bidirectional stream `stream_closed` (both
+                    // directions finished) is true here exactly when the
+                    // send side had already finished too.
+                    let fin_sent = conn.stream_closed(stream_id);
+
                     self.streams.remove(&stream_id);
+
+                    if self.is_server && !fin_sent {
+                        match conn.stream_shutdown(
+                            stream_id,
+                            crate::Shutdown::Write,
+                            error,
+                        ) {
+                            Ok(()) | Err(crate::Error::Done) => (),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+
                     return Ok(Some(error));
                 },
 
@@ -851,6 +894,129 @@ mod tests {
         assert_eq!(
             server.send_response(&mut pipe.server, 0, b"too late", true),
             Err(Error::UnknownStream)
+        );
+
+        // Server replies with RESET_STREAM.
+        let transport = pipe.server.stats();
+        assert_eq!(
+            transport.reset_stream_count_remote, 1,
+            "server should count the remote reset"
+        );
+        assert_eq!(
+            transport.reset_stream_count_local, 1,
+            "server should reset its own send side before query FIN"
+        );
+    }
+
+    #[test]
+    fn server_echoed_reset_reaches_client() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+
+        // The client abandons a query before sending STREAM FIN.
+        pipe.client
+            .stream_send(0, &framed(b"hello")[..3], false)
+            .unwrap();
+        pipe.client
+            .stream_shutdown(0, crate::Shutdown::Write, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Ok((0, Event::Reset(42))));
+
+        // Round-trip the server's echoed RESET_STREAM back to the client to
+        // confirm it was actually sent on the wire, not just requested
+        // locally.
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Reset(42))));
+    }
+
+    #[test]
+    fn already_reset_stream_is_not_echoed_again() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // Client sends a partial query, no FIN yet.
+        pipe.client
+            .stream_send(0, &framed(b"hello")[..3], false)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+
+        // The driver abandons the transaction for a reason unrelated to a
+        // client-initiated reset (e.g. an internal error), resetting the
+        // server's own send side before the client's own RESET_STREAM
+        // below is processed.
+        server.reset_stream(&mut pipe.server, 0, 7).unwrap();
+
+        // The client independently resets its send side before indicating
+        // STREAM FIN, racing with the server's reset above.
+        pipe.client
+            .stream_shutdown(0, crate::Shutdown::Write, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Ok((0, Event::Reset(42))));
+
+        // Per RFC 9250, Section 4.3.1:
+        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>,
+        // the server must not issue a second RESET_STREAM: it has already
+        // reset the stream for another reason.
+        let transport = pipe.server.stats();
+        assert_eq!(
+            transport.reset_stream_count_local, 1,
+            "server should not echo a reset for a stream it already reset"
+        );
+    }
+
+    #[test]
+    fn reset_after_query_fin_is_not_echoed() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // Send a complete framed query with FIN.
+        pipe.client.stream_send(0, &framed(b"hello"), true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"hello".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+
+        // The client resets the stream after its FIN was already sent.
+        // quiche accepts a matching-final-size reset here but does not
+        // resurface it as `StreamReset` from `stream_recv` (see
+        // `RecvBuf::reset`), so the DoQ layer never sees this as a
+        // reset to echo.
+        pipe.client
+            .stream_shutdown(0, crate::Shutdown::Write, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+
+        let transport = pipe.server.stats();
+        assert_eq!(
+            transport.reset_stream_count_remote, 1,
+            "server should still count the remote reset"
+        );
+        assert_eq!(
+            transport.reset_stream_count_local, 0,
+            "server should NOT echo a reset that arrives after query FIN"
         );
     }
 
