@@ -44,7 +44,7 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 /// has been received, before treating the stream as "dangling" and tearing the
 /// connection down with DOQ_PROTOCOL_ERROR.
 ///
-/// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
 const FIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 use quiche::doq::*;
@@ -69,19 +69,19 @@ struct ZoneTransfer {
     // SOA: the first SOA is the zone apex SOA (written to the file), and the
     // second SOA marks the end of the transfer and MUST NOT be written — a zone
     // file has exactly one SOA.
-    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
+    // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
     soa_seen: u32,
     // Set once the closing SOA has been seen, i.e. the zone DATA is complete.
     // Note: the DoQ response is only fully terminated once the server also
     // sends the STREAM FIN; this flag alone is not enough.
-    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
+    // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
     complete: bool,
     // When the closing SOA was seen, used to bound how long we wait for the
     // server's required STREAM FIN before declaring a dangling stream.
     complete_at: Option<std::time::Instant>,
     // Set if data arrives after the closing SOA, which is forbidden; it is a
     // fatal DoQ protocol error.
-    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
+    // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
     protocol_error: bool,
     // Records are streamed to this file as each message is parsed, so the full
     // zone is persisted without ever holding the whole transfer in memory.
@@ -204,7 +204,7 @@ fn main() {
         // Wake no later than the dangling-stream grace deadline so a transfer
         // whose data is complete but whose STREAM FIN never arrives can be
         // torn down promptly rather than lingering until the idle timeout.
-        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
         let mut timeout = conn.timeout();
         let now = std::time::Instant::now();
         for t in active_transfers.values() {
@@ -395,7 +395,7 @@ fn main() {
             // never finalize on it alone; the "dangling" case (closing
             // SOA seen, FIN missing) is bounded by the grace timer in the main
             // loop.
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
             let done = active_transfers
                 .get(&stream_id)
                 .map(|t| is_fin || t.failed || t.protocol_error)
@@ -428,7 +428,7 @@ fn main() {
                 } else if transfer.protocol_error {
                     // Data after the closing SOA is forbidden: a fatal DoQ
                     // protocol error.
-                    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
+                    // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
                     let _ = std::fs::remove_file(&transfer.out_path);
                     println!("\nAXFR Transfer FAILED (protocol error):");
                     println!("  Zone: {}", transfer.zone);
@@ -480,7 +480,7 @@ fn main() {
 
                     // Client is done; close with DOQ_NO_ERROR once nothing
                     // else is in flight.
-                    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.4>
+                    // https://datatracker.ietf.org/doc/html/rfc9250#section-4.4
                     if active_transfers.is_empty() {
                         info!("All transfers complete, closing connection");
                         conn.close(true, DoqError::NoError.to_wire(), b"done")
@@ -495,7 +495,7 @@ fn main() {
         // within the grace period, so the connection is aborted with
         // DOQ_PROTOCOL_ERROR. The zone data itself is complete, so the file is
         // kept.
-        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2>
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
         let now = std::time::Instant::now();
         let dangling: Vec<u64> = active_transfers
             .iter()
@@ -589,7 +589,7 @@ fn write_message_records(
 
     // We already saw the closing SOA, yet more data arrived: nothing may
     // follow the closing SOA. Treat it as a fatal DoQ protocol error.
-    // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
+    // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
     if transfer.complete {
         transfer.protocol_error = true;
         return Ok(rcode);
@@ -603,7 +603,7 @@ fn write_message_records(
         // zone apex SOA and is written; the second SOA is the end-of-transfer
         // marker and must NOT be written, otherwise the resulting zone file
         // would contain two SOA records and be invalid.
-        // <https://datatracker.ietf.org/doc/html/rfc5936#section-2.2>
+        // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
         if is_soa {
             transfer.soa_seen += 1;
             if transfer.soa_seen >= 2 {

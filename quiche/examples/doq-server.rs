@@ -26,12 +26,14 @@
 
 //! DNS over QUIC (DoQ) server implementation.
 //!
-//! This example demonstrates a simple DoQ server according to
-//! <https://datatracker.ietf.org/doc/html/rfc9250>.
+//! This example implements the DoQ mapping specified by RFC 9250, Section 4.
+//! https://datatracker.ietf.org/doc/html/rfc9250#section-4
 
 // TODO: Use DoH to 1.1.1.1 to process queries
-// TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-address-validation
-// TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-padding
+// TODO: Implement address validation required by RFC 9250, Section 5.3.
+// https://datatracker.ietf.org/doc/html/rfc9250#section-5.3
+// TODO: Implement padding required by RFC 9250, Section 5.4.
+// https://datatracker.ietf.org/doc/html/rfc9250#section-5.4
 
 #[macro_use]
 extern crate log;
@@ -49,8 +51,8 @@ const MAX_CLIENTS: usize = 1024;
 // at 65537 bytes, but without an application-level limit a slow-loris client
 // could open many streams and dribble bytes to pin ~6.5 MB per connection. Cap
 // the aggregate so abandoned/slow streams cannot accumulate unbounded memory;
-// exceeding it is treated as DOQ_EXCESSIVE_LOAD
-// (<https://datatracker.ietf.org/doc/html/rfc9250#section-4.3>).
+// exceeding it is treated as DOQ_EXCESSIVE_LOAD per RFC 9250, Section 4.3.
+// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3
 const MAX_PARTIAL_QUERY_BYTES: usize = 256 * 1024;
 
 use quiche::doq::*;
@@ -133,14 +135,14 @@ fn main() {
     // per-stream flow control at the protocol maximum so a misbehaving client
     // cannot force more than one max-size message worth of buffering per
     // stream.
-    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.6>
-    // <https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2>
+    // https://datatracker.ietf.org/doc/html/rfc9250#section-4.6
+    // https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2
     config.set_initial_max_stream_data_bidi_remote(65537);
     config.set_initial_max_stream_data_uni(0); // DoQ doesn't use unidirectional streams
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(0);
-    // Disable migration for privacy.
-    // <https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.4>
+    // Disable migration for privacy as recommended by RFC 9250, Section 5.5.4.
+    // https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.4
     config.set_disable_active_migration(true);
 
     // Enable 0-RTT.
@@ -189,8 +191,10 @@ fn main() {
         // code SHOULD be set to DOQ_INTERNAL_ERROR. The corresponding DNS
         // transaction MUST be abandoned.
         //
-        // TODO: Handle all https://datatracker.ietf.org/doc/html/rfc9250#name-protocol-errors
-        // TODO: https://datatracker.ietf.org/doc/html/rfc9250#name-alternative-error-codes
+        // TODO: Handle protocol errors defined by RFC 9250, Section 4.3.3.
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+        // TODO: Handle RFC 9250, Section 4.3.4 alternative error codes.
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
 
         // Read incoming UDP packets.
         'read: loop {
@@ -573,7 +577,7 @@ fn handle_dns_query(
 
     // Check message ID: ID 0 is required; a non-zero ID is a fatal protocol
     // error.
-    // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1>
+    // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
     if id != 0 {
         error!("{} received DNS query with non-zero ID: {}", conn_id, id);
         client
@@ -594,8 +598,8 @@ fn handle_dns_query(
             conn_id, opcode
         );
         // Reply with REFUSED + EDE "Too Early" (code 26).
-        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.5>
-        // <https://datatracker.ietf.org/doc/html/rfc9250#section-8.3>
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-8.3
         let response = build_dns_response(query, Rcode::REFUSED, vec![
             ExtendedErrorCode::from_int(26),
         ])

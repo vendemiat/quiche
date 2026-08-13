@@ -28,12 +28,13 @@
 //!
 //! This module provides an
 //! [`ApplicationOverQuic`](crate::ApplicationOverQuic) implementation,
-//! `DoqServerDriver`, that speaks DNS over QUIC as specified in
-//! [RFC 9250](https://datatracker.ietf.org/doc/html/rfc9250). It mirrors the
+//! `DoqServerDriver`, that implements the DoQ mapping specified by RFC 9250,
+//! Section 4. It mirrors the
 //! [`H3Driver`](crate::http3::driver::H3Driver) / controller split: the driver
 //! owns the QUIC side and runs inside the connection's IO worker task, while
 //! the async application logic (forwarding to a resolver, etc.) lives in a
 //! consumer task that drains the paired `DoqController`'s event channel.
+//! https://datatracker.ietf.org/doc/html/rfc9250#section-4
 //!
 //! ```text
 //!   client bidi stream -> DoqServerDriver --DoqEvent::Query{responder}--> app

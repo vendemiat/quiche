@@ -343,8 +343,8 @@ impl Connection {
     /// [`response_pending`](Self::response_pending) to tell whether data
     /// remains queued. Returns `Err(Error::UnknownStream)` if the stream
     /// isn't tracked, or a [`Error::TransportError`] if the peer stopped the
-    /// stream (`STOP_SENDING`) — see
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>.
+    /// stream (`STOP_SENDING`) as described by RFC 9250, Section 4.3.1.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     pub fn flush_response<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<()> {
@@ -396,9 +396,9 @@ impl Connection {
     }
 
     /// Abandons the transaction on `stream_id`, sending `RESET_STREAM` with
-    /// the given DoQ error code (see
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2>) and
-    /// dropping the stream's state.
+    /// the given DoQ error code and dropping the stream's state as described
+    /// by RFC 9250, Section 4.3.2.
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     ///
     /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen or
     /// has already been completed or reset.
@@ -433,18 +433,19 @@ impl Connection {
                 return Ok(Vec::new());
             }
 
-            // Clients MUST send queries on a bidirectional stream, see
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
+            // Clients MUST send queries on a bidirectional stream per RFC
+            // 9250, Section 4.3.3.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             if !is_bidi(stream_id) {
                 return Err(Error::ProtocolError);
             }
         } else {
             // A client-role `Connection` only ever reads on the
             // bidirectional streams it opened itself to send queries;
-            // servers never initiate streams in DoQ, see
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-3.4>
-            // and
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
+            // servers never initiate streams in DoQ per RFC 9250, Sections
+            // 3.4 and 4.3.3.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-3.4
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             if peer_initiated {
                 return Err(Error::ProtocolError);
             }
@@ -472,14 +473,14 @@ impl Connection {
     /// wire error code, dropping the stream's state and not draining any
     /// further; the caller should surface this as `Event::Reset(error)`. If
     /// the server's own reset below fails instead, this returns that error.
-    /// Per RFC 9250, Section 4.3.1:
-    /// <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>,
+    /// RFC 9250, Section 4.3.1 requires the following behavior:
     /// "Servers MUST NOT continue processing a DNS transaction if they
     /// receive a RESET_STREAM request from the client before the client
     /// indicates the STREAM FIN. The server MUST issue a RESET_STREAM to
     /// indicate that the transaction is abandoned unless: it has already
     /// done so for another reason or it has already both sent the
     /// response and indicated the STREAM FIN."
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     fn read_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<Option<u64>> {
@@ -595,9 +596,9 @@ impl Connection {
         match read_dns_message(&state.recv_buf) {
             Ok((data, consumed)) => {
                 // Bytes beyond the first complete message are a second
-                // query framed on the same stream, see
-                // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>,
-                // regardless of whether FIN has arrived yet.
+                // query framed on the same stream per RFC 9250, Section
+                // 4.3.3, regardless of whether FIN has arrived yet.
+                // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
                 if consumed < state.recv_buf.len() {
                     return Err(Error::ProtocolError);
                 }
@@ -617,8 +618,8 @@ impl Connection {
             Err(DnsWireError::LenDataIncomplete) |
             Err(DnsWireError::DnsMessageIncomplete) => {
                 // STREAM FIN before a full message arrived is a truncated
-                // message, see
-                // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
+                // message per RFC 9250, Section 4.3.3.
+                // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
                 if state.fin_received {
                     return Err(Error::ProtocolError);
                 }
@@ -666,8 +667,8 @@ impl Connection {
 
         if state.fin_received {
             // A non-empty leftover here is a partial message that will
-            // never be completed, see
-            // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3>.
+            // never be completed per RFC 9250, Section 4.3.3.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             if !state.recv_buf.is_empty() {
                 return Err(Error::ProtocolError);
             }
@@ -966,10 +967,9 @@ mod tests {
 
         assert_eq!(server.poll(&mut pipe.server), Ok((0, Event::Reset(42))));
 
-        // Per RFC 9250, Section 4.3.1:
-        // <https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1>,
-        // the server must not issue a second RESET_STREAM: it has already
-        // reset the stream for another reason.
+        // RFC 9250, Section 4.3.1 forbids a second RESET_STREAM because the
+        // server already reset the stream for another reason.
+        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
         let transport = pipe.server.stats();
         assert_eq!(
             transport.reset_stream_count_local, 1,

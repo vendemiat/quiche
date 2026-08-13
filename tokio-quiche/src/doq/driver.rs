@@ -317,9 +317,9 @@ impl DoqServerDriver {
         }
     }
 
-    /// Resets `stream_id` with `error` per RFC 9250, Section 4.3.2.
+    /// Resets `stream_id` with `error` per RFC 9250, Section 4.3.2, stopping
+    /// the driver from sending any more of the response.
     /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
-    /// stopping the driver from sending any more of the response.
     ///
     /// Two errors are treated as benign no-ops rather than fatal:
     /// `UnknownStream` is a stale race with the peer, and
