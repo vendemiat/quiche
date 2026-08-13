@@ -239,6 +239,14 @@ async fn client_reset_before_query_completes_is_noop() {
         .unwrap();
     helper.advance_and_run_loop().unwrap();
 
+    // RFC 9250, Section 4.3.1 requires the server to echo the client's
+    // RESET_STREAM; the raw client-role peer connection observes it here.
+    // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    assert_eq!(
+        helper.peer.poll(&mut helper.pipe.client),
+        Ok((abandoned, doq::Event::Reset(42)))
+    );
+
     // No `Query` was ever emitted for the abandoned stream; the only event
     // in the channel is the `HandshakeConfirmed` from this first round.
     assert!(matches!(
