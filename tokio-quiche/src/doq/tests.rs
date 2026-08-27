@@ -206,6 +206,33 @@ async fn concurrent_out_of_order_responses() {
 }
 
 #[tokio::test]
+async fn stop_sending_does_not_release_peer_bidi_stream_credit() {
+    let mut config = super::test_utils::default_quiche_config();
+    config.set_initial_max_streams_bidi(2);
+    let mut helper = DoqDriverTestHelper::with_pipe(
+        quiche::test_utils::Pipe::with_config_and_buf(&mut config).unwrap(),
+    )
+    .unwrap();
+    let credits = helper.pipe.client.peer_streams_left_bidi();
+
+    for _ in 0..credits {
+        let stream_id = helper.peer_send_query(b"q").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        helper
+            .pipe
+            .client
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+    }
+
+    assert_eq!(
+        helper.peer_send_query(b"q").unwrap_err().downcast_ref(),
+        Some(&quiche::Error::StreamLimit)
+    );
+}
+
+#[tokio::test]
 async fn handshake_confirmed_emitted_once() {
     let mut helper = DoqDriverTestHelper::new().unwrap();
 
