@@ -100,7 +100,7 @@ quiche  datagram-socket  qlog-dancer        (Layer 1)
 ```
 quiche:        default=boringssl-boring-crate
                qlog, gcongestion, internal, ffi, fuzzing, sfv, custom-client-dcid,
-               pkg-config-meta
+               pkg-config-meta, doq
 tokio-quiche:  fuzzing, quiche_internal, gcongestion, zero-copy, rpk
                (hardcodes: quiche/boringssl-boring-crate + quiche/qlog)
 h3i:           async (enables tokio-quiche dependency)

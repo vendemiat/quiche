@@ -9537,6 +9537,8 @@ mod buffers;
 mod cid;
 mod crypto;
 mod dgram;
+#[cfg(feature = "doq")]
+pub mod doq;
 mod error;
 #[cfg(feature = "ffi")]
 mod ffi;

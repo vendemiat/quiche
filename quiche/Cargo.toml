@@ -54,6 +54,8 @@ internal = []
 
 # Enable qlog support with serde_json for extension data
 qlog = ["dep:qlog", "dep:serde", "dep:serde_json", "dep:serde_with"]
+# DNS over QUIC (DoQ) support as specified in RFC 9250.
+doq = []
 
 [package.metadata.release]
 tag-prefix = ""
