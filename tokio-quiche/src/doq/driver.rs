@@ -43,7 +43,6 @@ use super::DoqCommand;
 use super::DoqEvent;
 use super::DoqResponder;
 use super::ResponderMessage;
-use crate::buf_factory::BufFactory;
 use crate::metrics::Metrics;
 use crate::quic::HandshakeInfo;
 use crate::quic::QuicheConnection;
@@ -112,9 +111,6 @@ pub struct DoqServerDriver {
     /// currently `None` because it was checked out into this set.
     waiting: FuturesUnordered<WaitForResponder>,
 
-    /// The buffer used to interact with the underlying `IoWorker`.
-    io_worker_buf: Vec<u8>,
-
     /// Set once `DoqEvent::HandshakeConfirmed` has been sent, on the first
     /// `process_writes` call. The connection FSM only invokes
     /// `process_writes` once the handshake is actually confirmed, so this
@@ -174,7 +170,6 @@ impl DoqServerDriver {
                 cmd_recv,
                 streams: HashMap::new(),
                 waiting: FuturesUnordered::new(),
-                io_worker_buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
                 handshake_confirmed: false,
                 event_receiver_dropped: false,
             },
@@ -549,11 +544,6 @@ impl ApplicationOverQuic for DoqServerDriver {
     #[inline]
     fn should_act(&self) -> bool {
         self.conn.is_some()
-    }
-
-    #[inline]
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.io_worker_buf
     }
 
     /// Polls the underlying [`doq::Connection`] for events, translating each
