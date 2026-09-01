@@ -43,7 +43,7 @@ use crate::doq::DoqServerDriver;
 use crate::quic::HandshakeInfo;
 use crate::ApplicationOverQuic as _;
 
-type Pipe = quiche::test_utils::Pipe<BufFactory>;
+pub(crate) type Pipe = quiche::test_utils::Pipe<BufFactory>;
 
 pub fn default_quiche_config() -> quiche::Config {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -84,6 +84,10 @@ impl DoqDriverTestHelper {
     pub fn with_pipe(mut pipe: Pipe) -> anyhow::Result<Self> {
         pipe.handshake().context("handshake")?;
 
+        Self::with_initialized_pipe(pipe)
+    }
+
+    pub(crate) fn with_initialized_pipe(mut pipe: Pipe) -> anyhow::Result<Self> {
         // The client's own `peer_streams_left_bidi()`, read before it has
         // opened any stream, is exactly the server's negotiated
         // `initial_max_streams_bidi`: it's derived from the server's
@@ -144,6 +148,14 @@ impl DoqDriverTestHelper {
             self.work_loop_iter()?;
         }
         self.pipe.advance()?;
+        Ok(())
+    }
+
+    /// Delivers one client flight without advancing the server or completing
+    /// the handshake.
+    pub fn advance_client_to_server(&mut self) -> anyhow::Result<()> {
+        let flight = quiche::test_utils::emit_flight(&mut self.pipe.client)?;
+        quiche::test_utils::process_flight(&mut self.pipe.server, flight)?;
         Ok(())
     }
 

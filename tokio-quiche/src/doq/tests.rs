@@ -49,7 +49,9 @@ use quiche::doq;
 use quiche::doq::DoqError;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use super::test_utils::default_quiche_config;
 use super::test_utils::DoqDriverTestHelper;
+use super::test_utils::Pipe;
 use super::StreamClosed;
 use crate::ApplicationOverQuic as _;
 
@@ -84,6 +86,69 @@ async fn query_event_and_response_roundtrip() {
         helper.peer.poll(&mut helper.pipe.client),
         Err(doq::Error::Done)
     );
+}
+
+#[tokio::test]
+async fn zero_rtt_query_event_and_response_roundtrip() {
+    let mut config = default_quiche_config();
+    config.enable_early_data();
+
+    let mut ticket_pipe = Pipe::with_config_and_buf(&mut config).unwrap();
+    ticket_pipe.handshake().unwrap();
+    let session = ticket_pipe.client.session().unwrap().to_vec();
+
+    let mut pipe = Pipe::with_config_and_buf(&mut config).unwrap();
+    pipe.client.set_session(&session).unwrap();
+    let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+    quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    let mut helper = DoqDriverTestHelper::with_initialized_pipe(pipe).unwrap();
+    assert!(helper.pipe.client.is_in_early_data());
+    assert!(helper.pipe.server.is_in_early_data());
+    assert!(!helper.pipe.client.is_established());
+    assert!(!helper.pipe.server.is_established());
+
+    let stream_id = helper.peer_send_query(b"early").unwrap();
+    helper.advance_client_to_server().unwrap();
+    helper
+        .driver
+        .process_reads(&mut helper.pipe.server)
+        .unwrap();
+
+    let (data, is_0rtt, responder) = helper.expect_query_event();
+    assert_eq!(data, Bytes::from_static(b"early"));
+    assert!(is_0rtt);
+    assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
+
+    helper.pipe.advance().unwrap();
+    helper.work_loop_iter().unwrap();
+    assert!(matches!(
+        helper.try_recv_event(),
+        Ok(super::DoqEvent::HandshakeConfirmed)
+    ));
+    assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
+
+    responder
+        .send(Bytes::from_static(b"response"), true)
+        .await
+        .unwrap();
+    helper.advance_and_run_loop().unwrap();
+
+    assert_eq!(
+        helper.peer.poll(&mut helper.pipe.client),
+        Ok((stream_id, doq::Event::Response {
+            data: b"response".to_vec()
+        }))
+    );
+    assert_eq!(
+        helper.peer.poll(&mut helper.pipe.client),
+        Ok((stream_id, doq::Event::Finished))
+    );
+    assert_eq!(
+        helper.peer.poll(&mut helper.pipe.client),
+        Err(doq::Error::Done)
+    );
+    assert!(responder.closed().now_or_never().is_some());
 }
 
 #[tokio::test]
