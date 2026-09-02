@@ -50,19 +50,6 @@ use super::DnsWireError;
 /// A specialized [`Result`] type for [`Connection`] operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Maximum unconsumed bytes a server-role stream may buffer while waiting
-/// for STREAM FIN: a DoQ message plus its 2-octet length prefix, per RFC 9250,
-/// Section 4.2. A server-role stream carries at most one query (see
-/// [`Connection::drain_server_stream`]), so legitimate traffic never needs
-/// more; a peer that keeps streaming bytes past this without completing or
-/// finishing its query is exceeding its budget rather than making progress.
-/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-///
-/// Not applied to the client role: a zone-transfer stream may legitimately
-/// have several complete responses buffered at once before
-/// [`Connection::drain_client_stream`] runs.
-const MAX_SERVER_RECV_BUF_LEN: usize = 65535 + 2;
-
 /// An error while driving a [`Connection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -504,7 +491,7 @@ impl Connection {
                     state.recv_buf.extend_from_slice(&buf[..len]);
 
                     if self.is_server &&
-                        state.recv_buf.len() > MAX_SERVER_RECV_BUF_LEN
+                        state.recv_buf.len() > super::MAX_DOQ_MESSAGE_LEN
                     {
                         self.streams.remove(&stream_id);
                         return Err(Error::ProtocolError);

@@ -30,6 +30,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
+use domain::base::iana::Rcode;
+use domain::base::Message;
+use domain::base::MessageBuilder;
 use tokio::sync::mpsc;
 
 /// One DNS response in an upstream sequence.
@@ -92,6 +95,8 @@ pub(crate) enum UpstreamError {
     DeadlineExceeded,
     /// The response consumer closed before a response was sent.
     ReceiverClosed,
+    /// The fake upstream could not parse the DNS query.
+    InvalidQuery,
 }
 
 /// The resolver interface used by the transaction layer.
@@ -102,6 +107,30 @@ pub(crate) trait Upstream: Send + Sync {
     ) -> Pin<
         Box<dyn Future<Output = Result<ResponseSequence, UpstreamError>> + Send>,
     >;
+}
+
+/// A deterministic upstream that returns an empty successful DNS response.
+pub(crate) struct FakeUpstream;
+
+impl Upstream for FakeUpstream {
+    fn resolve(
+        &self, query: Bytes,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ResponseSequence, UpstreamError>> + Send>,
+    > {
+        Box::pin(async move {
+            let query = Message::from_octets(query.to_vec())
+                .map_err(|_| UpstreamError::InvalidQuery)?;
+            let response = MessageBuilder::new_vec()
+                .start_answer(&query, Rcode::NOERROR)
+                .map_err(|_| UpstreamError::InvalidQuery)?
+                .additional()
+                .finish();
+            let (sender, sequence) = ResponseSequence::channel(1);
+            sender.send(Bytes::from(response), true).await?;
+            Ok(sequence)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +174,21 @@ mod tests {
             sequence.next().await,
             Err(UpstreamError::InvalidResponseSequence)
         );
+    }
+
+    #[tokio::test]
+    async fn fake_upstream_returns_a_terminal_dns_response() {
+        let query = Bytes::from_static(
+            b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x07example\x03com\0\0\x01\0\x01",
+        );
+        let mut responses = FakeUpstream.resolve(query).await.unwrap();
+
+        let ResponseItem::Final(response) = responses.next().await.unwrap()
+        else {
+            panic!("fake upstream response must finish the DoQ stream");
+        };
+
+        assert_eq!(&response[..2], &[0, 0]);
+        assert_ne!(response[2] & 0x80, 0);
     }
 }

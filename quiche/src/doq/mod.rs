@@ -44,6 +44,17 @@ pub const DOQ_ALPN: &[u8] = b"doq";
 /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.1.1
 pub const DOQ_PORT: u16 = 853;
 
+/// Maximum bytes in one encoded DoQ DNS message.
+///
+/// RFC 9250, Section 4.2: "All DNS messages (queries and responses) sent over
+/// DoQ connections MUST be encoded as a 2-octet length field followed by the
+/// message content as specified in [RFC1035]."
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+/// RFC 9250, Section 4.6: "DoQ implementations always assume that the maximum
+/// message size is 65535 bytes."
+/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.6
+pub const MAX_DOQ_MESSAGE_LEN: usize = 65_537;
+
 /// Define DoQ error codes from RFC 9250, Section 4.3.
 /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

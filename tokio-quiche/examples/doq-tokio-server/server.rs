@@ -25,3 +25,44 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! DoQ controller orchestration and transaction concurrency.
+
+use std::sync::Arc;
+
+use tokio_quiche::doq::DoqController;
+use tokio_quiche::doq::DoqError;
+use tokio_quiche::doq::DoqEvent;
+
+use crate::config::ServerConfig;
+use crate::request::Request;
+use crate::upstream::Upstream;
+
+/// Process DoQ events for one connection.
+pub(crate) async fn serve<U>(
+    mut controller: DoqController, upstream: Arc<U>, config: ServerConfig,
+) where
+    U: Upstream + 'static,
+{
+    let Some(mut events) = controller.take_event_receiver() else {
+        return;
+    };
+
+    while let Some(event) = events.recv().await {
+        if let DoqEvent::Query {
+            data, responder, ..
+        } = event
+        {
+            let upstream = Arc::clone(&upstream);
+            let config = config.clone();
+            tokio::spawn(async move {
+                let request = Request::start(&config);
+                if request
+                    .respond(upstream.as_ref(), data, &responder)
+                    .await
+                    .is_err()
+                {
+                    let _ = responder.reset(DoqError::InternalError).await;
+                }
+            });
+        }
+    }
+}

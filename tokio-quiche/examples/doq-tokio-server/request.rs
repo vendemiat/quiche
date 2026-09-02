@@ -28,8 +28,10 @@
 
 use bytes::Bytes;
 use tokio::time::Instant;
+use tokio_quiche::doq::DoqResponder;
 
 use crate::config::ServerConfig;
+use crate::upstream::ResponseItem;
 use crate::upstream::ResponseSequence;
 use crate::upstream::Upstream;
 use crate::upstream::UpstreamError;
@@ -49,11 +51,13 @@ impl Request {
     }
 
     /// Return the absolute deadline for this request.
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
 
     /// Return whether the request has reached its deadline.
+    #[cfg(test)]
     pub(crate) fn is_expired(&self, now: Instant) -> bool {
         now >= self.deadline
     }
@@ -65,6 +69,31 @@ impl Request {
         tokio::time::timeout_at(self.deadline, upstream.resolve(query))
             .await
             .map_err(|_| UpstreamError::DeadlineExceeded)?
+    }
+
+    /// Resolve and forward all upstream responses for this request.
+    pub(crate) async fn respond<U: Upstream>(
+        &self, upstream: &U, query: Bytes, responder: &DoqResponder,
+    ) -> Result<(), UpstreamError> {
+        let mut responses = self.resolve(upstream, query).await?;
+
+        loop {
+            let response =
+                tokio::time::timeout_at(self.deadline, responses.next())
+                    .await
+                    .map_err(|_| UpstreamError::DeadlineExceeded)??;
+            let (data, fin) = match response {
+                ResponseItem::More(data) => (data, false),
+                ResponseItem::Final(data) => (data, true),
+            };
+
+            if responder.send(data, fin).await.is_err() {
+                return Ok(());
+            }
+            if fin {
+                return Ok(());
+            }
+        }
     }
 }
 
