@@ -106,7 +106,7 @@ tokio-util = { workspace = true, features = [
 url = { workspace = true }
 
 [dev-dependencies]
-domain = { version = "0.11", default-features = false }
+domain = { version = "0.11", default-features = false, features = ["std"] }
 assert_matches = { workspace = true }
 clap = { version = "4.5.40", features = ["derive"] }
 env_logger = { workspace = true }
@@ -117,7 +117,7 @@ http-body-util = "0.1"
 regex = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true, features = ["time", "test-util", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "time", "test-util", "rt-multi-thread"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

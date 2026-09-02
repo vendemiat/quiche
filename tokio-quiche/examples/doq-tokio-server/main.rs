@@ -26,4 +26,89 @@
 
 //! Request core for the Tokio DoQ server.
 
-fn main() {}
+mod config;
+mod dns;
+mod request;
+mod server;
+mod upstream;
+
+use std::sync::Arc;
+
+use clap::Parser;
+use futures::StreamExt;
+use quiche::doq::MAX_DOQ_MESSAGE_LEN;
+use tokio::net::UdpSocket;
+use tokio_quiche::doq::DoqServerDriver;
+use tokio_quiche::doq::DOQ_ALPN;
+use tokio_quiche::listen;
+use tokio_quiche::metrics::DefaultMetrics;
+use tokio_quiche::settings::CertificateKind;
+use tokio_quiche::settings::Hooks;
+use tokio_quiche::settings::QuicSettings;
+use tokio_quiche::settings::TlsCertificatePaths;
+use tokio_quiche::ConnectionParams;
+
+use crate::config::ServerConfig;
+use crate::server::serve;
+use crate::upstream::FakeUpstream;
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Address on which to listen for DoQ connections.
+    #[arg(long, default_value = "127.0.0.1:8853")]
+    address: String,
+
+    /// Path to the server TLS certificate.
+    #[arg(long, default_value = "examples/cert.crt")]
+    tls_cert_path: String,
+
+    /// Path to the server TLS private key.
+    #[arg(long, default_value = "examples/cert.key")]
+    tls_private_key_path: String,
+}
+
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+
+    let args = Args::parse();
+    let socket = UdpSocket::bind(&args.address)
+        .await
+        .expect("DoQ UDP socket should be bindable");
+    let mut settings = QuicSettings::default();
+    let max_streams_bidi = settings.initial_max_streams_bidi;
+    settings.alpn = vec![DOQ_ALPN.to_vec()];
+    settings.enable_dgram = false;
+    settings.enable_early_data = true;
+    settings.initial_max_stream_data_bidi_local = MAX_DOQ_MESSAGE_LEN as u64;
+    settings.initial_max_stream_data_bidi_remote = MAX_DOQ_MESSAGE_LEN as u64;
+    settings.initial_max_streams_uni = 0;
+
+    let mut listeners = listen(
+        [socket],
+        ConnectionParams::new_server(
+            settings,
+            TlsCertificatePaths {
+                cert: &args.tls_cert_path,
+                private_key: &args.tls_private_key_path,
+                kind: CertificateKind::X509,
+            },
+            Hooks::default(),
+        ),
+        DefaultMetrics,
+    )
+    .expect("DoQ listener should be constructible");
+
+    while let Some(connection) = listeners[0].next().await {
+        let Ok(connection) = connection else {
+            continue;
+        };
+        let (driver, controller) = DoqServerDriver::new(max_streams_bidi);
+        connection.start(driver);
+        tokio::spawn(serve(
+            controller,
+            Arc::new(FakeUpstream),
+            ServerConfig::default(),
+        ));
+    }
+}
