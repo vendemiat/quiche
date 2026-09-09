@@ -65,6 +65,21 @@ struct Args {
     /// Path to the server TLS private key.
     #[arg(long, default_value = "examples/cert.key")]
     tls_private_key_path: String,
+
+    /// Disable acceptance of 0-RTT queries.
+    #[arg(long)]
+    disable_0rtt: bool,
+}
+
+fn doq_settings(disable_0rtt: bool) -> QuicSettings {
+    let mut settings = QuicSettings::default();
+    settings.alpn = vec![DOQ_ALPN.to_vec()];
+    settings.enable_dgram = false;
+    settings.enable_early_data = !disable_0rtt;
+    settings.initial_max_stream_data_bidi_local = MAX_DOQ_MESSAGE_LEN as u64;
+    settings.initial_max_stream_data_bidi_remote = MAX_DOQ_MESSAGE_LEN as u64;
+    settings.initial_max_streams_uni = 0;
+    settings
 }
 
 #[tokio::main]
@@ -75,14 +90,8 @@ async fn main() {
     let socket = UdpSocket::bind(&args.address)
         .await
         .expect("DoQ UDP socket should be bindable");
-    let mut settings = QuicSettings::default();
+    let settings = doq_settings(args.disable_0rtt);
     let max_streams_bidi = settings.initial_max_streams_bidi;
-    settings.alpn = vec![DOQ_ALPN.to_vec()];
-    settings.enable_dgram = false;
-    settings.enable_early_data = true;
-    settings.initial_max_stream_data_bidi_local = MAX_DOQ_MESSAGE_LEN as u64;
-    settings.initial_max_stream_data_bidi_remote = MAX_DOQ_MESSAGE_LEN as u64;
-    settings.initial_max_streams_uni = 0;
 
     let mut listeners = listen(
         [socket],
@@ -110,5 +119,16 @@ async fn main() {
             Arc::new(FakeUpstream),
             ServerConfig::default(),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enables_early_data_unless_disabled() {
+        assert!(doq_settings(false).enable_early_data);
+        assert!(!doq_settings(true).enable_early_data);
     }
 }

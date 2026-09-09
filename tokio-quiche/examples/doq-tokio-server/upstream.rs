@@ -31,9 +31,13 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use domain::base::iana::Rcode;
+use domain::base::message_builder::PushError;
 use domain::base::Message;
 use domain::base::MessageBuilder;
 use tokio::sync::mpsc;
+use tokio::time::error::Elapsed;
+
+use crate::dns::DnsError;
 
 /// One DNS response in an upstream sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,65 +51,101 @@ pub(crate) enum ResponseItem {
 /// Producer for an ordered upstream response sequence.
 pub(crate) struct ResponseStreamSender {
     sender: mpsc::Sender<ResponseItem>,
+    finished: bool,
 }
 
 impl ResponseStreamSender {
     /// Send a response, optionally marking it as final.
     pub(crate) async fn send(
-        &self, data: Bytes, fin: bool,
+        &mut self, data: Bytes, fin: bool,
     ) -> Result<(), UpstreamError> {
+        if self.finished {
+            return Err(UpstreamError::InvalidResponseSequence(
+                DnsError::InvalidResponse,
+            ));
+        }
+
         self.sender
             .send(if fin {
                 ResponseItem::Final(data)
             } else {
                 ResponseItem::More(data)
             })
-            .await
-            .map_err(|_| UpstreamError::ReceiverClosed)
+            .await?;
+        self.finished = fin;
+        Ok(())
     }
 }
 
 /// Responses produced in order as the upstream resolves them.
 pub(crate) struct ResponseSequence {
     receiver: mpsc::Receiver<ResponseItem>,
+    finished: bool,
 }
 
 impl ResponseSequence {
     /// Create a producer and its response sequence.
     pub(crate) fn channel(capacity: usize) -> (ResponseStreamSender, Self) {
         let (sender, receiver) = mpsc::channel(capacity);
-        (ResponseStreamSender { sender }, Self { receiver })
+        (
+            ResponseStreamSender {
+                sender,
+                finished: false,
+            },
+            Self {
+                receiver,
+                finished: false,
+            },
+        )
     }
 
     /// Receive the next response or report premature stream closure.
     pub(crate) async fn next(&mut self) -> Result<ResponseItem, UpstreamError> {
         match self.receiver.recv().await {
+            Some(_) if self.finished => Err(
+                UpstreamError::InvalidResponseSequence(DnsError::InvalidResponse),
+            ),
+            Some(ResponseItem::Final(data)) => {
+                self.finished = true;
+                Ok(ResponseItem::Final(data))
+            },
             Some(item) => Ok(item),
-            None => Err(UpstreamError::InvalidResponseSequence),
+            None => Err(UpstreamError::InvalidResponseSequence(
+                DnsError::InvalidResponse,
+            )),
         }
     }
 }
 
-/// Internal errors returned by an upstream resolver or response sequence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum UpstreamError {
-    /// The response stream ended before a terminal response.
-    InvalidResponseSequence,
-    /// The request exceeded its absolute deadline.
-    DeadlineExceeded,
-    /// The response consumer closed before a response was sent.
-    ReceiverClosed,
-    /// The fake upstream could not parse the DNS query.
-    InvalidQuery,
+    #[error("invalid upstream response sequence")]
+    InvalidResponseSequence(#[from] DnsError),
+
+    #[error("request deadline exceeded")]
+    DeadlineExceeded(#[from] Elapsed),
+
+    #[error("response consumer closed")]
+    ReceiverClosed(#[from] mpsc::error::SendError<ResponseItem>),
+
+    #[error("upstream failed")]
+    Failed(#[from] PushError),
+
+    #[error("downstream request cancelled")]
+    Cancelled,
 }
 
 /// The resolver interface used by the transaction layer.
 pub(crate) trait Upstream: Send + Sync {
     /// Start resolving one DNS request.
-    fn resolve(
-        &self, query: Bytes,
+    fn resolve<'a>(
+        &'a self, query: &'a Message<Bytes>,
     ) -> Pin<
-        Box<dyn Future<Output = Result<ResponseSequence, UpstreamError>> + Send>,
+        Box<
+            dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                + Send
+                + 'a,
+        >,
     >;
 }
 
@@ -113,21 +153,23 @@ pub(crate) trait Upstream: Send + Sync {
 pub(crate) struct FakeUpstream;
 
 impl Upstream for FakeUpstream {
-    fn resolve(
-        &self, query: Bytes,
+    fn resolve<'a>(
+        &'a self, query: &'a Message<Bytes>,
     ) -> Pin<
-        Box<dyn Future<Output = Result<ResponseSequence, UpstreamError>> + Send>,
+        Box<
+            dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(async move {
-            let query = Message::from_octets(query.to_vec())
-                .map_err(|_| UpstreamError::InvalidQuery)?;
-            let response = MessageBuilder::new_vec()
-                .start_answer(&query, Rcode::NOERROR)
-                .map_err(|_| UpstreamError::InvalidQuery)?
+            let response = MessageBuilder::new_bytes()
+                .start_answer(query, Rcode::NOERROR)?
                 .additional()
-                .finish();
-            let (sender, sequence) = ResponseSequence::channel(1);
-            sender.send(Bytes::from(response), true).await?;
+                .into_message()
+                .into_octets();
+            let (mut sender, sequence) = ResponseSequence::channel(1);
+            sender.send(response, true).await?;
             Ok(sequence)
         })
     }
@@ -139,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_sequence_yields_incrementally_and_requires_fin() {
-        let (sender, mut sequence) = ResponseSequence::channel(1);
+        let (mut sender, mut sequence) = ResponseSequence::channel(1);
         sender
             .send(Bytes::from_static(b"response"), false)
             .await
@@ -160,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_sequence_rejects_close_before_fin() {
-        let (sender, mut sequence) = ResponseSequence::channel(1);
+        let (mut sender, mut sequence) = ResponseSequence::channel(1);
         sender
             .send(Bytes::from_static(b"response"), false)
             .await
@@ -170,10 +212,27 @@ mod tests {
             ResponseItem::More(Bytes::from_static(b"response"))
         );
         drop(sender);
-        assert_eq!(
+        assert!(matches!(
             sequence.next().await,
-            Err(UpstreamError::InvalidResponseSequence)
-        );
+            Err(UpstreamError::InvalidResponseSequence(
+                DnsError::InvalidResponse
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_sequence_rejects_messages_after_final() {
+        let (mut sender, _sequence) = ResponseSequence::channel(1);
+        sender
+            .send(Bytes::from_static(b"response"), true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            sender.send(Bytes::from_static(b"response"), false).await,
+            Err(UpstreamError::InvalidResponseSequence(
+                DnsError::InvalidResponse
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -181,7 +240,8 @@ mod tests {
         let query = Bytes::from_static(
             b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x07example\x03com\0\0\x01\0\x01",
         );
-        let mut responses = FakeUpstream.resolve(query).await.unwrap();
+        let query = Message::from_octets(query).unwrap();
+        let mut responses = FakeUpstream.resolve(&query).await.unwrap();
 
         let ResponseItem::Final(response) = responses.next().await.unwrap()
         else {
