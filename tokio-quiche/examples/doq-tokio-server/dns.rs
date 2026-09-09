@@ -33,9 +33,16 @@ use domain::base::message::ShortMessage;
 use domain::base::message_builder::PushError;
 use domain::base::opt::exterr::ExtendedError;
 use domain::base::wire::ParseError;
-use domain::base::Header;
 use domain::base::Message;
 use domain::base::MessageBuilder;
+use domain::rdata::AllRecordData;
+
+// RFC 9715, Section 3.2: "UDP requestors should limit the requestor's maximum
+// UDP payload size to fit in the minimum of the interface MTU, the network MTU
+// value configured by the network operators, and the RECOMMENDED maximum
+// DNS/UDP payload size 1400. A smaller limit may be allowed."
+// https://datatracker.ietf.org/doc/html/rfc9715#section-3.2
+pub(crate) const MAX_DNS_UDP_BUFFER_SIZE: u16 = 1400;
 
 /// A validated DNS query received over DoQ.
 pub(crate) struct DoqDnsQuery<T>(Message<T>);
@@ -96,7 +103,7 @@ impl DoqDnsQuery<Bytes> {
         self.0.header().opcode().into()
     }
 
-    /// Return this query with a random DNS message ID.
+    /// Build an upstream query with a random ID and bounded UDP payload size.
     pub(crate) fn prepare_upstream_query(
         self,
     ) -> Result<Message<Bytes>, DnsError> {
@@ -104,9 +111,40 @@ impl DoqDnsQuery<Bytes> {
         // over another transport, a DNS Message ID MUST be generated according
         // to the rules of the protocol that is in use."
         // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
-        let mut header = Header::new();
-        header.set_random_id();
-        update_id(self.0, header.id())
+        let source_header = self.0.header();
+        let source_opt = self.0.opt();
+
+        let mut builder = MessageBuilder::new_bytes();
+        builder.header_mut().set_random_id();
+        builder.header_mut().set_opcode(source_header.opcode());
+        builder.header_mut().set_flags(source_header.flags());
+        builder.header_mut().set_z(source_header.z());
+        builder.header_mut().set_rcode(source_header.rcode());
+
+        let mut questions = builder.question();
+        for question in self.0.question() {
+            questions.push(question?)?;
+        }
+
+        let mut additional = questions.additional();
+        // Copy non-OPT records. Build exactly one OPT below because the builder
+        // cannot modify a record after it has been pushed.
+        for record in self.0.additional()? {
+            let record = record?;
+            if record.rtype() == domain::base::iana::Rtype::OPT {
+                continue;
+            }
+            additional.push(record.to_any_record::<AllRecordData<_, _>>()?)?;
+        }
+        additional.opt(|opt| {
+            if let Some(source_opt) = source_opt.as_ref() {
+                opt.clone_from(source_opt)?;
+            }
+            opt.set_udp_payload_size(MAX_DNS_UDP_BUFFER_SIZE);
+            Ok(())
+        })?;
+
+        Ok(additional.into_message())
     }
 
     /// Build a terminal DNS response for this query.
@@ -168,6 +206,11 @@ impl DoqDnsResponse<Bytes> {
         // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
         let response = update_id(response, 0)?;
         Self::try_from(response)
+    }
+
+    /// Return whether this response requires retrying over TCP.
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.0.header().tc()
     }
 
     /// Return the bare DNS response bytes.
@@ -246,14 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn translates_and_restores_only_the_dns_id() {
-        let expected = query(0, Rtype::A);
-        let expected_body = expected.as_ref()[2..].to_vec();
+    fn prepares_upstream_query_with_id_and_edns_size() {
         let validated = parse_doq_query(query(0, Rtype::A)).unwrap();
-        let original_ptr = validated.0.as_slice().as_ptr();
         let upstream_query = validated.prepare_upstream_query().unwrap();
-        assert_eq!(upstream_query.as_slice().as_ptr(), original_ptr);
-        assert_eq!(&upstream_query.as_slice()[2..], expected_body.as_slice());
+        assert_ne!(upstream_query.header().id(), 0);
+        assert_eq!(
+            upstream_query.opt().unwrap().udp_payload_size(),
+            MAX_DNS_UDP_BUFFER_SIZE
+        );
 
         let response = MessageBuilder::new_bytes()
             .start_answer(&upstream_query, Rcode::NOERROR)
@@ -265,6 +308,36 @@ mod tests {
             DoqDnsResponse::from_upstream(response, &upstream_query).unwrap();
         assert_eq!(response.0.as_slice().as_ptr(), original_ptr);
         assert_eq!(response.0.header().id(), 0);
+    }
+
+    #[test]
+    fn preserves_existing_edns_options_in_upstream_query() {
+        let query = Message::from_octets(query(0, Rtype::A)).unwrap();
+        let mut additional = MessageBuilder::new_bytes().question();
+        for question in query.question() {
+            additional.push(question.unwrap()).unwrap();
+        }
+        let mut additional = additional.additional();
+        additional
+            .opt(|opt| {
+                opt.set_udp_payload_size(4096);
+                opt.set_dnssec_ok(true);
+                opt.padding(8)?;
+                Ok(())
+            })
+            .unwrap();
+        let query = additional.into_message();
+        let original_opt = query.opt().unwrap();
+        let original_options = original_opt.opt().clone();
+        let upstream_query = DoqDnsQuery::try_from(query)
+            .unwrap()
+            .prepare_upstream_query()
+            .unwrap();
+        let upstream_opt = upstream_query.opt().unwrap();
+
+        assert_eq!(upstream_opt.udp_payload_size(), MAX_DNS_UDP_BUFFER_SIZE);
+        assert!(upstream_opt.dnssec_ok());
+        assert_eq!(upstream_opt.opt(), &original_options);
     }
 
     #[test]

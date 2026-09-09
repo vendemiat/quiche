@@ -108,6 +108,7 @@ pub(crate) async fn serve<U>(
                             error,
                             UpstreamError::DeadlineExceeded(_)
                                 | UpstreamError::Failed(_)
+                                | UpstreamError::Network(_)
                         )
                         .then(|| ExtendedErrorCode::NETWORK_ERROR.into());
                         send_terminal(
