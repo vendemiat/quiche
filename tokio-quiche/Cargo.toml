@@ -106,7 +106,7 @@ tokio-util = { workspace = true, features = [
 url = { workspace = true }
 
 [dev-dependencies]
-domain = { version = "0.11", default-features = false, features = ["std"] }
+domain = { version = "0.11", default-features = false, features = ["bytes", "rand", "std"] }
 assert_matches = { workspace = true }
 clap = { version = "4.5.40", features = ["derive"] }
 env_logger = { workspace = true }

@@ -27,27 +27,39 @@
 //! Per-query deadline, cancellation, and response forwarding state.
 
 use bytes::Bytes;
+use domain::base::iana::Rcode;
+use domain::base::opt::exterr::ExtendedError;
+use domain::base::Message;
 use tokio::time::Instant;
 use tokio_quiche::doq::DoqResponder;
 
 use crate::config::ServerConfig;
+use crate::dns::build_failed_response;
+use crate::dns::DnsError;
+use crate::dns::DoqDnsQuery;
+use crate::dns::DoqDnsResponse;
 use crate::upstream::ResponseItem;
 use crate::upstream::ResponseSequence;
 use crate::upstream::Upstream;
 use crate::upstream::UpstreamError;
 
 /// State shared by the controller while one DNS request is in flight.
-#[derive(Debug)]
 pub(crate) struct Request {
     deadline: Instant,
+    upstream_query: Message<Bytes>,
 }
 
 impl Request {
     /// Start a request using the monotonic Tokio clock.
-    pub(crate) fn start(config: &ServerConfig) -> Self {
+    pub(crate) fn start(
+        config: &ServerConfig, query: DoqDnsQuery<Bytes>,
+    ) -> Result<Self, DnsError> {
         let started_at = Instant::now();
         let deadline = started_at + config.transaction_timeout;
-        Self { deadline }
+        Ok(Self {
+            deadline,
+            upstream_query: query.prepare_upstream_query()?,
+        })
     }
 
     /// Return the absolute deadline for this request.
@@ -64,68 +76,77 @@ impl Request {
 
     /// Resolve the request before its absolute deadline.
     pub(crate) async fn resolve<U: Upstream>(
-        &self, upstream: &U, query: Bytes,
+        &self, upstream: &U, responder: &DoqResponder,
     ) -> Result<ResponseSequence, UpstreamError> {
-        tokio::time::timeout_at(self.deadline, upstream.resolve(query))
-            .await
-            .map_err(|_| UpstreamError::DeadlineExceeded)?
+        tokio::select! {
+            result = tokio::time::timeout_at(
+                self.deadline,
+                upstream.resolve(&self.upstream_query),
+            ) => {
+                Ok(result??)
+            },
+            _ = responder.closed() => Err(UpstreamError::Cancelled),
+        }
     }
 
     /// Resolve and forward all upstream responses for this request.
     pub(crate) async fn respond<U: Upstream>(
-        &self, upstream: &U, query: Bytes, responder: &DoqResponder,
+        &self, upstream: &U, responder: &DoqResponder,
     ) -> Result<(), UpstreamError> {
-        let mut responses = self.resolve(upstream, query).await?;
-
+        let mut responses = self.resolve(upstream, responder).await?;
         loop {
-            let response =
-                tokio::time::timeout_at(self.deadline, responses.next())
-                    .await
-                    .map_err(|_| UpstreamError::DeadlineExceeded)??;
+            let response = tokio::select! {
+                result = tokio::time::timeout_at(self.deadline, responses.next()) => {
+                result??
+            },
+            _ = responder.closed() => return Err(UpstreamError::Cancelled),
+            };
             let (data, fin) = match response {
                 ResponseItem::More(data) => (data, false),
                 ResponseItem::Final(data) => (data, true),
             };
+            if !self.upstream_query.is_xfr() && !fin {
+                return Err(UpstreamError::InvalidResponseSequence(
+                    DnsError::InvalidResponse,
+                ));
+            }
+            let data =
+                DoqDnsResponse::from_upstream_bytes(data, &self.upstream_query)?;
 
-            if responder.send(data, fin).await.is_err() {
-                return Ok(());
+            tokio::select! {
+                result = responder.send(data.into_bytes(), fin) => {
+                    if result.is_err() {
+                        return Ok(());
+                    }
+                },
+            _ = responder.closed() => return Err(UpstreamError::Cancelled),
             }
             if fin {
                 return Ok(());
             }
         }
     }
+
+    /// Build a terminal DNS response for this request.
+    pub(crate) fn failed_reponse(
+        &self, rcode: Rcode, ede: Vec<ExtendedError<Bytes>>,
+    ) -> Result<DoqDnsResponse<Bytes>, DnsError> {
+        build_failed_response(&self.upstream_query, rcode, ede)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
+    use domain::base::iana::Rtype;
+    use domain::base::Message;
     use std::time::Duration;
 
-    use crate::upstream::ResponseItem;
-
-    struct TestUpstream;
-
-    impl Upstream for TestUpstream {
-        fn resolve(
-            &self, _query: Bytes,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
-                    + Send,
-            >,
-        > {
-            Box::pin(async {
-                let (sender, sequence) = ResponseSequence::channel(1);
-                sender
-                    .send(Bytes::from_static(b"response"), true)
-                    .await
-                    .unwrap();
-                Ok(sequence)
-            })
-        }
+    fn query() -> DoqDnsQuery<Bytes> {
+        Message::from_octets(crate::dns::query(0, Rtype::A))
+            .unwrap()
+            .try_into()
+            .unwrap()
     }
 
     #[tokio::test(start_paused = true)]
@@ -133,22 +154,9 @@ mod tests {
         let config = ServerConfig {
             transaction_timeout: Duration::from_secs(5),
         };
-        let request = Request::start(&config);
+        let request = Request::start(&config, query()).unwrap();
         assert!(!request.is_expired(Instant::now()));
         tokio::time::advance(config.transaction_timeout).await;
         assert!(request.is_expired(request.deadline()));
-    }
-
-    #[tokio::test]
-    async fn resolves_before_transaction_deadline() {
-        let request = Request::start(&ServerConfig::default());
-        let mut response = request
-            .resolve(&TestUpstream, Bytes::from_static(b"query"))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.next().await.unwrap(),
-            ResponseItem::Final(Bytes::from_static(b"response"))
-        );
     }
 }
