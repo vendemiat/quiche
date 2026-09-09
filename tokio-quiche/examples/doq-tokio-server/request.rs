@@ -110,8 +110,7 @@ impl Request {
                     DnsError::InvalidResponse,
                 ));
             }
-            let data =
-                DoqDnsResponse::from_upstream_bytes(data, &self.upstream_query)?;
+            let data = self.validate_upstream_response(data)?;
 
             tokio::select! {
                 result = responder.send(data.into_bytes(), fin) => {
@@ -133,6 +132,17 @@ impl Request {
     ) -> Result<DoqDnsResponse<Bytes>, DnsError> {
         build_failed_response(&self.upstream_query, rcode, ede)
     }
+
+    fn validate_upstream_response(
+        &self, data: Bytes,
+    ) -> Result<DoqDnsResponse<Bytes>, UpstreamError> {
+        let response =
+            DoqDnsResponse::from_upstream_bytes(data, &self.upstream_query)?;
+        if response.is_truncated() {
+            return Err(UpstreamError::TcpRetryRequired);
+        }
+        Ok(response)
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +150,7 @@ mod tests {
     use super::*;
     use domain::base::iana::Rtype;
     use domain::base::Message;
+    use domain::base::MessageBuilder;
     use std::time::Duration;
 
     fn query() -> DoqDnsQuery<Bytes> {
@@ -158,5 +169,20 @@ mod tests {
         assert!(!request.is_expired(Instant::now()));
         tokio::time::advance(config.transaction_timeout).await;
         assert!(request.is_expired(request.deadline()));
+    }
+
+    #[test]
+    fn validated_truncated_response_requires_tcp_retry() {
+        let request = Request::start(&ServerConfig::default(), query()).unwrap();
+        let mut response = MessageBuilder::new_bytes()
+            .start_answer(&request.upstream_query, Rcode::NOERROR)
+            .unwrap();
+        response.header_mut().set_tc(true);
+        let response = response.additional().into_message().into_octets();
+
+        assert!(matches!(
+            request.validate_upstream_response(response),
+            Err(UpstreamError::TcpRetryRequired)
+        ));
     }
 }

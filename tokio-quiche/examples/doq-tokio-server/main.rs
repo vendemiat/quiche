@@ -32,6 +32,7 @@ mod request;
 mod server;
 mod upstream;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -50,13 +51,17 @@ use tokio_quiche::ConnectionParams;
 
 use crate::config::ServerConfig;
 use crate::server::serve;
-use crate::upstream::FakeUpstream;
+use crate::upstream::UdpUpstream;
 
 #[derive(Debug, Parser)]
 struct Args {
     /// Address on which to listen for DoQ connections.
     #[arg(long, default_value = "127.0.0.1:8853")]
     address: String,
+
+    /// Address of the UDP DNS upstream resolver.
+    #[arg(long)]
+    upstream_address: SocketAddr,
 
     /// Path to the server TLS certificate.
     #[arg(long, default_value = "examples/cert.crt")]
@@ -116,7 +121,7 @@ async fn main() {
         connection.start(driver);
         tokio::spawn(serve(
             controller,
-            Arc::new(FakeUpstream),
+            Arc::new(UdpUpstream::new(args.upstream_address)),
             ServerConfig::default(),
         ));
     }

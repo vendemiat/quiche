@@ -27,17 +27,18 @@
 //! Incremental upstream response abstractions.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use domain::base::iana::Rcode;
 use domain::base::message_builder::PushError;
 use domain::base::Message;
-use domain::base::MessageBuilder;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::error::Elapsed;
 
 use crate::dns::DnsError;
+use crate::dns::MAX_DNS_UDP_BUFFER_SIZE;
 
 /// One DNS response in an upstream sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +132,12 @@ pub(crate) enum UpstreamError {
     #[error("upstream failed")]
     Failed(#[from] PushError),
 
+    #[error("upstream network error")]
+    Network(#[from] std::io::Error),
+
+    #[error("upstream response requires TCP retry")]
+    TcpRetryRequired,
+
     #[error("downstream request cancelled")]
     Cancelled,
 }
@@ -149,10 +156,19 @@ pub(crate) trait Upstream: Send + Sync {
     >;
 }
 
-/// A deterministic upstream that returns an empty successful DNS response.
-pub(crate) struct FakeUpstream;
+/// A conventional UDP DNS upstream resolver.
+pub(crate) struct UdpUpstream {
+    address: SocketAddr,
+}
 
-impl Upstream for FakeUpstream {
+impl UdpUpstream {
+    /// Create an upstream resolver for the provided address.
+    pub(crate) fn new(address: SocketAddr) -> Self {
+        Self { address }
+    }
+}
+
+impl Upstream for UdpUpstream {
     fn resolve<'a>(
         &'a self, query: &'a Message<Bytes>,
     ) -> Pin<
@@ -163,13 +179,20 @@ impl Upstream for FakeUpstream {
         >,
     > {
         Box::pin(async move {
-            let response = MessageBuilder::new_bytes()
-                .start_answer(query, Rcode::NOERROR)?
-                .additional()
-                .into_message()
-                .into_octets();
+            let bind_address = match self.address {
+                SocketAddr::V4(_) => "0.0.0.0:0",
+                SocketAddr::V6(_) => "[::]:0",
+            };
+            let socket = UdpSocket::bind(bind_address).await?;
+            socket.connect(self.address).await?;
+            socket.send(query.as_slice()).await?;
+
+            let mut response = vec![0; usize::from(MAX_DNS_UDP_BUFFER_SIZE)];
+            let response_len = socket.recv(&mut response).await?;
+            response.truncate(response_len);
+
             let (mut sender, sequence) = ResponseSequence::channel(1);
-            sender.send(response, true).await?;
+            sender.send(Bytes::from(response), true).await?;
             Ok(sequence)
         })
     }
@@ -178,6 +201,36 @@ impl Upstream for FakeUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::base::iana::Rcode;
+    use domain::base::iana::Rtype;
+    use domain::base::MessageBuilder;
+    use tokio::net::UdpSocket;
+
+    /// A deterministic upstream that returns an empty successful DNS response.
+    struct FakeUpstream;
+
+    impl Upstream for FakeUpstream {
+        fn resolve<'a>(
+            &'a self, query: &'a Message<Bytes>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let response = MessageBuilder::new_bytes()
+                    .start_answer(query, Rcode::NOERROR)?
+                    .additional()
+                    .into_message()
+                    .into_octets();
+                let (mut sender, sequence) = ResponseSequence::channel(1);
+                sender.send(response, true).await?;
+                Ok(sequence)
+            })
+        }
+    }
 
     #[tokio::test]
     async fn response_sequence_yields_incrementally_and_requires_fin() {
@@ -237,9 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn fake_upstream_returns_a_terminal_dns_response() {
-        let query = Bytes::from_static(
-            b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x07example\x03com\0\0\x01\0\x01",
-        );
+        let query = crate::dns::query(0, Rtype::A);
         let query = Message::from_octets(query).unwrap();
         let mut responses = FakeUpstream.resolve(&query).await.unwrap();
 
@@ -250,5 +301,44 @@ mod tests {
 
         assert_eq!(&response[..2], &[0, 0]);
         assert_ne!(response[2] & 0x80, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_upstream_forwards_query_and_returns_terminal_response() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let query = crate::dns::query(0, Rtype::A);
+        let query_message = crate::dns::DoqDnsQuery::try_from(
+            Message::from_octets(query).unwrap(),
+        )
+        .unwrap()
+        .prepare_upstream_query()
+        .unwrap();
+        let response = MessageBuilder::new_bytes()
+            .start_answer(&query_message, Rcode::NOERROR)
+            .unwrap()
+            .additional()
+            .into_message()
+            .into_octets();
+        let expected_query = query_message.as_slice().to_vec();
+        let expected_response = response.clone();
+
+        let response_task = tokio::spawn(async move {
+            let mut received = vec![0; usize::from(MAX_DNS_UDP_BUFFER_SIZE)];
+            let (received_len, peer) =
+                upstream.recv_from(&mut received).await.unwrap();
+            assert_eq!(&received[..received_len], expected_query.as_slice());
+            upstream.send_to(&expected_response, peer).await.unwrap();
+        });
+
+        let mut responses = UdpUpstream::new(upstream_address)
+            .resolve(&query_message)
+            .await
+            .unwrap();
+        assert_eq!(
+            responses.next().await.unwrap(),
+            ResponseItem::Final(response)
+        );
+        response_task.await.unwrap();
     }
 }
