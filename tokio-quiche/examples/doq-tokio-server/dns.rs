@@ -282,9 +282,21 @@ mod tests {
     }
 
     #[test]
-    fn preserves_zone_transfer_types() {
-        assert!(parse_doq_query(query(0, Rtype::AXFR)).unwrap().0.is_xfr());
-        assert!(parse_doq_query(query(0, Rtype::IXFR)).unwrap().0.is_xfr());
+    fn classifies_axfr_query() {
+        let query = parse_doq_query(query(0, Rtype::AXFR)).unwrap();
+        assert_eq!(query.0.qtype(), Some(Rtype::AXFR));
+        assert!(query.0.is_xfr());
+    }
+
+    #[test]
+    fn classifies_ixfr_query() {
+        let query = parse_doq_query(query(0, Rtype::IXFR)).unwrap();
+        assert_eq!(query.0.qtype(), Some(Rtype::IXFR));
+        assert!(query.0.is_xfr());
+    }
+
+    #[test]
+    fn classifies_ordinary_query() {
         assert!(!parse_doq_query(query(0, Rtype::A)).unwrap().0.is_xfr());
     }
 
