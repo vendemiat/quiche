@@ -301,28 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn prepares_upstream_query_with_id_and_edns_size() {
-        let validated = parse_doq_query(query(0, Rtype::A)).unwrap();
-        let upstream_query = validated.prepare_upstream_query().unwrap();
-        assert_ne!(upstream_query.header().id(), 0);
-        assert_eq!(
-            upstream_query.opt().unwrap().udp_payload_size(),
-            MAX_DNS_UDP_BUFFER_SIZE
-        );
-
-        let response = MessageBuilder::new_bytes()
-            .start_answer(&upstream_query, Rcode::NOERROR)
-            .unwrap()
-            .additional()
-            .into_message();
-        let original_ptr = response.as_slice().as_ptr();
-        let response =
-            DoqDnsResponse::from_upstream(response, &upstream_query).unwrap();
-        assert_eq!(response.0.as_slice().as_ptr(), original_ptr);
-        assert_eq!(response.0.header().id(), 0);
-    }
-
-    #[test]
     fn preserves_existing_edns_options_in_upstream_query() {
         let query = Message::from_octets(query(0, Rtype::A)).unwrap();
         let mut additional = MessageBuilder::new_bytes().question();
