@@ -25,6 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Context;
@@ -48,6 +50,41 @@ use crate::quic::HandshakeInfo;
 use crate::quic::QuicheConnection;
 use crate::ApplicationOverQuic;
 use crate::QuicResult;
+
+/// The error type used internally in [`DoqServerDriver`].
+///
+/// Note that [`ApplicationOverQuic`] errors are not exposed to users at this
+/// time. The type is public to document the failure modes in
+/// [`DoqServerDriver`].
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DoqConnectionError {
+    /// The transport connection has not been established yet.
+    ConnectionNotEstablished,
+
+    /// The consumer is not draining [`DoqEvent`]s fast enough.
+    EventChannelFull,
+
+    /// The driver no longer tracks the stream: it was closed, cancelled, or
+    /// never opened.
+    UnknownStream,
+}
+
+impl Error for DoqConnectionError {}
+
+impl fmt::Display for DoqConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            Self::ConnectionNotEstablished =>
+                "DoQ transport connection has not been established yet",
+            Self::EventChannelFull =>
+                "DoQ event channel is full; consumer too slow",
+            Self::UnknownStream => "unknown stream",
+        };
+
+        write!(f, "{s}")
+    }
+}
 
 // A per-query responder channel with capacity 16 works out to 16 * 64KB =
 // 1MB of max buffered response data, matching `H3Driver`'s `STREAM_CAPACITY`
@@ -187,11 +224,9 @@ impl DoqServerDriver {
     /// `ApplicationOverQuic` method that could reach this on
     /// `self.conn.is_some()`.
     fn conn_mut(&mut self) -> QuicResult<&mut doq::Connection> {
-        self.conn.as_mut().ok_or_else(|| {
-            "DoqServerDriver's transport connection has not been \
-             established yet"
-                .into()
-        })
+        self.conn
+            .as_mut()
+            .ok_or_else(|| DoqConnectionError::ConnectionNotEstablished.into())
     }
 
     /// Checks `rx` out into a fresh [`WaitForResponder`] in `self.waiting`,
@@ -236,7 +271,7 @@ impl DoqServerDriver {
                     // the connection so a stalled consumer can't pin
                     // unbounded memory.
                     Err(mpsc::error::TrySendError::Full(_)) =>
-                        Err("DoQ event channel is full; consumer too slow".into()),
+                        Err(DoqConnectionError::EventChannelFull.into()),
 
                     // A dropped event receiver is handled by the
                     // `event_sender.closed()` arm in `wait_for_data`,
@@ -414,9 +449,9 @@ impl DoqServerDriver {
         fin: bool,
     ) -> QuicResult<()> {
         if self.conn_mut()?.response_pending(stream_id) {
-            let state = self.streams.get_mut(&stream_id).expect(
-                "a stream just written to must still be tracked in `streams`",
-            );
+            let Some(state) = self.streams.get_mut(&stream_id) else {
+                return Err(DoqConnectionError::UnknownStream.into());
+            };
             state.rx = Some(rx);
             state.pending_fin = fin;
         } else if fin {
@@ -557,20 +592,9 @@ impl ApplicationOverQuic for DoqServerDriver {
 
                 Err(doq::Error::Done) => break,
 
-                // Close the connection for these violations.
-                // See RFC 9250, Section 4.3.3.
-                // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-                // Covers a unidirectional or server-initiated stream, a
-                // truncated FIN, or a second query framed on the same
-                // stream.
-                Err(doq::Error::ProtocolError) => {
-                    let _ = qconn.close(
-                        true,
-                        DoqError::ProtocolError.to_wire(),
-                        b"DoQ protocol error",
-                    );
-                    return Ok(());
-                },
+                // `Connection::poll()` already initiated the protocol-error
+                // close. Keep the worker loop alive so it can send it.
+                Err(doq::Error::ProtocolError) => return Ok(()),
 
                 // `poll()` never returns `MessageTooLarge` or
                 // `UnknownStream`; those come only from `send_response` or

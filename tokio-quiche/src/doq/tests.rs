@@ -291,10 +291,10 @@ async fn stop_sending_does_not_release_peer_bidi_stream_credit() {
         helper.advance_and_run_loop().unwrap();
     }
 
-    assert_eq!(
+    assert!(matches!(
         helper.peer_send_query(b"q").unwrap_err().downcast_ref(),
-        Some(&quiche::Error::StreamLimit)
-    );
+        Some(doq::Error::TransportError(quiche::Error::StreamLimit))
+    ));
 }
 
 #[tokio::test]
@@ -318,7 +318,7 @@ async fn handshake_confirmed_emitted_once() {
 async fn client_reset_before_query_completes_is_noop() {
     let mut helper = DoqDriverTestHelper::new().unwrap();
 
-    let abandoned = helper.next_stream_id();
+    let abandoned = DoqDriverTestHelper::raw_client_stream_id(1);
     helper
         .pipe
         .client
@@ -487,13 +487,13 @@ async fn close_connection_command() {
 }
 
 /// A fatal protocol violation detected by `quiche::doq::Connection::poll`
-/// (here: a truncated STREAM FIN) makes `process_reads` close the whole
+/// (here: a truncated STREAM FIN) makes `Connection` itself close the whole
 /// connection with `DoqError::ProtocolError`, not just fail the one stream.
 #[tokio::test]
 async fn protocol_error_closes_connection() {
     let mut helper = DoqDriverTestHelper::new().unwrap();
 
-    let stream_id = helper.next_stream_id();
+    let stream_id = DoqDriverTestHelper::raw_client_stream_id(0);
     let mut wire = Vec::new();
     doq::write_dns_message(&mut wire, b"hello").unwrap();
     // Send everything but the last byte, with FIN: a truncated message.

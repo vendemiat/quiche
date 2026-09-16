@@ -76,6 +76,7 @@ pub mod test_utils;
 #[cfg(test)]
 mod tests;
 
+pub use driver::DoqConnectionError;
 pub use driver::DoqController;
 pub use driver::DoqServerDriver;
 

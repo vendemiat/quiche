@@ -63,17 +63,13 @@ pub fn default_quiche_config() -> quiche::Config {
     config
 }
 
-/// Wraps a `Pipe` with a `DoqServerDriver` on the server side and a raw
-/// `doq::Connection` (client role) as the peer. The peer's `Connection` has
-/// no query-sending API of its own (see `quiche::doq::connection`'s own
-/// tests): queries are written directly onto a fresh client-initiated bidi
-/// stream via [`Self::peer_send_query`].
+/// Wraps a `Pipe` with a `DoqServerDriver` on the server side and a
+/// client-role `doq::Connection` as the peer.
 pub struct DoqDriverTestHelper {
     pub pipe: Pipe,
     pub driver: DoqServerDriver,
     pub controller: DoqController,
     pub peer: doq::Connection,
-    next_client_stream_id: u64,
 }
 
 impl DoqDriverTestHelper {
@@ -114,7 +110,6 @@ impl DoqDriverTestHelper {
             driver,
             controller,
             peer,
-            next_client_stream_id: 0,
         })
     }
 
@@ -165,22 +160,13 @@ impl DoqDriverTestHelper {
     /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
     /// Returns the stream ID used.
     pub fn peer_send_query(&mut self, data: &[u8]) -> anyhow::Result<u64> {
-        let stream_id = self.next_stream_id();
-
-        let mut wire = Vec::new();
-        doq::write_dns_message(&mut wire, data).unwrap();
-        self.pipe.client.stream_send(stream_id, &wire, true)?;
-
-        Ok(stream_id)
+        Ok(self.peer.send_query(&mut self.pipe.client, data)?)
     }
 
-    /// Returns a fresh client-initiated bidi stream ID (0, 4, 8, ...)
-    /// without sending anything on it yet, for tests that need to control
-    /// the write calls themselves.
-    pub fn next_stream_id(&mut self) -> u64 {
-        let stream_id = self.next_client_stream_id;
-        self.next_client_stream_id += 4;
-        stream_id
+    /// Returns an explicit client-initiated bidirectional stream ID for tests
+    /// that deliberately create malformed raw QUIC traffic.
+    pub const fn raw_client_stream_id(index: u64) -> u64 {
+        index * 4
     }
 
     /// Tries to receive the next `DoqEvent` from the controller.

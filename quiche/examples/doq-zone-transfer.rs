@@ -158,7 +158,8 @@ fn main() {
     config.set_initial_max_data(100_000_000); // 100MB
     config.set_initial_max_stream_data_bidi_local(50_000_000); // 50MB
     config.set_initial_max_stream_data_bidi_remote(50_000_000);
-    config.set_initial_max_streams_bidi(10); // Allow multiple concurrent transfers
+    config.set_initial_max_streams_bidi(10); // Allow multiple concurrent
+                                             // transfers
     config.set_initial_max_streams_uni(0);
 
     // Generate a random source connection ID.
@@ -178,6 +179,7 @@ fn main() {
         &mut config,
     )
     .unwrap();
+    let mut doq_conn = Connection::with_transport(&conn).unwrap();
 
     info!(
         "Connecting to {} for AXFR zone transfer of {}",
@@ -195,10 +197,6 @@ fn main() {
 
     let mut transfer_sent = false;
     let mut active_transfers: HashMap<u64, ZoneTransfer> = HashMap::new();
-    // Per-stream receive buffers persist across event-loop iterations so that
-    // large zone-transfer responses are not lost when they arrive in chunks.
-    let mut stream_bufs: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut next_stream_id = 0;
 
     loop {
         // Wake no later than the dangling-stream grace deadline so a transfer
@@ -266,23 +264,8 @@ fn main() {
                 },
             };
 
-            // Prepare the message with length prefix.
-            let mut dns_message = Vec::new();
-            if let Err(e) = write_dns_message(&mut dns_message, &query) {
-                eprintln!("Failed to format DNS message: {}", e);
-                break;
-            }
-
-            // Send on the next available stream.
-            let stream_id = next_stream_id;
-            next_stream_id += 4;
-
-            match conn.stream_send(stream_id, &dns_message, true) {
-                Ok(written) => {
-                    if written < dns_message.len() {
-                        error!("Failed to send complete query");
-                        break;
-                    }
+            match doq_conn.send_query(&mut conn, &query) {
+                Ok(stream_id) => {
                     info!("Sent AXFR request on stream {}", stream_id);
 
                     // Stream received records straight to a zone file so the
@@ -324,69 +307,52 @@ fn main() {
             }
         }
 
-        // Process responses. Each complete DNS message is parsed and its
-        // records streamed to the zone file as soon as it arrives, then its
-        // bytes are discarded. The persistent buffer therefore only ever holds
-        // an in-flight partial message (< one max DNS message, ~64 KiB) rather
-        // than the entire zone, so memory stays bounded regardless of zone
-        // size.
-        for stream_id in conn.readable() {
-            let mut is_fin = false;
+        // Process DoQ events. `Connection` reassembles the stream and removes
+        // the DNS length prefix before returning each complete response.
+        loop {
+            let (stream_id, event) = match doq_conn.poll(&mut conn) {
+                Ok(event) => event,
+                Err(Error::Done) => break,
+                Err(Error::ProtocolError) => {
+                    error!("DoQ protocol error; connection close is pending");
+                    break;
+                },
+                Err(e) => {
+                    error!("DoQ response processing failed: {:?}", e);
+                    break;
+                },
+            };
 
-            let stream_buf = stream_bufs.entry(stream_id).or_default();
-            loop {
-                match conn.stream_recv(stream_id, &mut buf) {
-                    Ok((read, fin)) => {
-                        stream_buf.extend_from_slice(&buf[..read]);
-                        is_fin = fin;
-                        if fin || read == 0 {
-                            break;
+            let is_fin = match event {
+                Event::Response { data } => {
+                    if let Some(transfer) = active_transfers.get_mut(&stream_id) {
+                        transfer.messages_received += 1;
+                        transfer.total_bytes += data.len() + 2;
+
+                        match write_message_records(transfer, &data) {
+                            Ok(rcode) if rcode == Rcode::NOERROR => {},
+                            Ok(rcode) => {
+                                eprintln!("Transfer failed with rcode: {rcode}");
+                                transfer.failed = true;
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to process DNS message: {}", e);
+                                transfer.failed = true;
+                            },
                         }
-                    },
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        error!("stream_recv failed: {:?}", e);
-                        break;
-                    },
-                }
-            }
-
-            if let Some(transfer) = active_transfers.get_mut(&stream_id) {
-                // Parse and emit every complete message currently buffered.
-                let mut consumed_total = 0;
-                // Stops once there are not enough bytes for another full
-                // message; the remainder is kept for the next iteration.
-                while let Ok((dns_data, consumed)) =
-                    read_dns_message(&stream_buf[consumed_total..])
-                {
-                    consumed_total += consumed;
-                    transfer.messages_received += 1;
-                    transfer.total_bytes += consumed;
-
-                    match write_message_records(transfer, dns_data) {
-                        Ok(rcode) if rcode == Rcode::NOERROR => {},
-                        Ok(rcode) => {
-                            eprintln!("Transfer failed with rcode: {rcode}");
-                            transfer.failed = true;
-                            break;
-                        },
-                        Err(e) => {
-                            eprintln!("Failed to process DNS message: {}", e);
-                            transfer.failed = true;
-                            break;
-                        },
                     }
-
-                    // Data after the closing SOA is a fatal DoQ protocol error;
-                    // stop processing this stream.
-                    if transfer.protocol_error {
-                        break;
+                    false
+                },
+                Event::Finished => true,
+                Event::Reset(code) => {
+                    error!("AXFR stream {} was reset: {}", stream_id, code);
+                    if let Some(transfer) = active_transfers.get_mut(&stream_id) {
+                        transfer.failed = true;
                     }
-                }
-
-                // Discard fully processed bytes, keeping only the partial tail.
-                stream_buf.drain(..consumed_total);
-            }
+                    false
+                },
+                Event::Query { .. } => unreachable!("client received query"),
+            };
 
             // A transfer ends only on the QUIC STREAM FIN — which the server
             // MUST send after the last response — or on a DNS failure / DoQ
@@ -405,8 +371,6 @@ fn main() {
             }
 
             // Stream finished: flush the zone file and finalize the transfer.
-            stream_bufs.remove(&stream_id);
-
             if let Some(mut transfer) = active_transfers.remove(&stream_id) {
                 if let Err(e) = transfer.out.flush() {
                     eprintln!("Failed to flush zone file: {}", e);
@@ -490,6 +454,26 @@ fn main() {
             }
         }
 
+        // Probe every writable stream. A tracked query must be flushed even
+        // after its bytes drain, because this detects a later STOP_SENDING.
+        for stream_id in conn.writable() {
+            let pending = doq_conn.query_pending(stream_id);
+            match doq_conn.flush_query(&mut conn, stream_id) {
+                Ok(()) if pending =>
+                    debug!("Flushed pending query on stream {}", stream_id),
+                Ok(()) => {},
+                Err(Error::UnknownStream) => {},
+                Err(Error::ProtocolError) => {
+                    error!("DoQ protocol error; connection close is pending");
+                    break;
+                },
+                Err(e) => {
+                    error!("Failed to flush query stream {}: {:?}", stream_id, e);
+                    break;
+                },
+            }
+        }
+
         // Tear down any "dangling" stream: the closing SOA was received (zone
         // data is complete) but the server has not sent the REQUIRED STREAM FIN
         // within the grace period, so the connection is aborted with
@@ -506,7 +490,6 @@ fn main() {
             .map(|(id, _)| *id)
             .collect();
         for id in dangling {
-            stream_bufs.remove(&id);
             if let Some(mut transfer) = active_transfers.remove(&id) {
                 let _ = transfer.out.flush();
                 println!("\nAXFR data complete, but server omitted STREAM FIN:");

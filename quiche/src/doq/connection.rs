@@ -46,6 +46,7 @@ use crate::stream::is_local;
 use super::read_dns_message;
 use super::write_dns_message;
 use super::DnsWireError;
+use super::DoqError;
 
 /// A specialized [`Result`] type for [`Connection`] operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -56,24 +57,21 @@ pub enum Error {
     /// There is no more work to do right now.
     Done,
 
-    /// A QUIC-stream-usage or DoQ-framing rule was violated in a way that is
-    /// fatal to the connection, per RFC 9250, Section 4.3.3.
-    /// These include a client-initiated unidirectional stream, a
-    /// server-initiated stream seen by a client-role `Connection`, STREAM
-    /// FIN before a full message arrived, or a second message framed on a
-    /// stream that already carried one. The caller should close the QUIC
-    /// connection with `DoqError::ProtocolError`.
+    /// A fatal DoQ protocol violation was detected.
     /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     ProtocolError,
 
-    /// A DNS message passed to [`Connection::send_response`] is larger than
-    /// the 65535 bytes the 2-octet length prefix can represent.
+    /// DNS message is larger than the 65535 bytes the 2-octet length prefix
+    /// can represent.
     MessageTooLarge,
 
-    /// [`Connection::send_response`] or [`Connection::reset_stream`] was
-    /// called for a stream `Connection` doesn't know about: never seen,
-    /// already completed, or already reset. Callers should treat this as a
-    /// no-op race with the peer, not a bug.
+    /// Client specific functions were called on a server-role connection.
+    ClientOnly,
+
+    /// There are no more client-initiated bidirectional stream IDs.
+    StreamIdExhausted,
+
+    /// Unknown stream was used which `Connection` doesn't know about
     UnknownStream,
 
     /// Error originated from the transport layer.
@@ -86,6 +84,10 @@ impl fmt::Display for Error {
             Error::Done => write!(f, "no more work to do"),
             Error::ProtocolError => write!(f, "DoQ protocol error"),
             Error::MessageTooLarge => write!(f, "DNS message is too large"),
+            Error::ClientOnly => {
+                write!(f, "operation requires a client connection")
+            },
+            Error::StreamIdExhausted => write!(f, "client stream IDs exhausted"),
             Error::UnknownStream => write!(f, "unknown or already-closed stream"),
             Error::TransportError(e) => write!(f, "transport error: {e}"),
         }
@@ -99,6 +101,21 @@ impl From<crate::Error> for Error {
         match e {
             crate::Error::Done => Error::Done,
             e => Error::TransportError(e),
+        }
+    }
+}
+
+impl From<DnsWireError> for Error {
+    fn from(e: DnsWireError) -> Self {
+        match e {
+            DnsWireError::DnsMessageTooLarge => Error::MessageTooLarge,
+
+            // The remaining variants describe a malformed message rather than
+            // an oversized one. The read path inspects them directly, because
+            // a truncated message is only an error once the peer sends fin.
+            DnsWireError::LenDataIncomplete |
+            DnsWireError::DnsMessageIncomplete |
+            DnsWireError::IoError(_) => Error::ProtocolError,
         }
     }
 }
@@ -138,16 +155,14 @@ pub enum Event {
         data: Vec<u8>,
     },
 
-    /// STREAM FIN was observed on a stream after all currently-complete
-    /// messages have already been surfaced. For a client-role `Connection`
-    /// this is the signal that no further [`Event::Response`]s will follow
-    /// on that stream.
+    /// The server finished sending responses on this stream.
     Finished,
 
-    /// The peer reset the stream (`RESET_STREAM`) or asked the local side to
-    /// stop sending (`STOP_SENDING`). The raw wire error code is passed
-    /// through unmapped; a caller that needs the unknown-code mapping in RFC
-    /// 9250, Section 4.3.4 must do it itself.
+    /// The peer reset the stream (`RESET_STREAM`). The raw wire error code is
+    /// passed through unmapped; a caller that needs the unknown-code mapping
+    /// in RFC 9250, Section 4.3.4 must do it itself. A client receiving
+    /// `STOP_SENDING` instead gets [`Error::ProtocolError`] because RFC 9250,
+    /// Section 4.3.3 makes that fatal.
     /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
     Reset(u64),
 }
@@ -167,23 +182,37 @@ struct StreamState {
     /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
     is_0rtt: bool,
 
-    /// Server role only: set once the query on this stream has been
-    /// surfaced via `Event::Query`. The entry is kept (rather than removed)
-    /// so `send_response`/`reset_stream` can still find the stream, and so
-    /// any further bytes on it are recognized as a protocol-error second
-    /// query rather than silently ignored.
-    query_emitted: bool,
+    /// Whether this `Connection` opened the stream itself, as opposed to
+    /// discovering it by reading peer-initiated bytes. Only
+    /// [`Connection::send_query`] sets this, so it is never true on a server.
+    /// [`Connection::flush_query`] and [`Connection::query_pending`] use it to
+    /// recognize locally opened query streams.
+    is_local: bool,
 
-    /// Framed response bytes queued for sending but not yet accepted by the
-    /// QUIC send buffer. Holds only the not-yet-written remainder: each
-    /// partial write drains the bytes it accepted off the front. A single
-    /// framed message may only partially fit in the stream's current
-    /// capacity, so its tail lives here until the stream is writable again.
+    /// Whether at least one DNS message event has been surfaced on this
+    /// stream: [`Event::Query`] on a server, [`Event::Response`] on a client.
+    /// This latches, and is never cleared once set: a zone-transfer stream
+    /// sets it on its first response and keeps it set across the rest.
+    ///
+    /// Server role reads it as a latch. Buffered bytes arriving after the
+    /// query was surfaced are a second query on the same stream, a protocol
+    /// error under RFC 9250, Section 4.3.3.
+    ///
+    /// Client role reads it at STREAM FIN. A FIN with no response surfaced is
+    /// a protocol error under RFC 9250, Sections 4.2 and 4.3.3.
+    ///
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+    event_triggered: bool,
+
+    /// Framed outgoing query or response bytes that QUIC has not yet accepted.
+    /// A partial write drains accepted bytes from the front, retaining the
+    /// remaining suffix until the stream is writable again.
     send_buf: Vec<u8>,
 
-    /// Set once the final response has been queued (via `send_response` with
-    /// `fin = true`); the STREAM FIN is delivered once `send_buf` fully
-    /// drains. Once set, no further responses are accepted on this stream.
+    /// Whether the queued outgoing message must carry STREAM FIN once all its
+    /// bytes are accepted. Client queries always set this; server responses
+    /// set it only for their final message.
     send_fin: bool,
 }
 
@@ -207,6 +236,7 @@ impl StreamState {
 /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
 pub struct Connection {
     is_server: bool,
+    next_query_stream_id: u64,
     streams: HashMap<u64, StreamState>,
     pending: VecDeque<(u64, Event)>,
 }
@@ -222,6 +252,7 @@ impl Connection {
     ) -> Result<Connection> {
         Ok(Connection {
             is_server: conn.is_server(),
+            next_query_stream_id: 0,
             streams: HashMap::new(),
             pending: VecDeque::new(),
         })
@@ -230,18 +261,26 @@ impl Connection {
     /// Processes any readable streams and returns the next DoQ event.
     ///
     /// Returns `Err(Error::Done)` when there is currently no event to
-    /// report. Returns `Err(Error::ProtocolError)` when a fatal protocol
-    /// violation per RFC 9250, Section 4.3.3 is detected; the caller should
-    /// close the connection with `DoqError::ProtocolError`.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+    /// report. A returned [`Error::ProtocolError`] has already initiated a
+    /// connection close with `DoqError::ProtocolError`.
     pub fn poll<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>,
     ) -> Result<(u64, Event)> {
+        // A prior protocol error already initiated closure. Do not continue
+        // processing application streams while that close is pending.
+        if conn.local_error().is_some() {
+            return Err(Error::Done);
+        }
+
         if let Some(ev) = self.pending.pop_front() {
             return Ok(ev);
         }
 
         for stream_id in conn.readable() {
+            if !self.is_server && self.streams.contains_key(&stream_id) {
+                self.probe_query_stream(conn, stream_id)?;
+            }
+
             match self.process_readable_stream(conn, stream_id) {
                 Ok(events) if events.is_empty() => continue,
 
@@ -258,11 +297,202 @@ impl Connection {
                     return Ok((stream_id, first));
                 },
 
+                Err(Error::ProtocolError) =>
+                    return self.fail_protocol_error(conn),
+
                 Err(e) => return Err(e),
             }
         }
 
         Err(Error::Done)
+    }
+
+    /// Opens a client-initiated bidirectional stream and queues one framed DNS
+    /// query on it.
+    ///
+    /// RFC 9250, Section 4.2: "The client MUST send the DNS query over the
+    /// selected stream and MUST indicate through the STREAM FIN mechanism
+    /// that no further data will be sent on that stream."
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    ///
+    /// Call [`flush_query`](Self::flush_query) for every writable notification
+    /// on a tracked query stream, including when
+    /// [`query_pending`](Self::query_pending) returns `false`.
+    pub fn send_query<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, data: &[u8],
+    ) -> Result<u64> {
+        if self.is_server {
+            return Err(Error::ClientOnly);
+        }
+
+        let stream_id = self.next_query_stream_id;
+
+        let mut send_buf = Vec::new();
+        write_dns_message(&mut send_buf, data)?;
+
+        self.streams.insert(stream_id, StreamState {
+            is_local: true,
+            send_buf,
+            send_fin: true,
+            ..Default::default()
+        });
+
+        // Force transport stream creation after registering DoQ state, like
+        // H3 request creation. Roll back the registration if it fails.
+        match conn.stream_send(stream_id, b"", false) {
+            Ok(_) => (),
+            Err(crate::Error::StreamStopped(_)) => {
+                self.streams.remove(&stream_id);
+                return self.fail_protocol_error(conn);
+            },
+            Err(e) => {
+                self.streams.remove(&stream_id);
+                return Err(e.into());
+            },
+        }
+
+        if let Err(e) = self.flush_query(conn, stream_id) {
+            // `stream_send` reports accepted bytes only through `Ok(sent)`.
+            // Every error path above returns before accepting query bytes;
+            // `ProtocolError` additionally attempts to close the connection.
+            self.streams.remove(&stream_id);
+            return Err(e);
+        }
+
+        self.next_query_stream_id = self
+            .next_query_stream_id
+            .checked_add(4)
+            .ok_or(Error::StreamIdExhausted)?;
+
+        Ok(stream_id)
+    }
+
+    /// Flushes framed query bytes queued by [`send_query`](Self::send_query).
+    ///
+    /// This probes the QUIC send side even after the query bytes have drained.
+    pub fn flush_query<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> Result<()> {
+        if self.is_server {
+            return Err(Error::ClientOnly);
+        }
+
+        let Some(state) = self.streams.get(&stream_id) else {
+            return Err(Error::UnknownStream);
+        };
+
+        if !state.is_local {
+            return Err(Error::UnknownStream);
+        }
+
+        self.probe_query_stream(conn, stream_id)?;
+
+        let Some(state) = self.streams.get_mut(&stream_id) else {
+            return Err(Error::UnknownStream);
+        };
+
+        if state.send_buf.is_empty() {
+            return Ok(());
+        }
+
+        match conn.stream_send(stream_id, &state.send_buf, true) {
+            // A write can be partial. quiche suppresses the fin unless the
+            // whole buffer fits, so the fin lands with the last byte.
+            Ok(sent) => {
+                state.send_buf.drain(..sent);
+                Ok(())
+            },
+
+            // The stream had no send capacity, so no byte moved. The queued
+            // bytes stay in `send_buf`, where `query_pending` reports them
+            // until a later call drains them. Catch this before the arm
+            // below, which would surface backpressure as `Error::Done`.
+            Err(crate::Error::Done) => Ok(()),
+
+            // RFC 9250, Section 4.3.3 lists "a client receives a STOP_SENDING
+            // request" among the fatal error conditions.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            // The server role stays per-stream. RFC 9250, Section 4.3.1:
+            // "Servers SHOULD NOT continue processing a DNS transaction if
+            // they receive a STOP_SENDING."
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+            Err(crate::Error::StreamStopped(_)) => self.fail_protocol_error(conn),
+
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Returns whether a query still has bytes waiting for QUIC send capacity.
+    pub fn query_pending(&self, stream_id: u64) -> bool {
+        self.streams
+            .get(&stream_id)
+            .is_some_and(|s| s.is_local && !s.send_buf.is_empty())
+    }
+
+    /// Cancels the outstanding query on `stream_id`.
+    ///
+    /// RFC 9250, Section 4.3.1: "If a DoQ client wishes to cancel an
+    /// outstanding request, it MUST issue a QUIC STOP_SENDING, and it SHOULD
+    /// use the error code DOQ_REQUEST_CANCELLED.  It MAY use a more specific
+    /// error code registered according to Section 8.4."
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    /// Pass [`DoqError::RequestCancelled`] as `error` unless a more specific
+    /// code applies.
+    ///
+    /// RFC 9250, Section 4.3.1: "The STOP_SENDING request may be sent at any
+    /// time but will have no effect if the server response has already been
+    /// sent, in which case the client will simply discard the incoming
+    /// response.  The corresponding DNS transaction MUST be abandoned."
+    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    /// The stream state is dropped, so a response already in flight is
+    /// discarded instead of being surfaced as an [`Event`].
+    ///
+    /// Returns `Err(Error::UnknownStream)` if `stream_id` is not a query
+    /// stream this `Connection` opened, which includes an already-completed
+    /// or already-cancelled one.
+    pub fn cancel_query<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64, error: u64,
+    ) -> Result<()> {
+        if self.is_server {
+            return Err(Error::ClientOnly);
+        }
+
+        let Some(state) = self.streams.get(&stream_id) else {
+            return Err(Error::UnknownStream);
+        };
+
+        if !state.is_local {
+            return Err(Error::UnknownStream);
+        }
+
+        // Queued bytes mean the fin never reached the peer: `flush_query`
+        // asks for it with the last byte of the query, and quiche suppresses
+        // it on a partial write. Read this before dropping the state.
+        let query_unsent = !state.send_buf.is_empty();
+
+        self.streams.remove(&stream_id);
+
+        // Shut the read side down first, so the stream stops being readable
+        // even if the send side below reports an error.
+        match conn.stream_shutdown(stream_id, crate::Shutdown::Read, error) {
+            Ok(()) | Err(crate::Error::Done) => (),
+            Err(e) => return Err(e.into()),
+        }
+
+        if query_unsent {
+            // RFC 9250, Section 4.3.1: "Servers MUST NOT continue processing
+            // a DNS transaction if they receive a RESET_STREAM request from
+            // the client before the client indicates the STREAM FIN."
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+            // A half-sent query would otherwise leave the server waiting on
+            // a fin that never arrives.
+            match conn.stream_shutdown(stream_id, crate::Shutdown::Write, error) {
+                Ok(()) | Err(crate::Error::Done) => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(())
     }
 
     /// Queues a DNS response message on `stream_id`, framed with the 2-octet
@@ -308,8 +538,7 @@ impl Connection {
         // it never leaves a partial frame in `send_buf` on error. The new
         // message is appended after any not-yet-written remainder already
         // queued on this stream.
-        write_dns_message(&mut state.send_buf, data)
-            .map_err(|_| Error::MessageTooLarge)?;
+        write_dns_message(&mut state.send_buf, data)?;
         state.send_fin = fin;
 
         self.flush_response(conn, stream_id)
@@ -572,7 +801,7 @@ impl Connection {
             None => return Ok(Vec::new()),
         };
 
-        if state.query_emitted {
+        if state.event_triggered {
             if !state.recv_buf.is_empty() {
                 return Err(Error::ProtocolError);
             }
@@ -596,7 +825,7 @@ impl Connection {
 
                 let data = data.to_vec();
                 let is_0rtt = state.is_0rtt;
-                state.query_emitted = true;
+                state.event_triggered = true;
                 state.recv_buf.clear();
 
                 Ok(vec![Event::Query { data, is_0rtt }])
@@ -642,6 +871,7 @@ impl Connection {
                     events.push(Event::Response {
                         data: data.to_vec(),
                     });
+                    state.event_triggered = true;
                     state.recv_buf.drain(..consumed);
                 },
 
@@ -653,10 +883,11 @@ impl Connection {
         }
 
         if state.fin_received {
-            // A non-empty leftover here is a partial message that will
-            // never be completed per RFC 9250, Section 4.3.3.
+            // RFC 9250, Section 4.2 requires a server response before FIN.
+            // Section 4.3.3 makes a FIN before a response a protocol error.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
             // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-            if !state.recv_buf.is_empty() {
+            if !state.event_triggered || !state.recv_buf.is_empty() {
                 return Err(Error::ProtocolError);
             }
 
@@ -666,6 +897,36 @@ impl Connection {
 
         Ok(events)
     }
+
+    /// Checks the send-side status of a locally opened query stream.
+    fn probe_query_stream<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> Result<()> {
+        match conn.stream_capacity(stream_id) {
+            Ok(_) => Ok(()),
+
+            // Fatal for the client role, as in `flush_query`. RFC 9250,
+            // Section 4.3.3 lists "a client receives a STOP_SENDING request"
+            // among the fatal error conditions.
+            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            Err(crate::Error::StreamStopped(_)) => self.fail_protocol_error(conn),
+
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Closes the connection with `DOQ_PROTOCOL_ERROR` and returns
+    /// [`Error::ProtocolError`].
+    fn fail_protocol_error<T, F: BufFactory>(
+        &self, conn: &mut crate::Connection<F>,
+    ) -> Result<T> {
+        conn.close(
+            true,
+            DoqError::ProtocolError.to_wire(),
+            b"DoQ protocol error",
+        )?;
+        Err(Error::ProtocolError)
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +934,7 @@ mod tests {
     use super::*;
 
     use crate::test_utils::Pipe;
+    use crate::ConnectionError;
 
     fn doq_config() -> crate::Config {
         let mut config = Pipe::default_config("cubic").unwrap();
@@ -691,6 +953,458 @@ mod tests {
         let mut out = Vec::new();
         write_dns_message(&mut out, data).unwrap();
         out
+    }
+
+    fn assert_protocol_close(conn: &crate::Connection) {
+        assert_eq!(
+            conn.local_error(),
+            Some(&ConnectionError {
+                is_app: true,
+                error_code: DoqError::ProtocolError.to_wire(),
+                reason: b"DoQ protocol error".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn send_query_allocates_and_frames_client_streams() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+
+        assert_eq!(client.send_query(&mut pipe.client, b"zero"), Ok(0));
+        assert_eq!(client.send_query(&mut pipe.client, b"four"), Ok(4));
+        assert_eq!(client.send_query(&mut pipe.client, b"eight"), Ok(8));
+        assert!(!client.query_pending(0));
+        assert!(!client.query_pending(4));
+        assert!(!client.query_pending(8));
+
+        pipe.advance().unwrap();
+
+        for (stream_id, data) in [
+            (0, b"zero".as_slice()),
+            (4, b"four".as_slice()),
+            (8, b"eight".as_slice()),
+        ] {
+            let mut buf = [0; 16];
+            assert_eq!(
+                pipe.server.stream_recv(stream_id, &mut buf),
+                Ok((data.len() + 2, true))
+            );
+            assert_eq!(&buf[..data.len() + 2], framed(data));
+        }
+
+        pipe.server.stream_send(8, &framed(b"eight"), true).unwrap();
+        pipe.server.stream_send(0, &framed(b"zero"), true).unwrap();
+        pipe.server.stream_send(4, &framed(b"four"), true).unwrap();
+        pipe.advance().unwrap();
+
+        let mut responses = Vec::new();
+        for _ in 0..6 {
+            match client.poll(&mut pipe.client).unwrap() {
+                (stream_id, Event::Response { data }) => {
+                    responses.push((stream_id, data));
+                },
+                (_, Event::Finished) => (),
+                (_, event) => panic!("unexpected event: {event:?}"),
+            }
+        }
+        responses.sort_unstable_by_key(|(stream_id, _)| *stream_id);
+        assert_eq!(responses, vec![
+            (0, b"zero".to_vec()),
+            (4, b"four".to_vec()),
+            (8, b"eight".to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn send_query_rejects_server_role_and_oversize_without_consuming_id() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        assert_eq!(
+            server.send_query(&mut pipe.server, b"query"),
+            Err(Error::ClientOnly)
+        );
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(
+            client.send_query(&mut pipe.client, &[0; 65_536]),
+            Err(Error::MessageTooLarge)
+        );
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+    }
+
+    #[test]
+    fn send_query_partial_write_delivers_fin_with_final_bytes() {
+        let mut config = doq_config();
+        config.set_initial_max_stream_data_bidi_remote(20);
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let query = vec![0xAB; 200];
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, &query), Ok(0));
+        assert!(client.query_pending(0));
+
+        let mut received = Vec::new();
+        let mut fin = false;
+        for _ in 0..50 {
+            pipe.advance().unwrap();
+
+            let mut buf = [0; 256];
+            loop {
+                match pipe.server.stream_recv(0, &mut buf) {
+                    Ok((len, stream_fin)) => {
+                        received.extend_from_slice(&buf[..len]);
+                        fin |= stream_fin;
+                    },
+                    Err(crate::Error::Done) => break,
+                    Err(error) => panic!("unexpected receive error: {error:?}"),
+                }
+            }
+
+            if !client.query_pending(0) {
+                break;
+            }
+
+            client.flush_query(&mut pipe.client, 0).unwrap();
+        }
+
+        pipe.advance().unwrap();
+        let mut buf = [0; 256];
+        loop {
+            match pipe.server.stream_recv(0, &mut buf) {
+                Ok((len, stream_fin)) => {
+                    received.extend_from_slice(&buf[..len]);
+                    fin |= stream_fin;
+                },
+                Err(crate::Error::Done) => break,
+                Err(error) => panic!("unexpected receive error: {error:?}"),
+            }
+        }
+
+        assert!(!client.query_pending(0));
+        assert!(fin);
+        assert_eq!(received, framed(&query));
+    }
+
+    #[test]
+    fn cancel_query_sends_stop_sending() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            client.cancel_query(
+                &mut pipe.client,
+                0,
+                DoqError::RequestCancelled.to_wire()
+            ),
+            Ok(())
+        );
+        pipe.advance().unwrap();
+
+        // The server observes the cancellation as `StreamStopped` carrying
+        // the DoQ error code the client asked for.
+        assert_eq!(
+            pipe.server.stream_send(0, &framed(b"response"), true),
+            Err(crate::Error::StreamStopped(
+                DoqError::RequestCancelled.to_wire()
+            ))
+        );
+    }
+
+    #[test]
+    fn cancel_query_stops_response_events() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        pipe.advance().unwrap();
+
+        // The response is already on the wire when the cancellation is
+        // issued, so it arrives at a stream the client no longer tracks.
+        pipe.server
+            .stream_send(0, &framed(b"response"), true)
+            .unwrap();
+        assert_eq!(
+            client.cancel_query(
+                &mut pipe.client,
+                0,
+                DoqError::RequestCancelled.to_wire()
+            ),
+            Ok(())
+        );
+        pipe.advance().unwrap();
+
+        // `Shutdown::Read` drops the stream from the readable set, so the
+        // discarded response never reaches `poll`.
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+        assert!(pipe.client.local_error().is_none());
+    }
+
+    #[test]
+    fn cancel_query_partial_query_resets_send_side() {
+        let mut config = doq_config();
+        // Too small for the framed query, so the fin is never sent.
+        config.set_initial_max_stream_data_bidi_remote(20);
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, &[b'q'; 64]), Ok(0));
+        assert!(client.query_pending(0));
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            client.cancel_query(
+                &mut pipe.client,
+                0,
+                DoqError::RequestCancelled.to_wire()
+            ),
+            Ok(())
+        );
+        pipe.advance().unwrap();
+
+        // The half-sent query is reset, so the server stops waiting for a
+        // fin that will never arrive.
+        let mut buf = [0; 64];
+        assert_eq!(
+            pipe.server.stream_recv(0, &mut buf),
+            Err(crate::Error::StreamReset(
+                DoqError::RequestCancelled.to_wire()
+            ))
+        );
+    }
+
+    #[test]
+    fn cancel_query_unknown_stream_is_error() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        let error = DoqError::RequestCancelled.to_wire();
+
+        assert_eq!(
+            client.cancel_query(&mut pipe.client, 0, error),
+            Err(Error::UnknownStream)
+        );
+
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        assert_eq!(client.cancel_query(&mut pipe.client, 0, error), Ok(()));
+
+        // The state is gone, so cancelling twice is not idempotent.
+        assert_eq!(
+            client.cancel_query(&mut pipe.client, 0, error),
+            Err(Error::UnknownStream)
+        );
+    }
+
+    #[test]
+    fn cancel_query_on_server_is_client_only() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        assert_eq!(
+            server.cancel_query(
+                &mut pipe.server,
+                0,
+                DoqError::RequestCancelled.to_wire()
+            ),
+            Err(Error::ClientOnly)
+        );
+    }
+
+    #[test]
+    fn client_stop_sending_closes_with_protocol_error_during_query_send() {
+        let mut config = doq_config();
+        config.set_initial_max_stream_data_bidi_remote(20);
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, &[0; 200]), Ok(0));
+        assert!(client.query_pending(0));
+
+        pipe.advance().unwrap();
+
+        pipe.server
+            .stream_shutdown(0, crate::Shutdown::Read, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            client.flush_query(&mut pipe.client, 0),
+            Err(Error::ProtocolError)
+        );
+        assert_protocol_close(&pipe.client);
+    }
+
+    #[test]
+    fn client_stop_sending_closes_after_query_bytes_drain() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        assert!(!client.query_pending(0));
+        pipe.advance().unwrap();
+
+        let mut buf = [0; 65_535];
+        let frames = [crate::frame::Frame::StopSending {
+            stream_id: 0,
+            error_code: 42,
+        }];
+        let len = crate::test_utils::encode_pkt(
+            &mut pipe.server,
+            crate::packet::Type::Short,
+            &frames,
+            &mut buf,
+        )
+        .unwrap();
+        crate::test_utils::recv_send(&mut pipe.client, &mut buf, len).unwrap();
+
+        assert_eq!(
+            client.flush_query(&mut pipe.client, 0),
+            Err(Error::ProtocolError)
+        );
+        assert_protocol_close(&pipe.client);
+    }
+
+    #[test]
+    fn client_stop_sending_wins_over_a_simultaneous_response() {
+        let mut config = doq_config();
+        config.set_initial_max_stream_data_bidi_remote(20);
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, &[0; 200]), Ok(0));
+        pipe.advance().unwrap();
+
+        pipe.server
+            .stream_send(0, &framed(b"response"), false)
+            .unwrap();
+        pipe.server
+            .stream_shutdown(0, crate::Shutdown::Read, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.client);
+    }
+
+    #[test]
+    fn query_probe_propagates_non_protocol_errors() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        client.streams.insert(0, StreamState {
+            is_local: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            client.probe_query_stream(&mut pipe.client, 0),
+            Err(Error::TransportError(crate::Error::InvalidStreamState(0)))
+        );
+    }
+
+    #[test]
+    fn server_reset_on_opened_query_surfaces_as_event() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        pipe.advance().unwrap();
+
+        pipe.server
+            .stream_shutdown(0, crate::Shutdown::Write, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Reset(42))));
+    }
+
+    #[test]
+    fn send_query_stream_limit_preserves_id() {
+        let mut config = doq_config();
+        config.set_initial_max_streams_bidi(0);
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(
+            client.send_query(&mut pipe.client, b"query"),
+            Err(Error::TransportError(crate::Error::StreamLimit))
+        );
+        assert_eq!(client.next_query_stream_id, 0);
+        assert!(!client.query_pending(0));
+    }
+
+    #[test]
+    fn send_query_works_in_early_data() {
+        let mut config = doq_config();
+        config.enable_early_data();
+
+        let mut ticket_pipe = Pipe::with_config(&mut config).unwrap();
+        ticket_pipe.handshake().unwrap();
+        let session = ticket_pipe.client.session().unwrap().to_vec();
+
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.client.set_session(&session).unwrap();
+        let flight = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
+        crate::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        assert!(pipe.client.is_in_early_data());
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"early"), Ok(0));
+        assert!(!client.query_pending(0));
+    }
+
+    #[test]
+    fn server_response_stop_sending_is_a_transport_error() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        pipe.client.stream_send(0, &framed(b"query"), true).unwrap();
+        pipe.advance().unwrap();
+        assert!(matches!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query { .. }))
+        ));
+
+        pipe.client
+            .stream_shutdown(0, crate::Shutdown::Read, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.send_response(&mut pipe.server, 0, b"response", true),
+            Err(Error::TransportError(crate::Error::StreamStopped(42)))
+        );
+        assert_eq!(pipe.server.local_error(), None);
     }
 
     #[test]
@@ -745,6 +1459,8 @@ mod tests {
         pipe.advance().unwrap();
 
         assert_eq!(server.poll(&mut pipe.server), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.server);
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
     }
 
     #[test]
@@ -811,6 +1527,24 @@ mod tests {
         pipe.advance().unwrap();
 
         assert_eq!(client.poll(&mut pipe.client), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.client);
+    }
+
+    #[test]
+    fn client_fin_before_response_is_protocol_error() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        pipe.advance().unwrap();
+
+        pipe.server.stream_send(0, b"", true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.client);
     }
 
     #[test]
@@ -821,10 +1555,7 @@ mod tests {
 
         let mut client = Connection::with_transport(&pipe.client).unwrap();
 
-        // The client opens the query stream itself.
-        pipe.client
-            .stream_send(0, &framed(b"axfr query"), true)
-            .unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"axfr query"), Ok(0));
         pipe.advance().unwrap();
 
         let mut wire = framed(b"answer 1");
