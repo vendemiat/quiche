@@ -34,7 +34,6 @@ use tokio::time::Instant;
 use tokio_quiche::doq::DoqResponder;
 
 use crate::config::ServerConfig;
-use crate::dns::build_failed_response;
 use crate::dns::DnsError;
 use crate::dns::DoqDnsQuery;
 use crate::dns::DoqDnsResponse;
@@ -46,6 +45,8 @@ use crate::upstream::UpstreamError;
 /// State shared by the controller while one DNS request is in flight.
 pub(crate) struct Request {
     deadline: Instant,
+    /// Keep the original DoQ query for terminal responses.
+    client_query: DoqDnsQuery<Bytes>,
     upstream_query: Message<Bytes>,
 }
 
@@ -56,9 +57,11 @@ impl Request {
     ) -> Result<Self, DnsError> {
         let started_at = Instant::now();
         let deadline = started_at + config.transaction_timeout;
+        let upstream_query = query.prepare_upstream_query()?;
         Ok(Self {
             deadline,
-            upstream_query: query.prepare_upstream_query()?,
+            client_query: query,
+            upstream_query,
         })
     }
 
@@ -126,11 +129,11 @@ impl Request {
         }
     }
 
-    /// Build a terminal DNS response for this request.
+    /// Build a terminal DNS response from the original DoQ query.
     pub(crate) fn failed_reponse(
         &self, rcode: Rcode, ede: Vec<ExtendedError<Bytes>>,
     ) -> Result<DoqDnsResponse<Bytes>, DnsError> {
-        build_failed_response(&self.upstream_query, rcode, ede)
+        self.client_query.failed_reponse(rcode, ede)
     }
 
     fn validate_upstream_response(

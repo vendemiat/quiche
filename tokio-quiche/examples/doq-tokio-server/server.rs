@@ -82,10 +82,9 @@ pub(crate) async fn serve<U>(
                 // behaviors:" https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
                 tokio::spawn(send_terminal(
                     responder,
-                    query.failed_reponse(
-                        Rcode::REFUSED,
-                        vec![ExtendedErrorCode::from_int(26).into()],
-                    ),
+                    query.failed_reponse(Rcode::REFUSED, vec![
+                        ExtendedErrorCode::from_int(26).into(),
+                    ]),
                 ));
                 continue;
             }
@@ -104,11 +103,11 @@ pub(crate) async fn serve<U>(
                     Ok(()) => {},
                     Err(UpstreamError::Cancelled) => {},
                     Err(error) => {
+                        // Attach EDE 23 only to deadline and network errors,
                         let ede = matches!(
                             error,
-                            UpstreamError::DeadlineExceeded(_)
-                                | UpstreamError::Failed(_)
-                                | UpstreamError::Network(_)
+                            UpstreamError::DeadlineExceeded(_) |
+                                UpstreamError::Network(_)
                         )
                         .then(|| ExtendedErrorCode::NETWORK_ERROR.into());
                         send_terminal(
@@ -126,6 +125,7 @@ pub(crate) async fn serve<U>(
     }
 }
 
+/// Send a final DNS response or reset the DoQ stream if delivery fails.
 async fn send_terminal<E>(
     responder: DoqResponder, response: Result<DoqDnsResponse<bytes::Bytes>, E>,
 ) {
@@ -142,15 +142,24 @@ async fn send_terminal<E>(
 mod tests {
     use std::future;
     use std::future::Future;
+    use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use domain::base::iana::Opcode;
+    use domain::base::iana::Rtype;
+    use domain::base::MessageBuilder;
     use futures::StreamExt;
     use tokio::net::UdpSocket;
     use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+    use tokio::task::JoinSet;
+    use tokio::time::Instant;
     use tokio_quiche::doq::DoqServerDriver;
     use tokio_quiche::quic::connect_with_config;
     use tokio_quiche::quic::HandshakeInfo;
@@ -167,6 +176,9 @@ mod tests {
     use crate::dns::query;
     use crate::doq_settings;
     use crate::upstream::ResponseSequence;
+    use crate::upstream::ResponseStreamSender;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[derive(Default)]
     struct PendingUpstream {
@@ -248,7 +260,7 @@ mod tests {
         fn on_conn_established(
             &mut self, qconn: &mut QuicheConnection, _info: &HandshakeInfo,
         ) -> QuicResult<()> {
-            let query = query(0, domain::base::iana::Rtype::A);
+            let query = query(0, Rtype::A);
             let mut wire = Vec::new();
             quiche::doq::write_dns_message(&mut wire, &query).unwrap();
             qconn.stream_send(0, &wire, true)?;
@@ -288,6 +300,531 @@ mod tests {
             &mut self, _qconn: &mut QuicheConnection,
         ) -> QuicResult<()> {
             Ok(())
+        }
+    }
+
+    /// Return a network error for every lookup and count the calls.
+    #[derive(Default)]
+    struct NetworkUpstream {
+        calls: AtomicUsize,
+    }
+
+    impl Upstream for NetworkUpstream {
+        fn resolve<'a>(
+            &'a self, _query: &'a Message<Bytes>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(UpstreamError::Network(std::io::Error::other(
+                    "test network failure",
+                )))
+            })
+        }
+    }
+
+    /// Send one non-final response and keep the sequence open.
+    #[derive(Default)]
+    struct PartialUpstream {
+        calls: AtomicUsize,
+        sender: OnceLock<ResponseStreamSender>,
+    }
+
+    impl Upstream for PartialUpstream {
+        fn resolve<'a>(
+            &'a self, query: &'a Message<Bytes>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let response = MessageBuilder::new_bytes()
+                    .start_answer(query, Rcode::NOERROR)?
+                    .additional()
+                    .into_message()
+                    .into_octets();
+                let (mut sender, sequence) = ResponseSequence::channel(1);
+                sender.send(response, false).await?;
+                // Store the sender so returning from resolve does not drop it.
+                assert!(
+                    self.sender.set(sender).is_ok(),
+                    "PartialUpstream resolved more than once"
+                );
+                Ok(sequence)
+            })
+        }
+    }
+
+    /// Return malformed DNS bytes or a response to another question.
+    struct InvalidUpstream {
+        /// Select a valid response to a different question when true.
+        mismatched: bool,
+    }
+
+    impl Upstream for InvalidUpstream {
+        fn resolve<'a>(
+            &'a self, query: &'a Message<Bytes>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let response = if self.mismatched {
+                    let other = Message::from_octets(crate::dns::query(
+                        query.header().id(),
+                        Rtype::AAAA,
+                    ))
+                    .unwrap();
+                    MessageBuilder::new_bytes()
+                        .start_answer(&other, Rcode::NOERROR)?
+                        .additional()
+                        .into_message()
+                        .into_octets()
+                } else {
+                    Bytes::from_static(b"invalid")
+                };
+                let (mut sender, sequence) = ResponseSequence::channel(1);
+                sender.send(response, true).await?;
+                Ok(sequence)
+            })
+        }
+    }
+
+    /// Build a DNS query with the requested type, opcode, and EDNS mode.
+    fn test_query(qtype: Rtype, opcode: Opcode, edns: bool) -> Bytes {
+        let source = Message::from_octets(query(0, qtype)).unwrap();
+        let mut builder = MessageBuilder::new_bytes();
+        builder.header_mut().set_opcode(opcode);
+        let mut questions = builder.question();
+        for question in source.question() {
+            questions.push(question.unwrap()).unwrap();
+        }
+        if edns {
+            let mut additional = questions.additional();
+            additional
+                .opt(|opt| {
+                    opt.set_udp_payload_size(1232);
+                    Ok(())
+                })
+                .unwrap();
+            additional.into_message().into_octets()
+        } else {
+            questions.into_message().into_octets()
+        }
+    }
+
+    /// Start a loopback DoQ listener for the requested number of connections.
+    async fn start_server<U: Upstream + 'static>(
+        upstream: Arc<U>, config: ServerConfig, connections: usize,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let settings = doq_settings(false);
+        let max_streams_bidi = settings.initial_max_streams_bidi;
+        let mut listeners = tokio_quiche::listen(
+            [server_socket],
+            ConnectionParams::new_server(
+                settings,
+                TlsCertificatePaths {
+                    cert: "examples/cert.crt",
+                    private_key: "examples/cert.key",
+                    kind: CertificateKind::X509,
+                },
+                Hooks::default(),
+            ),
+            tokio_quiche::metrics::DefaultMetrics,
+        )
+        .unwrap();
+        let mut listener = listeners.remove(0);
+        let task = tokio::spawn(async move {
+            let mut tasks = JoinSet::new();
+            for _ in 0..connections {
+                let connection = listener.next().await.unwrap().unwrap();
+                let (driver, controller) = DoqServerDriver::new(max_streams_bidi);
+                connection.start(driver);
+                let upstream = Arc::clone(&upstream);
+                let config = config.clone();
+                tasks.spawn(serve(controller, upstream, config));
+            }
+            while let Some(task) = tasks.join_next().await {
+                task.unwrap();
+            }
+        });
+        (server_addr, task)
+    }
+
+    /// Send every QUIC packet currently queued for the loopback server.
+    async fn send_pending_packets(
+        socket: &UdpSocket, conn: &mut quiche::Connection,
+        server_addr: SocketAddr,
+    ) {
+        let mut outgoing = [0; 1500];
+        loop {
+            match conn.send(&mut outgoing) {
+                Ok((len, _)) => {
+                    socket.send_to(&outgoing[..len], server_addr).await.unwrap();
+                },
+                Err(quiche::Error::Done) => break,
+                Err(error) => panic!("client packet send failed: {error:?}"),
+            }
+        }
+    }
+
+    /// Process one datagram or QUIC timeout before the shared deadline.
+    async fn receive_packet(
+        socket: &UdpSocket, conn: &mut quiche::Connection, deadline: Instant,
+    ) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "client packet should arrive");
+        let wait = conn.timeout().unwrap_or(remaining).min(remaining);
+        let mut incoming = [0; 65_535];
+        match tokio::time::timeout(wait, socket.recv_from(&mut incoming)).await {
+            Ok(Ok((len, from))) => {
+                conn.recv(&mut incoming[..len], quiche::RecvInfo {
+                    from,
+                    to: socket.local_addr().unwrap(),
+                })
+                .unwrap();
+            },
+            Ok(Err(error)) => panic!("client socket receive failed: {error}"),
+            Err(_) => conn.on_timeout(),
+        }
+    }
+
+    /// Process Retry and return before sending the post-Retry Initial.
+    /// Leave the handshake pending so callers can queue 0-RTT data.
+    async fn raw_client_after_retry(
+        server_addr: SocketAddr, session: Option<&[u8]>, deadline: Instant,
+    ) -> (UdpSocket, quiche::Connection, quiche::doq::Connection) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        config
+            .set_application_protos(&[quiche::doq::DOQ_ALPN])
+            .unwrap();
+        config.verify_peer(false);
+        config.enable_early_data();
+        config.set_initial_max_data(1_000_000);
+        config.set_initial_max_stream_data_bidi_local(65_535);
+        config.set_initial_max_stream_data_bidi_remote(65_535);
+        config.set_initial_max_streams_bidi(10);
+        let scid = quiche::ConnectionId::from_ref(&[7; quiche::MAX_CONN_ID_LEN]);
+        let mut conn = quiche::connect(
+            Some("localhost"),
+            &scid,
+            local_addr,
+            server_addr,
+            &mut config,
+        )
+        .unwrap();
+        if let Some(session) = session {
+            conn.set_session(session).unwrap();
+        }
+        let doq = quiche::doq::Connection::with_transport(&conn).unwrap();
+        let mut outgoing = [0; 1500];
+        let (len, _) = conn.send(&mut outgoing).unwrap();
+        socket.send_to(&outgoing[..len], server_addr).await.unwrap();
+        let mut incoming = [0; 65_535];
+        let (len, from) =
+            tokio::time::timeout_at(deadline, socket.recv_from(&mut incoming))
+                .await
+                .expect("server Retry should arrive")
+                .unwrap();
+        let mut retry = incoming[..len].to_vec();
+        assert_eq!(
+            quiche::Header::from_slice(&mut retry, quiche::MAX_CONN_ID_LEN)
+                .unwrap()
+                .ty,
+            quiche::Type::Retry
+        );
+        conn.recv(&mut incoming[..len], quiche::RecvInfo {
+            from,
+            to: local_addr,
+        })
+        .unwrap();
+        (socket, conn, doq)
+    }
+
+    /// Complete a fresh client's handshake after Retry.
+    async fn raw_established_client(
+        server_addr: SocketAddr, deadline: Instant,
+    ) -> (UdpSocket, quiche::Connection, quiche::doq::Connection) {
+        let (socket, mut conn, doq) =
+            raw_client_after_retry(server_addr, None, deadline).await;
+        send_pending_packets(&socket, &mut conn, server_addr).await;
+        while !conn.is_established() {
+            receive_packet(&socket, &mut conn, deadline).await;
+            send_pending_packets(&socket, &mut conn, server_addr).await;
+        }
+        (socket, conn, doq)
+    }
+
+    /// Collect DoQ events through stream FIN and close the client.
+    async fn collect_response(
+        socket: &UdpSocket, conn: &mut quiche::Connection,
+        doq: &mut quiche::doq::Connection, server_addr: SocketAddr,
+        deadline: Instant, stream_id: u64,
+    ) -> Vec<quiche::doq::Event> {
+        let mut events = Vec::new();
+        while !events.contains(&quiche::doq::Event::Finished) {
+            receive_packet(socket, conn, deadline).await;
+            loop {
+                match doq.poll(conn) {
+                    Ok((id, event)) => {
+                        assert_eq!(id, stream_id);
+                        events.push(event);
+                    },
+                    Err(quiche::doq::Error::Done) => break,
+                    Err(error) => panic!("unexpected DoQ error: {error:?}"),
+                }
+            }
+            // Flush tracked streams when QUIC makes room for query bytes.
+            for id in conn.writable().collect::<Vec<_>>() {
+                doq.flush_query(conn, id).unwrap();
+            }
+            send_pending_packets(socket, conn, server_addr).await;
+        }
+        conn.close(false, 0, b"test complete").unwrap();
+        send_pending_packets(socket, conn, server_addr).await;
+        events
+    }
+
+    /// Send a query after a fresh handshake and collect its DoQ events.
+    async fn send_raw_query(
+        server_addr: SocketAddr, query: &Bytes,
+    ) -> Vec<quiche::doq::Event> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let (socket, mut conn, mut doq) =
+            raw_established_client(server_addr, deadline).await;
+        let stream_id = doq.send_query(&mut conn, query).unwrap();
+        send_pending_packets(&socket, &mut conn, server_addr).await;
+        collect_response(
+            &socket,
+            &mut conn,
+            &mut doq,
+            server_addr,
+            deadline,
+            stream_id,
+        )
+        .await
+    }
+
+    /// Collect a session ticket without creating upstream DNS work.
+    async fn acquire_session(server_addr: SocketAddr) -> Vec<u8> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let (socket, mut conn, _doq) =
+            raw_established_client(server_addr, deadline).await;
+        while conn.session().is_none() {
+            receive_packet(&socket, &mut conn, deadline).await;
+            send_pending_packets(&socket, &mut conn, server_addr).await;
+        }
+        let session = conn.session().unwrap().to_vec();
+        conn.close(false, 0, b"test complete").unwrap();
+        send_pending_packets(&socket, &mut conn, server_addr).await;
+        session
+    }
+
+    /// Check DNS response fields and EDE against the expected values.
+    fn assert_dns_response(
+        event: quiche::doq::Event, query: &Bytes, rcode: Rcode,
+        ede: Option<ExtendedErrorCode>,
+    ) {
+        let quiche::doq::Event::Response { data } = event else {
+            panic!("expected DoQ response, got {event:?}");
+        };
+        let response = Message::from_octets(Bytes::from(data)).unwrap();
+        let query = Message::from_octets(query.clone()).unwrap();
+        assert_eq!(response.header().id(), 0);
+        assert!(response.header().qr());
+        assert_eq!(response.header().rcode(), rcode);
+        assert!(response.is_answer(&query));
+        if query.opt().is_none() {
+            assert!(response.opt().is_none());
+        }
+        let actual_ede = response
+            .opt()
+            .and_then(|opt| opt.opt().extended_error())
+            .map(|error| error.code());
+        assert_eq!(actual_ede, ede);
+    }
+
+    /// Send a resumed query in 0-RTT after Retry and collect its events.
+    async fn send_raw_resumed_query(
+        server_addr: SocketAddr, session: &[u8], query: &Bytes,
+    ) -> Vec<quiche::doq::Event> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let (socket, mut conn, mut doq) =
+            raw_client_after_retry(server_addr, Some(session), deadline).await;
+        let mut outgoing = [0; 1500];
+        // Hold the post-Retry Initial until the 0-RTT query is queued.
+        let (len, _) = conn.send(&mut outgoing).unwrap();
+        let resumed_initial = outgoing[..len].to_vec();
+        assert!(conn.is_in_early_data(), "client must have 0-RTT keys");
+        assert!(!conn.is_established());
+        let stream_id = doq.send_query(&mut conn, query).unwrap();
+        assert_eq!(stream_id, 0);
+        socket.send_to(&resumed_initial, server_addr).await.unwrap();
+        send_pending_packets(&socket, &mut conn, server_addr).await;
+        collect_response(
+            &socket,
+            &mut conn,
+            &mut doq,
+            server_addr,
+            deadline,
+            stream_id,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn network_failure_sends_terminal_servfail_with_conditional_ede() {
+        for edns in [false, true] {
+            let upstream = Arc::new(NetworkUpstream::default());
+            let (server_addr, server_task) =
+                start_server(Arc::clone(&upstream), ServerConfig::default(), 1)
+                    .await;
+            let query = test_query(Rtype::A, Opcode::QUERY, edns);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_sends_terminal_servfail_with_conditional_ede() {
+        for edns in [false, true] {
+            let upstream = Arc::new(PendingUpstream::default());
+            let (server_addr, server_task) = start_server(
+                Arc::clone(&upstream),
+                ServerConfig {
+                    transaction_timeout: Duration::from_millis(100),
+                },
+                1,
+            )
+            .await;
+            let query = test_query(Rtype::A, Opcode::QUERY, edns);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_upstream_responses_send_servfail_without_ede() {
+        for mismatched in [false, true] {
+            let (server_addr, server_task) = start_server(
+                Arc::new(InvalidUpstream { mismatched }),
+                ServerConfig::default(),
+                1,
+            )
+            .await;
+            let query = test_query(Rtype::A, Opcode::QUERY, true);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_deadline_sends_servfail_after_partial_response() {
+        for qtype in [Rtype::AXFR, Rtype::IXFR] {
+            let upstream = Arc::new(PartialUpstream::default());
+            let (server_addr, server_task) = start_server(
+                Arc::clone(&upstream),
+                ServerConfig {
+                    transaction_timeout: Duration::from_millis(100),
+                },
+                1,
+            )
+            .await;
+            let query = test_query(qtype, Opcode::QUERY, true);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 3);
+            assert_dns_response(events.remove(0), &query, Rcode::NOERROR, None);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                Some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn non_replayable_zero_rtt_query_is_refused_without_upstream_work() {
+        for edns in [false, true] {
+            let upstream = Arc::new(NetworkUpstream::default());
+            let (server_addr, server_task) =
+                start_server(Arc::clone(&upstream), ServerConfig::default(), 2)
+                    .await;
+
+            let session = acquire_session(server_addr).await;
+
+            let query = test_query(Rtype::A, Opcode::UPDATE, edns);
+            let mut events =
+                send_raw_resumed_query(server_addr, &session, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::REFUSED,
+                edns.then_some(ExtendedErrorCode::from_int(26)),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 0);
+
+            // End the listener after checking the ticket and resumed response.
+            server_task.abort();
+            let _ = server_task.await;
         }
     }
 
