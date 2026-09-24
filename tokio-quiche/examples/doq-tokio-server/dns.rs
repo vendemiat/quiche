@@ -77,6 +77,8 @@ fn update_id(
     Ok(Message::from_octets(message.into_octets().freeze())?)
 }
 
+/// Build an ID-zero failure response from the original DoQ query.
+/// Include EDE only when that query contains EDNS.
 pub(crate) fn build_failed_response(
     query: &Message<Bytes>, rcode: Rcode, ede: Vec<ExtendedError<Bytes>>,
 ) -> Result<DoqDnsResponse<Bytes>, DnsError> {
@@ -105,7 +107,7 @@ impl DoqDnsQuery<Bytes> {
 
     /// Build an upstream query with a random ID and bounded UDP payload size.
     pub(crate) fn prepare_upstream_query(
-        self,
+        &self,
     ) -> Result<Message<Bytes>, DnsError> {
         // RFC 9250, Section 4.2.1: "When forwarding a DNS message from DoQ
         // over another transport, a DNS Message ID MUST be generated according
@@ -193,10 +195,10 @@ impl DoqDnsResponse<Bytes> {
         // RFC 5936, Section 2.2: "For subsequent messages, it MAY do the same
         // or leave the Question section empty."
         // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
-        let xfr_response_without_question = query.is_xfr()
-            && response.header().qr()
-            && response.header().id() == query.header().id()
-            && response.header_counts().qdcount() == 0;
+        let xfr_response_without_question = query.is_xfr() &&
+            response.header().qr() &&
+            response.header().id() == query.header().id() &&
+            response.header_counts().qdcount() == 0;
         if !response.is_answer(query) && !xfr_response_without_question {
             return Err(DnsError::InvalidResponse);
         }
