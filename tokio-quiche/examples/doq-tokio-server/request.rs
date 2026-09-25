@@ -51,13 +51,13 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// Start a request using the monotonic Tokio clock.
-    pub(crate) fn start(
-        config: &ServerConfig, query: DoqDnsQuery<Bytes>,
+    /// Start a request for `upstream` using the monotonic Tokio clock.
+    pub(crate) fn start<U: Upstream>(
+        config: &ServerConfig, query: DoqDnsQuery<Bytes>, upstream: &U,
     ) -> Result<Self, DnsError> {
         let started_at = Instant::now();
         let deadline = started_at + config.transaction_timeout;
-        let upstream_query = query.prepare_upstream_query()?;
+        let upstream_query = upstream.prepare_query(&query)?;
         Ok(Self {
             deadline,
             client_query: query,
@@ -144,13 +144,14 @@ impl Request {
         if response.is_truncated() {
             return Err(UpstreamError::TcpRetryRequired);
         }
-        Ok(response)
+        Ok(response.prepare_client_response(&self.client_query)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::UdpUpstream;
     use domain::base::iana::Rtype;
     use domain::base::Message;
     use domain::base::MessageBuilder;
@@ -163,12 +164,17 @@ mod tests {
             .unwrap()
     }
 
+    /// Return a UDP upstream that the tests never contact.
+    fn upstream() -> UdpUpstream {
+        UdpUpstream::new("192.0.2.1:53".parse().unwrap())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn deadline_is_based_on_configured_timeout() {
         let config = ServerConfig {
             transaction_timeout: Duration::from_secs(5),
         };
-        let request = Request::start(&config, query()).unwrap();
+        let request = Request::start(&config, query(), &upstream()).unwrap();
         assert!(!request.is_expired(Instant::now()));
         tokio::time::advance(config.transaction_timeout).await;
         assert!(request.is_expired(request.deadline()));
@@ -176,7 +182,9 @@ mod tests {
 
     #[test]
     fn validated_truncated_response_requires_tcp_retry() {
-        let request = Request::start(&ServerConfig::default(), query()).unwrap();
+        let request =
+            Request::start(&ServerConfig::default(), query(), &upstream())
+                .unwrap();
         let mut response = MessageBuilder::new_bytes()
             .start_answer(&request.upstream_query, Rcode::NOERROR)
             .unwrap();

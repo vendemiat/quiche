@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use tokio::time::error::Elapsed;
 
 use crate::dns::DnsError;
+use crate::dns::DoqDnsQuery;
 use crate::dns::MAX_DNS_UDP_BUFFER_SIZE;
 
 /// One DNS response in an upstream sequence.
@@ -144,6 +145,14 @@ pub(crate) enum UpstreamError {
 
 /// The resolver interface used by the transaction layer.
 pub(crate) trait Upstream: Send + Sync {
+    /// Build the query that this upstream sends and validates responses
+    /// against.
+    fn prepare_query(
+        &self, query: &DoqDnsQuery<Bytes>,
+    ) -> Result<Message<Bytes>, DnsError> {
+        query.prepare_upstream_query(None)
+    }
+
     /// Start resolving one DNS request.
     fn resolve<'a>(
         &'a self, query: &'a Message<Bytes>,
@@ -169,6 +178,12 @@ impl UdpUpstream {
 }
 
 impl Upstream for UdpUpstream {
+    fn prepare_query(
+        &self, query: &DoqDnsQuery<Bytes>,
+    ) -> Result<Message<Bytes>, DnsError> {
+        query.prepare_upstream_query(Some(MAX_DNS_UDP_BUFFER_SIZE))
+    }
+
     fn resolve<'a>(
         &'a self, query: &'a Message<Bytes>,
     ) -> Pin<
@@ -306,14 +321,14 @@ mod tests {
     #[tokio::test]
     async fn udp_upstream_forwards_query_and_returns_terminal_response() {
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_address = upstream.local_addr().unwrap();
+        let udp_upstream = UdpUpstream::new(upstream.local_addr().unwrap());
         let query = crate::dns::query(0, Rtype::A);
-        let query_message = crate::dns::DoqDnsQuery::try_from(
-            Message::from_octets(query).unwrap(),
-        )
-        .unwrap()
-        .prepare_upstream_query()
-        .unwrap();
+        let query_message = udp_upstream
+            .prepare_query(
+                &DoqDnsQuery::try_from(Message::from_octets(query).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
         let response = MessageBuilder::new_bytes()
             .start_answer(&query_message, Rcode::NOERROR)
             .unwrap()
@@ -327,14 +342,17 @@ mod tests {
             let mut received = vec![0; usize::from(MAX_DNS_UDP_BUFFER_SIZE)];
             let (received_len, peer) =
                 upstream.recv_from(&mut received).await.unwrap();
-            assert_eq!(&received[..received_len], expected_query.as_slice());
+            received.truncate(received_len);
+            assert_eq!(received, expected_query);
+            let received = Message::from_octets(received).unwrap();
+            assert_eq!(
+                received.opt().unwrap().udp_payload_size(),
+                MAX_DNS_UDP_BUFFER_SIZE
+            );
             upstream.send_to(&expected_response, peer).await.unwrap();
         });
 
-        let mut responses = UdpUpstream::new(upstream_address)
-            .resolve(&query_message)
-            .await
-            .unwrap();
+        let mut responses = udp_upstream.resolve(&query_message).await.unwrap();
         assert_eq!(
             responses.next().await.unwrap(),
             ResponseItem::Final(response)
