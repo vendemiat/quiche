@@ -99,9 +99,29 @@ pub(crate) async fn serve<U>(
                 continue;
             }
 
+            let permit = match Arc::clone(&config.concurrent_transactions)
+                .try_acquire_owned()
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // RFC 8914, Section 4.15: "The server is unable to answer
+                    // the query, as it was not fully functional when the query
+                    // was received."
+                    // https://datatracker.ietf.org/doc/html/rfc8914#section-4.15
+                    tokio::spawn(send_terminal(
+                        responder,
+                        query.failed_reponse(Rcode::SERVFAIL, vec![
+                            ExtendedErrorCode::NOT_READY.into(),
+                        ]),
+                    ));
+                    continue;
+                },
+            };
+
             let upstream = Arc::clone(&upstream);
             let config = config.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let request =
                     match Request::start(&config, query, upstream.as_ref()) {
                         Ok(request) => request,
@@ -169,6 +189,7 @@ mod tests {
     use futures::StreamExt;
     use tokio::net::UdpSocket;
     use tokio::sync::Notify;
+    use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
     use tokio::task::JoinSet;
     use tokio::time::Instant;
@@ -188,6 +209,7 @@ mod tests {
     use crate::dns::query;
     use crate::doq_settings;
     use crate::upstream::ResponseSequence;
+    use crate::upstream::UdpUpstream;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -555,7 +577,9 @@ mod tests {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero(), "client packet should arrive");
         let wait = conn.timeout().unwrap_or(remaining).min(remaining);
-        let mut incoming = [0; 65_535];
+        // The buffer lives across the await. Keep its bytes out of the
+        // future's inline state to avoid large caller stack frames.
+        let mut incoming = vec![0; 65_535];
         match tokio::time::timeout(wait, socket.recv_from(&mut incoming)).await {
             Ok(Ok((len, from))) => {
                 conn.recv(&mut incoming[..len], quiche::RecvInfo {
@@ -602,7 +626,9 @@ mod tests {
         let mut outgoing = [0; 1500];
         let (len, _) = conn.send(&mut outgoing).unwrap();
         socket.send_to(&outgoing[..len], server_addr).await.unwrap();
-        let mut incoming = [0; 65_535];
+        // The buffer lives across the await. Keep its bytes out of the
+        // future's inline state to avoid large caller stack frames.
+        let mut incoming = vec![0; 65_535];
         let (len, from) =
             tokio::time::timeout_at(deadline, socket.recv_from(&mut incoming))
                 .await
@@ -826,6 +852,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_socket_failure_sends_terminal_servfail_with_conditional_ede() {
+        for edns in [false, true] {
+            let upstream =
+                Arc::new(UdpUpstream::new("127.0.0.1:0".parse().unwrap()));
+            let (server_addr, server_task) =
+                start_server(upstream, ServerConfig::default(), 1).await;
+            let query = test_query(Rtype::A, Opcode::QUERY, edns);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_timeout_sends_terminal_servfail_with_conditional_ede() {
+        for edns in [false, true] {
+            let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let upstream =
+                Arc::new(UdpUpstream::new(upstream_socket.local_addr().unwrap()));
+            let config = ServerConfig {
+                transaction_timeout: Duration::from_millis(100),
+                ..ServerConfig::default()
+            };
+            let (server_addr, server_task) =
+                start_server(upstream, config, 1).await;
+            let query = test_query(Rtype::A, Opcode::QUERY, edns);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            let mut buffer = [0; 1400];
+            let (len, _) = tokio::time::timeout(
+                TEST_TIMEOUT,
+                upstream_socket.recv_from(&mut buffer),
+            )
+            .await
+            .expect("UDP upstream should receive the query")
+            .unwrap();
+            let upstream_query = Message::from_octets(&buffer[..len]).unwrap();
+            assert!(!upstream_query.header().qr());
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_udp_response_sends_servfail_without_ede() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream =
+            Arc::new(UdpUpstream::new(upstream_socket.local_addr().unwrap()));
+        let (server_addr, server_task) =
+            start_server(upstream, ServerConfig::default(), 1).await;
+        let response_task = tokio::spawn(async move {
+            let mut buffer = [0; 1400];
+            let (_, peer) = upstream_socket.recv_from(&mut buffer).await.unwrap();
+            upstream_socket.send_to(b"invalid", peer).await.unwrap();
+        });
+
+        let query = test_query(Rtype::A, Opcode::QUERY, true);
+        let mut events = send_raw_query(server_addr, &query).await;
+        assert_eq!(events.len(), 2);
+        assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
+        assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+        tokio::time::timeout(TEST_TIMEOUT, response_task)
+            .await
+            .expect("UDP upstream should send its invalid response")
+            .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, server_task)
+            .await
+            .expect("server should stop after client closes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_client_cancels_udp_transaction_and_releases_capacity() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream =
+            Arc::new(UdpUpstream::new(upstream_socket.local_addr().unwrap()));
+        let config = ServerConfig {
+            concurrent_transactions: Arc::new(Semaphore::new(1)),
+            ..ServerConfig::default()
+        };
+        let concurrent_transactions = Arc::clone(&config.concurrent_transactions);
+        let (server_addr, server_task) = start_server(upstream, config, 1).await;
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_socket.connect(server_addr).await.unwrap();
+        let (client, control) = QueryClient::new();
+        let mut client_settings = doq_settings(true);
+        client_settings.verify_peer = false;
+        let _connection = tokio::time::timeout_at(
+            deadline,
+            connect_with_config(
+                Socket::try_from(client_socket).unwrap(),
+                Some("localhost"),
+                &ConnectionParams::new_client(
+                    client_settings,
+                    None,
+                    Hooks::default(),
+                ),
+                client,
+            ),
+        )
+        .await
+        .expect("client connection should complete")
+        .unwrap();
+        let mut buffer = [0; 1400];
+        tokio::time::timeout_at(deadline, upstream_socket.recv_from(&mut buffer))
+            .await
+            .expect("UDP upstream should receive the query")
+            .unwrap();
+        control.close();
+
+        let permit =
+            tokio::time::timeout(TEST_TIMEOUT, concurrent_transactions.acquire())
+                .await
+                .expect("client close should release the transaction permit")
+                .unwrap();
+        drop(permit);
+        tokio::time::timeout(TEST_TIMEOUT, server_task)
+            .await
+            .expect("server should stop after client closes")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn deadline_sends_terminal_servfail_with_conditional_ede() {
         for edns in [false, true] {
             let upstream = Arc::new(PendingUpstream::default());
@@ -833,6 +1002,7 @@ mod tests {
                 Arc::clone(&upstream),
                 ServerConfig {
                     transaction_timeout: Duration::from_millis(100),
+                    ..ServerConfig::default()
                 },
                 1,
             )
@@ -1137,6 +1307,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_transaction_limit_is_shared_across_connections() {
+        let upstream = Arc::new(AnswerUpstream {
+            hold: Some(Rtype::A),
+            ..Default::default()
+        });
+        let config = ServerConfig {
+            concurrent_transactions: Arc::new(Semaphore::new(1)),
+            ..ServerConfig::default()
+        };
+        let concurrent_transactions = Arc::clone(&config.concurrent_transactions);
+        let (server_addr, server_task) =
+            start_server(Arc::clone(&upstream), config, 3).await;
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let (socket, mut conn, mut doq) =
+            raw_established_client(server_addr, deadline).await;
+        let held_query = test_query(Rtype::A, Opcode::QUERY, true);
+        let held_id = doq.send_query(&mut conn, &held_query).unwrap();
+        send_pending_packets(&socket, &mut conn, server_addr).await;
+        tokio::time::timeout_at(deadline, upstream.held_started.notified())
+            .await
+            .expect("first upstream query should start");
+
+        let other_query = test_query(Rtype::AAAA, Opcode::QUERY, true);
+        let mut overloaded = send_raw_query(server_addr, &other_query).await;
+        assert_eq!(overloaded.len(), 2);
+        assert_dns_response(
+            overloaded.remove(0),
+            &other_query,
+            Rcode::SERVFAIL,
+            Some(ExtendedErrorCode::NOT_READY),
+        );
+        assert_eq!(overloaded.remove(0), quiche::doq::Event::Finished);
+
+        let non_edns_query = test_query(Rtype::AAAA, Opcode::QUERY, false);
+        let non_edns_id = doq.send_query(&mut conn, &non_edns_query).unwrap();
+        send_pending_packets(&socket, &mut conn, server_addr).await;
+        let mut events = HashMap::new();
+        collect_until_finished(
+            &socket,
+            &mut conn,
+            &mut doq,
+            server_addr,
+            deadline,
+            &mut events,
+            non_edns_id,
+        )
+        .await;
+        assert_eq!(events.len(), 1);
+        let mut overloaded = events.remove(&non_edns_id).unwrap();
+        assert_eq!(overloaded.len(), 2);
+        assert_dns_response(
+            overloaded.remove(0),
+            &non_edns_query,
+            Rcode::SERVFAIL,
+            None,
+        );
+        assert_eq!(overloaded.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+
+        upstream.release.notify_one();
+        let mut held = collect_response(
+            &socket,
+            &mut conn,
+            &mut doq,
+            server_addr,
+            deadline,
+            held_id,
+        )
+        .await;
+        assert_dns_response(held.remove(0), &held_query, Rcode::NOERROR, None);
+        assert_eq!(held.remove(0), quiche::doq::Event::Finished);
+        let permit =
+            tokio::time::timeout(TEST_TIMEOUT, concurrent_transactions.acquire())
+                .await
+                .expect("completed transaction should release its permit")
+                .unwrap();
+        drop(permit);
+
+        let mut accepted = send_raw_query(server_addr, &other_query).await;
+        assert_eq!(accepted.len(), 2);
+        assert_dns_response(
+            accepted.remove(0),
+            &other_query,
+            Rcode::NOERROR,
+            None,
+        );
+        assert_eq!(accepted.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 2);
+        tokio::time::timeout(TEST_TIMEOUT, server_task)
+            .await
+            .expect("server should stop after clients close")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn cancels_pending_upstream_when_client_closes_connection() {
         const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1170,6 +1435,7 @@ mod tests {
             connection.start(driver);
             serve(controller, server_upstream, ServerConfig {
                 transaction_timeout: Duration::from_secs(30),
+                ..ServerConfig::default()
             })
             .await;
         });

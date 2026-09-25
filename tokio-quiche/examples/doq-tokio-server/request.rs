@@ -173,6 +173,7 @@ mod tests {
     async fn deadline_is_based_on_configured_timeout() {
         let config = ServerConfig {
             transaction_timeout: Duration::from_secs(5),
+            ..ServerConfig::default()
         };
         let request = Request::start(&config, query(), &upstream()).unwrap();
         assert!(!request.is_expired(Instant::now()));

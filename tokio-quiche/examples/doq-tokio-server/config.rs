@@ -24,19 +24,30 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
+
+const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_MAX_CONCURRENT_TRANSACTIONS: usize = 1024;
 
 /// Configuration for DoQ transaction processing.
 #[derive(Clone, Debug)]
 pub(crate) struct ServerConfig {
-    /// Maximum time spent processing one upstream transaction.
+    /// Time allowed for upstream resolution and response reads.
     pub(crate) transaction_timeout: Duration,
+    /// Shared capacity for concurrent upstream transactions.
+    pub(crate) concurrent_transactions: Arc<Semaphore>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            transaction_timeout: Duration::from_secs(30),
+            transaction_timeout: DEFAULT_TRANSACTION_TIMEOUT,
+            concurrent_transactions: Arc::new(Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_TRANSACTIONS,
+            )),
         }
     }
 }
