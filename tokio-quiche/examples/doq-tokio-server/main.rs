@@ -33,12 +33,14 @@ mod server;
 mod upstream;
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use clap::Parser;
 use futures::StreamExt;
 use quiche::doq::MAX_DOQ_MESSAGE_LEN;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use tokio_quiche::doq::DoqServerDriver;
 use tokio_quiche::doq::DOQ_ALPN;
 use tokio_quiche::listen;
@@ -50,6 +52,7 @@ use tokio_quiche::settings::TlsCertificatePaths;
 use tokio_quiche::ConnectionParams;
 
 use crate::config::ServerConfig;
+use crate::config::DEFAULT_MAX_CONCURRENT_TRANSACTIONS;
 use crate::server::serve;
 use crate::upstream::UdpUpstream;
 
@@ -62,6 +65,14 @@ struct Args {
     /// Address of the UDP DNS upstream resolver.
     #[arg(long)]
     upstream_address: SocketAddr,
+
+    /// Maximum number of concurrent upstream transactions across connections.
+    #[arg(
+        long,
+        default_value_t = NonZeroUsize::new(DEFAULT_MAX_CONCURRENT_TRANSACTIONS)
+            .expect("default limit must be nonzero")
+    )]
+    max_concurrent_transactions: NonZeroUsize,
 
     /// Path to the server TLS certificate.
     #[arg(long, default_value = "examples/cert.crt")]
@@ -97,6 +108,13 @@ async fn main() {
         .expect("DoQ UDP socket should be bindable");
     let settings = doq_settings(args.disable_0rtt);
     let max_streams_bidi = settings.initial_max_streams_bidi;
+    let upstream = Arc::new(UdpUpstream::new(args.upstream_address));
+    let config = ServerConfig {
+        concurrent_transactions: Arc::new(Semaphore::new(
+            args.max_concurrent_transactions.get(),
+        )),
+        ..ServerConfig::default()
+    };
 
     let mut listeners = listen(
         [socket],
@@ -119,11 +137,7 @@ async fn main() {
         };
         let (driver, controller) = DoqServerDriver::new(max_streams_bidi);
         connection.start(driver);
-        tokio::spawn(serve(
-            controller,
-            Arc::new(UdpUpstream::new(args.upstream_address)),
-            ServerConfig::default(),
-        ));
+        tokio::spawn(serve(controller, Arc::clone(&upstream), config.clone()));
     }
 }
 
