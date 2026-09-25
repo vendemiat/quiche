@@ -92,13 +92,14 @@ pub(crate) async fn serve<U>(
             let upstream = Arc::clone(&upstream);
             let config = config.clone();
             tokio::spawn(async move {
-                let request = match Request::start(&config, query) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        send_terminal(responder, Err(())).await;
-                        return;
-                    },
-                };
+                let request =
+                    match Request::start(&config, query, upstream.as_ref()) {
+                        Ok(request) => request,
+                        Err(_) => {
+                            send_terminal(responder, Err(())).await;
+                            return;
+                        },
+                    };
                 match request.respond(upstream.as_ref(), &responder).await {
                     Ok(()) => {},
                     Err(UpstreamError::Cancelled) => {},
@@ -152,6 +153,7 @@ mod tests {
 
     use bytes::Bytes;
     use domain::base::iana::Opcode;
+    use domain::base::iana::OptRcode;
     use domain::base::iana::Rtype;
     use domain::base::MessageBuilder;
     use futures::StreamExt;
@@ -395,6 +397,38 @@ mod tests {
                 } else {
                     Bytes::from_static(b"invalid")
                 };
+                let (mut sender, sequence) = ResponseSequence::channel(1);
+                sender.send(response, true).await?;
+                Ok(sequence)
+            })
+        }
+    }
+
+    /// Return one response with an OPT record and the configured full RCODE.
+    struct OptRcodeUpstream {
+        rcode: OptRcode,
+    }
+
+    impl Upstream for OptRcodeUpstream {
+        fn resolve<'a>(
+            &'a self, query: &'a Message<Bytes>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let mut additional = MessageBuilder::new_bytes()
+                    .start_answer(query, self.rcode.rcode())?
+                    .additional();
+                additional.opt(|opt| {
+                    opt.set_rcode(self.rcode);
+                    opt.padding(8)?;
+                    Ok(())
+                })?;
+                let response = additional.into_message().into_octets();
                 let (mut sender, sequence) = ResponseSequence::channel(1);
                 sender.send(response, true).await?;
                 Ok(sequence)
@@ -758,6 +792,46 @@ mod tests {
             let mut events = send_raw_query(server_addr, &query).await;
             assert_eq!(events.len(), 2);
             assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_opt_follows_client_edns_support() {
+        // Each case lists: client sends OPT, upstream full RCODE, and the
+        // expected full RCODE in the DoQ response.
+        let cases = [
+            (false, OptRcode::NOERROR, OptRcode::NOERROR),
+            (false, OptRcode::BADVERS, OptRcode::SERVFAIL),
+            (true, OptRcode::NOERROR, OptRcode::NOERROR),
+            (true, OptRcode::BADVERS, OptRcode::BADVERS),
+        ];
+        for (edns, upstream_rcode, expected_rcode) in cases {
+            let (server_addr, server_task) = start_server(
+                Arc::new(OptRcodeUpstream {
+                    rcode: upstream_rcode,
+                }),
+                ServerConfig::default(),
+                1,
+            )
+            .await;
+            let query = test_query(Rtype::A, Opcode::QUERY, edns);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            let quiche::doq::Event::Response { data } = events.remove(0) else {
+                panic!("expected DoQ response");
+            };
+            let response = Message::from_octets(Bytes::from(data)).unwrap();
+            let query = Message::from_octets(query).unwrap();
+            assert_eq!(response.header().id(), 0);
+            assert!(response.is_answer(&query));
+            assert_eq!(response.opt_rcode(), expected_rcode);
+            assert_eq!(response.opt().is_some(), edns);
             assert_eq!(events.remove(0), quiche::doq::Event::Finished);
 
             tokio::time::timeout(TEST_TIMEOUT, server_task)

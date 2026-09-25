@@ -29,10 +29,14 @@
 use bytes::Bytes;
 use bytes::BytesMut;
 use domain::base::iana::Rcode;
+use domain::base::iana::Rtype;
+use domain::base::message::CopyRecordsError;
 use domain::base::message::ShortMessage;
+use domain::base::message_builder::AdditionalBuilder;
 use domain::base::message_builder::PushError;
 use domain::base::opt::exterr::ExtendedError;
 use domain::base::wire::ParseError;
+use domain::base::Header;
 use domain::base::Message;
 use domain::base::MessageBuilder;
 use domain::rdata::AllRecordData;
@@ -64,6 +68,12 @@ pub(crate) enum DnsError {
 
     #[error("invalid DNS response")]
     InvalidResponse,
+
+    #[error("failed to copy DNS records")]
+    CopyRecords(#[from] CopyRecordsError),
+
+    #[error("extended RCODE does not fit in the header RCODE field")]
+    ExtendedRcodeOverflow,
 }
 
 fn update_id(
@@ -75,6 +85,48 @@ fn update_id(
         Message::from_octets(BytesMut::from(message.into_octets()))?;
     message.header_mut().set_id(id);
     Ok(Message::from_octets(message.into_octets().freeze())?)
+}
+
+/// Return a message builder that holds a copy of `source` without its OPT
+/// records.
+///
+/// Copy the header, the sole question, and every other record. Write names
+/// without compression. Fail when `source` does not have exactly one question.
+/// Return the builder positioned at the additional section.
+fn builder_from_msg_without_opt(
+    source: &Message<Bytes>,
+) -> Result<AdditionalBuilder<BytesMut>, DnsError> {
+    let mut builder = MessageBuilder::new_bytes();
+    *builder.header_mut() = source.header();
+
+    // `copy_records` does not copy the question section, so push the question
+    // first.
+    let mut questions = builder.question();
+    questions.push(source.sole_question()?)?;
+
+    // The closure cannot return an error, so keep the first parse error and
+    // return it after copying.
+    let mut parse_error = None;
+
+    // `copy_records` copies the answer, authority, and additional sections of
+    // `source` in order, starting with the answer builder it receives. It
+    // passes each record to the closure and pushes the record the closure
+    // returns. Returning `None` omits the record. It returns the builder
+    // positioned at the additional section.
+    let additional = source.copy_records(questions.answer(), |record| {
+        if record.rtype() == Rtype::OPT {
+            return None;
+        }
+        record
+            .to_any_record::<AllRecordData<_, _>>()
+            .map_err(|error| parse_error.get_or_insert(error))
+            .ok()
+    })?;
+
+    match parse_error {
+        Some(error) => Err(error.into()),
+        None => Ok(additional),
+    }
 }
 
 /// Build an ID-zero failure response from the original DoQ query.
@@ -105,47 +157,42 @@ impl DoqDnsQuery<Bytes> {
         self.0.header().opcode().into()
     }
 
-    /// Build an upstream query with a random ID and bounded UDP payload size.
+    /// Build the upstream query with a random ID.
+    ///
+    /// Two cases:
+    /// 1. `udp_payload_size` is `None`: change only the ID.
+    /// 2. `udp_payload_size` is `Some`: build a copy of the query with one OPT
+    ///    record. The OPT record keeps the client's EDNS fields and options and
+    ///    advertises the given UDP payload size. Add an OPT record when the
+    ///    client query has none.
     pub(crate) fn prepare_upstream_query(
-        &self,
+        &self, udp_payload_size: Option<u16>,
     ) -> Result<Message<Bytes>, DnsError> {
         // RFC 9250, Section 4.2.1: "When forwarding a DNS message from DoQ
         // over another transport, a DNS Message ID MUST be generated according
         // to the rules of the protocol that is in use."
         // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
-        let source_header = self.0.header();
+        let mut header = Header::new();
+        header.set_random_id();
+        let Some(udp_payload_size) = udp_payload_size else {
+            return update_id(self.0.clone(), header.id());
+        };
+
+        let mut additional = builder_from_msg_without_opt(&self.0)?;
+        additional.header_mut().set_id(header.id());
         let source_opt = self.0.opt();
-
-        let mut builder = MessageBuilder::new_bytes();
-        builder.header_mut().set_random_id();
-        builder.header_mut().set_opcode(source_header.opcode());
-        builder.header_mut().set_flags(source_header.flags());
-        builder.header_mut().set_z(source_header.z());
-        builder.header_mut().set_rcode(source_header.rcode());
-
-        let mut questions = builder.question();
-        for question in self.0.question() {
-            questions.push(question?)?;
-        }
-
-        let mut additional = questions.additional();
-        // Copy non-OPT records. Build exactly one OPT below because the builder
-        // cannot modify a record after it has been pushed.
-        for record in self.0.additional()? {
-            let record = record?;
-            if record.rtype() == domain::base::iana::Rtype::OPT {
-                continue;
-            }
-            additional.push(record.to_any_record::<AllRecordData<_, _>>()?)?;
-        }
+        // RFC 6891, Section 6.2.3: "The requestor's UDP payload size (encoded
+        // in the RR CLASS field) is the number of octets of the largest UDP
+        // payload that can be reassembled and delivered in the requestor's
+        // network stack."
+        // https://datatracker.ietf.org/doc/html/rfc6891#section-6.2.3
         additional.opt(|opt| {
             if let Some(source_opt) = source_opt.as_ref() {
                 opt.clone_from(source_opt)?;
             }
-            opt.set_udp_payload_size(MAX_DNS_UDP_BUFFER_SIZE);
+            opt.set_udp_payload_size(udp_payload_size);
             Ok(())
         })?;
-
         Ok(additional.into_message())
     }
 
@@ -210,6 +257,38 @@ impl DoqDnsResponse<Bytes> {
         Self::try_from(response)
     }
 
+    /// Adapt this response to the EDNS support of the client query.
+    ///
+    /// Two cases:
+    /// 1. The client query has an OPT record: return the response unchanged.
+    /// 2. The client query has no OPT record: remove every OPT record. Fail
+    ///    when the full RCODE needs the OPT record to be represented.
+    pub(crate) fn prepare_client_response(
+        self, client_query: &DoqDnsQuery<Bytes>,
+    ) -> Result<Self, DnsError> {
+        if client_query.0.opt().is_some() {
+            return Ok(self);
+        }
+
+        // RFC 6891, Section 6.1.3: "Note that EXTENDED-RCODE value 0
+        // indicates that an unextended RCODE is in use (values 0 through
+        // 15)."
+        // https://datatracker.ietf.org/doc/html/rfc6891#section-6.1.3
+        if self.0.opt_rcode().to_int() >= 16 {
+            return Err(DnsError::ExtendedRcodeOverflow);
+        }
+
+        // RFC 6891, Section 7: "Lack of presence of an OPT record in a request
+        // MUST be taken as an indication that the requestor does not implement
+        // any part of this specification and that the responder MUST NOT
+        // include an OPT record in its response."
+        // https://datatracker.ietf.org/doc/html/rfc6891#section-7
+        if self.0.opt().is_none() {
+            return Ok(self);
+        }
+        Self::try_from(builder_from_msg_without_opt(&self.0)?.into_message())
+    }
+
     /// Return whether this response requires retrying over TCP.
     pub(crate) fn is_truncated(&self) -> bool {
         self.0.header().tc()
@@ -251,7 +330,11 @@ pub(crate) fn query(id: u16, qtype: domain::base::iana::Rtype) -> Bytes {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use domain::base::iana::Rtype;
+    use domain::base::iana::Class;
+    use domain::base::iana::OptRcode;
+    use domain::base::Record;
+    use domain::base::Ttl;
+    use domain::rdata::A;
 
     use super::*;
 
@@ -302,8 +385,8 @@ mod tests {
         assert!(!parse_doq_query(query(0, Rtype::A)).unwrap().0.is_xfr());
     }
 
-    #[test]
-    fn preserves_existing_edns_options_in_upstream_query() {
+    /// Build a query with a 4096-byte payload size, DO, and padding.
+    fn edns_query() -> Message<Bytes> {
         let query = Message::from_octets(query(0, Rtype::A)).unwrap();
         let mut additional = MessageBuilder::new_bytes().question();
         for question in query.question() {
@@ -318,24 +401,182 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let query = additional.into_message();
-        let original_opt = query.opt().unwrap();
-        let original_options = original_opt.opt().clone();
-        let upstream_query = DoqDnsQuery::try_from(query)
-            .unwrap()
-            .prepare_upstream_query()
-            .unwrap();
-        let upstream_opt = upstream_query.opt().unwrap();
+        additional.into_message()
+    }
 
-        assert_eq!(upstream_opt.udp_payload_size(), MAX_DNS_UDP_BUFFER_SIZE);
-        assert!(upstream_opt.dnssec_ok());
-        assert_eq!(upstream_opt.opt(), &original_options);
+    /// Build a response to `query` with the full RCODE, one A record, and an
+    /// OPT record.
+    fn response_with_opt_rcode(
+        query: &Message<Bytes>, rcode: u16,
+    ) -> DoqDnsResponse<Bytes> {
+        assert!(rcode <= 0x0FFF);
+        let rcode = OptRcode::masked_from_int(rcode);
+        let mut answer = MessageBuilder::new_bytes()
+            .start_answer(query, rcode.rcode())
+            .unwrap();
+        answer
+            .push(Record::new(
+                query.sole_question().unwrap().into_qname(),
+                Class::IN,
+                Ttl::from_secs(300),
+                A::from_octets(192, 0, 2, 1),
+            ))
+            .unwrap();
+        let mut additional = answer.additional();
+        additional
+            .opt(|opt| {
+                opt.set_rcode(rcode);
+                opt.padding(8)?;
+                Ok(())
+            })
+            .unwrap();
+        DoqDnsResponse::try_from(additional.into_message()).unwrap()
+    }
+
+    #[test]
+    fn upstream_query_changes_only_the_id() {
+        let query = edns_query();
+        let upstream_query = DoqDnsQuery::try_from(query.clone())
+            .unwrap()
+            .prepare_upstream_query(None)
+            .unwrap();
+
+        assert_eq!(&upstream_query.as_slice()[2..], &query.as_slice()[2..]);
+    }
+
+    #[test]
+    fn udp_upstream_query_preserves_existing_edns_options() {
+        let query = edns_query();
+        let udp_query = DoqDnsQuery::try_from(query.clone())
+            .unwrap()
+            .prepare_upstream_query(Some(MAX_DNS_UDP_BUFFER_SIZE))
+            .unwrap();
+        let original_opt = query.opt().unwrap();
+        let udp_opt = udp_query.opt().unwrap();
+
+        assert_eq!(udp_opt.udp_payload_size(), MAX_DNS_UDP_BUFFER_SIZE);
+        assert!(udp_opt.dnssec_ok());
+        assert_eq!(udp_opt.opt(), original_opt.opt());
+        assert_eq!(udp_query.header_counts(), query.header_counts());
+        assert_eq!(
+            udp_query.sole_question().unwrap(),
+            query.sole_question().unwrap()
+        );
+    }
+
+    #[test]
+    fn udp_upstream_query_adds_opt_when_absent() {
+        let query = Message::from_octets(query(0, Rtype::A)).unwrap();
+        let udp_query = DoqDnsQuery::try_from(query.clone())
+            .unwrap()
+            .prepare_upstream_query(Some(MAX_DNS_UDP_BUFFER_SIZE))
+            .unwrap();
+        let udp_opt = udp_query.opt().unwrap();
+
+        assert_eq!(udp_query.header_counts().arcount(), 1);
+        assert_eq!(udp_opt.udp_payload_size(), MAX_DNS_UDP_BUFFER_SIZE);
+        assert_eq!(udp_opt.version(), 0);
+        assert!(!udp_opt.dnssec_ok());
+        assert!(udp_opt.opt().is_empty());
+    }
+
+    #[test]
+    fn udp_upstream_query_keeps_every_section() {
+        let source = Message::from_octets(query(0, Rtype::A)).unwrap();
+        let question = source.sole_question().unwrap();
+        let mut questions = MessageBuilder::new_bytes().question();
+        questions.push(&question).unwrap();
+        let mut answer = questions.answer();
+        answer
+            .push(Record::new(
+                question.qname(),
+                Class::IN,
+                Ttl::from_secs(300),
+                A::from_octets(192, 0, 2, 1),
+            ))
+            .unwrap();
+        let query = answer.additional().into_message();
+        let udp_query = DoqDnsQuery::try_from(query.clone())
+            .unwrap()
+            .prepare_upstream_query(Some(MAX_DNS_UDP_BUFFER_SIZE))
+            .unwrap();
+
+        assert_eq!(udp_query.header().opcode(), query.header().opcode());
+        assert_eq!(udp_query.header().flags(), query.header().flags());
+        assert_eq!(udp_query.sole_question().unwrap(), question);
+        let records = udp_query
+            .answer()
+            .unwrap()
+            .limit_to::<A>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(*records[0].data(), A::from_octets(192, 0, 2, 1));
+    }
+
+    #[test]
+    fn response_opt_is_removed_for_client_without_opt() {
+        let client_query = parse_doq_query(query(0, Rtype::A)).unwrap();
+        let response = response_with_opt_rcode(&client_query.0, 0);
+        let response = response.prepare_client_response(&client_query).unwrap();
+
+        assert!(response.0.opt().is_none());
+        assert_eq!(response.0.header_counts().arcount(), 0);
+        assert!(response.0.is_answer(&client_query.0));
+        let records = response
+            .0
+            .answer()
+            .unwrap()
+            .limit_to::<A>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(*records[0].data(), A::from_octets(192, 0, 2, 1));
+    }
+
+    #[test]
+    fn response_is_unchanged_for_client_with_opt() {
+        let client_query = DoqDnsQuery::try_from(edns_query()).unwrap();
+        for rcode in [0, 16, 4095] {
+            let response = response_with_opt_rcode(&client_query.0, rcode);
+            let expected = response.clone().into_bytes();
+
+            let response =
+                response.prepare_client_response(&client_query).unwrap();
+            assert_eq!(response.into_bytes(), expected);
+        }
+    }
+
+    #[test]
+    fn unextended_rcodes_are_forwarded_to_client_without_opt() {
+        let client_query = parse_doq_query(query(0, Rtype::A)).unwrap();
+        for rcode in 0..16 {
+            let response = response_with_opt_rcode(&client_query.0, rcode)
+                .prepare_client_response(&client_query)
+                .unwrap();
+
+            assert_eq!(u16::from(response.0.header().rcode().to_int()), rcode);
+            assert!(response.0.opt().is_none());
+        }
+    }
+
+    #[test]
+    fn extended_rcodes_are_rejected_for_client_without_opt() {
+        let client_query = parse_doq_query(query(0, Rtype::A)).unwrap();
+        for rcode in [16, 17, 4095] {
+            let response = response_with_opt_rcode(&client_query.0, rcode);
+
+            assert!(matches!(
+                response.prepare_client_response(&client_query),
+                Err(DnsError::ExtendedRcodeOverflow)
+            ));
+        }
     }
 
     #[test]
     fn terminal_response_resets_prepared_query_id() {
         let query = parse_doq_query(query(0, Rtype::A)).unwrap();
-        let upstream_query = query.prepare_upstream_query().unwrap();
+        let upstream_query = query.prepare_upstream_query(None).unwrap();
         let response =
             build_failed_response(&upstream_query, Rcode::SERVFAIL, vec![])
                 .unwrap();
@@ -347,7 +588,7 @@ mod tests {
     fn rejects_response_with_unexpected_id() {
         let query = parse_doq_query(query(0, Rtype::A)).unwrap();
         let response = query.failed_reponse(Rcode::NOERROR, vec![]).unwrap();
-        let upstream_query = query.prepare_upstream_query().unwrap();
+        let upstream_query = query.prepare_upstream_query(None).unwrap();
         let response = Message::from_octets(response.into_bytes()).unwrap();
         assert!(DoqDnsResponse::from_upstream(response, &upstream_query).is_err());
     }
@@ -355,7 +596,8 @@ mod tests {
     #[test]
     fn rejects_response_with_another_question() {
         let validated_query = parse_doq_query(query(0, Rtype::A)).unwrap();
-        let upstream_query = validated_query.prepare_upstream_query().unwrap();
+        let upstream_query =
+            validated_query.prepare_upstream_query(None).unwrap();
         let other_query = Message::from_octets(query(
             upstream_query.header().id(),
             Rtype::AAAA,
