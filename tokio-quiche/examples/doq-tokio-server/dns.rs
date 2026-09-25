@@ -157,6 +157,11 @@ impl DoqDnsQuery<Bytes> {
         self.0.header().opcode().into()
     }
 
+    /// Return whether this query has an AXFR or IXFR question.
+    pub(crate) fn is_xfr(&self) -> bool {
+        self.0.is_xfr()
+    }
+
     /// Build the upstream query with a random ID.
     ///
     /// Two cases:

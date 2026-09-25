@@ -89,6 +89,16 @@ pub(crate) async fn serve<U>(
                 continue;
             }
 
+            if query.is_xfr() {
+                // The proxy does not forward zone transfers.
+                // Answer AXFR and IXFR queries with NOTIMP directly.
+                tokio::spawn(send_terminal(
+                    responder,
+                    query.failed_reponse(Rcode::NOTIMP, vec![]),
+                ));
+                continue;
+            }
+
             let upstream = Arc::clone(&upstream);
             let config = config.clone();
             tokio::spawn(async move {
@@ -148,7 +158,6 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -178,7 +187,6 @@ mod tests {
     use crate::dns::query;
     use crate::doq_settings;
     use crate::upstream::ResponseSequence;
-    use crate::upstream::ResponseStreamSender;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -326,42 +334,6 @@ mod tests {
                 Err(UpstreamError::Network(std::io::Error::other(
                     "test network failure",
                 )))
-            })
-        }
-    }
-
-    /// Send one non-final response and keep the sequence open.
-    #[derive(Default)]
-    struct PartialUpstream {
-        calls: AtomicUsize,
-        sender: OnceLock<ResponseStreamSender>,
-    }
-
-    impl Upstream for PartialUpstream {
-        fn resolve<'a>(
-            &'a self, query: &'a Message<Bytes>,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<ResponseSequence, UpstreamError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                let response = MessageBuilder::new_bytes()
-                    .start_answer(query, Rcode::NOERROR)?
-                    .additional()
-                    .into_message()
-                    .into_octets();
-                let (mut sender, sequence) = ResponseSequence::channel(1);
-                sender.send(response, false).await?;
-                // Store the sender so returning from resolve does not drop it.
-                assert!(
-                    self.sender.set(sender).is_ok(),
-                    "PartialUpstream resolved more than once"
-                );
-                Ok(sequence)
             })
         }
     }
@@ -842,34 +814,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_deadline_sends_servfail_after_partial_response() {
+    async fn zone_transfer_is_answered_with_notimp_without_upstream_work() {
         for qtype in [Rtype::AXFR, Rtype::IXFR] {
-            let upstream = Arc::new(PartialUpstream::default());
-            let (server_addr, server_task) = start_server(
-                Arc::clone(&upstream),
-                ServerConfig {
-                    transaction_timeout: Duration::from_millis(100),
-                },
-                1,
-            )
-            .await;
-            let query = test_query(qtype, Opcode::QUERY, true);
-            let mut events = send_raw_query(server_addr, &query).await;
-            assert_eq!(events.len(), 3);
-            assert_dns_response(events.remove(0), &query, Rcode::NOERROR, None);
-            assert_dns_response(
-                events.remove(0),
-                &query,
-                Rcode::SERVFAIL,
-                Some(ExtendedErrorCode::NETWORK_ERROR),
-            );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
-            assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+            for edns in [false, true] {
+                let upstream = Arc::new(NetworkUpstream::default());
+                let (server_addr, server_task) = start_server(
+                    Arc::clone(&upstream),
+                    ServerConfig::default(),
+                    1,
+                )
+                .await;
+                let query = test_query(qtype, Opcode::QUERY, edns);
+                let mut events = send_raw_query(server_addr, &query).await;
+                assert_eq!(events.len(), 2);
+                assert_dns_response(
+                    events.remove(0),
+                    &query,
+                    Rcode::NOTIMP,
+                    None,
+                );
+                assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+                assert_eq!(upstream.calls.load(Ordering::Relaxed), 0);
 
-            tokio::time::timeout(TEST_TIMEOUT, server_task)
-                .await
-                .expect("server should stop after client closes")
-                .unwrap();
+                tokio::time::timeout(TEST_TIMEOUT, server_task)
+                    .await
+                    .expect("server should stop after client closes")
+                    .unwrap();
+            }
         }
     }
 
