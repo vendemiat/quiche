@@ -156,6 +156,7 @@ mod tests {
     use domain::base::Message;
     use domain::base::MessageBuilder;
     use std::time::Duration;
+    use tokio::net::UdpSocket;
 
     fn query() -> DoqDnsQuery<Bytes> {
         Message::from_octets(crate::dns::query(0, Rtype::A))
@@ -181,20 +182,56 @@ mod tests {
         assert!(request.is_expired(request.deadline()));
     }
 
-    #[test]
-    fn validated_truncated_response_requires_tcp_retry() {
+    #[tokio::test]
+    async fn udp_truncated_response_requires_tcp_retry() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = UdpUpstream::new(socket.local_addr().unwrap());
         let request =
-            Request::start(&ServerConfig::default(), query(), &upstream())
-                .unwrap();
-        let mut response = MessageBuilder::new_bytes()
-            .start_answer(&request.upstream_query, Rcode::NOERROR)
+            Request::start(&ServerConfig::default(), query(), &upstream).unwrap();
+        let response_task = tokio::spawn(async move {
+            let mut buffer = [0; 1400];
+            let (len, peer) = tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.recv_from(&mut buffer),
+            )
+            .await
+            .expect("UDP upstream should receive the query")
             .unwrap();
-        response.header_mut().set_tc(true);
-        let response = response.additional().into_message().into_octets();
+            let received =
+                Message::from_octets(Bytes::copy_from_slice(&buffer[..len]))
+                    .unwrap();
+            let mut response = MessageBuilder::new_bytes()
+                .start_answer(&received, Rcode::NOERROR)
+                .unwrap();
+            response.header_mut().set_tc(true);
+            let response = response.additional().into_message().into_octets();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.send_to(&response, peer),
+            )
+            .await
+            .expect("UDP upstream should send the response")
+            .unwrap();
+        });
 
+        let mut responses = tokio::time::timeout(
+            Duration::from_secs(5),
+            upstream.resolve(&request.upstream_query),
+        )
+        .await
+        .expect("UDP adapter should receive the response")
+        .unwrap();
+        let ResponseItem::Final(response) = responses.next().await.unwrap()
+        else {
+            panic!("UDP adapter should return a final response");
+        };
         assert!(matches!(
             request.validate_upstream_response(response),
             Err(UpstreamError::TcpRetryRequired)
         ));
+        tokio::time::timeout(Duration::from_secs(5), response_task)
+            .await
+            .expect("UDP response task should finish")
+            .unwrap();
     }
 }

@@ -182,10 +182,16 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use domain::base::iana::Class;
     use domain::base::iana::Opcode;
     use domain::base::iana::OptRcode;
     use domain::base::iana::Rtype;
+    use domain::base::name::Name;
     use domain::base::MessageBuilder;
+    use domain::base::Record;
+    use domain::base::Ttl;
+    use domain::rdata::Ns;
+    use domain::rdata::A;
     use futures::StreamExt;
     use tokio::net::UdpSocket;
     use tokio::sync::Notify;
@@ -505,6 +511,200 @@ mod tests {
         }
     }
 
+    fn large_udp_response(query: &Message<Bytes>, padding: u16) -> Bytes {
+        let mut answer = MessageBuilder::new_bytes()
+            .start_answer(query, Rcode::NOERROR)
+            .unwrap();
+        answer
+            .push(Record::new(
+                query.sole_question().unwrap().into_qname(),
+                Class::IN,
+                Ttl::from_secs(300),
+                A::from_octets(192, 0, 2, 1),
+            ))
+            .unwrap();
+        let name_server = Name::vec_from_str("ns.example.").unwrap();
+        let mut authority = answer.authority();
+        authority
+            .push(Record::new(
+                Name::vec_from_str("example.").unwrap(),
+                Class::IN,
+                Ttl::from_secs(301),
+                Ns::new(name_server.clone()),
+            ))
+            .unwrap();
+        let mut additional = authority.additional();
+        additional
+            .push(Record::new(
+                name_server,
+                Class::IN,
+                Ttl::from_secs(302),
+                A::from_octets(192, 0, 2, 2),
+            ))
+            .unwrap();
+        additional
+            .opt(|opt| {
+                opt.set_udp_payload_size(1400);
+                opt.padding(padding)?;
+                Ok(())
+            })
+            .unwrap();
+        additional.into_message().into_octets()
+    }
+
+    fn padded_edns_query() -> Bytes {
+        let source =
+            Message::from_octets(test_query(Rtype::A, Opcode::QUERY, false))
+                .unwrap();
+        let mut questions = MessageBuilder::new_bytes().question();
+        questions.push(source.sole_question().unwrap()).unwrap();
+        let mut additional = questions.additional();
+        additional
+            .opt(|opt| {
+                opt.set_udp_payload_size(1232);
+                opt.padding(8)?;
+                Ok(())
+            })
+            .unwrap();
+        additional.into_message().into_octets()
+    }
+
+    async fn large_udp_round_trip(bind_address: &str, edns: bool) {
+        let upstream_socket = UdpSocket::bind(bind_address).await.unwrap();
+        let upstream =
+            Arc::new(UdpUpstream::new(upstream_socket.local_addr().unwrap()));
+        let (server_addr, server_task) = start_server_on(
+            upstream,
+            ServerConfig::default(),
+            1,
+            false,
+            bind_address,
+        )
+        .await;
+        let query = if edns {
+            padded_edns_query()
+        } else {
+            test_query(Rtype::A, Opcode::QUERY, false)
+        };
+        let expected_query = Message::from_octets(query.clone()).unwrap();
+        let response_task = tokio::spawn(async move {
+            let mut buffer = vec![0; 1400];
+            let (len, peer) = tokio::time::timeout(
+                TEST_TIMEOUT,
+                upstream_socket.recv_from(&mut buffer),
+            )
+            .await
+            .expect("UDP upstream should receive the query")
+            .unwrap();
+            buffer.truncate(len);
+            let upstream_query =
+                Message::from_octets(Bytes::from(buffer)).unwrap();
+            assert!(!upstream_query.header().qr());
+            assert_eq!(
+                upstream_query.sole_question().unwrap(),
+                expected_query.sole_question().unwrap()
+            );
+            let opt = upstream_query.opt().unwrap();
+            assert_eq!(opt.udp_payload_size(), 1400);
+            if let Some(expected_opt) = expected_query.opt() {
+                assert_eq!(opt.opt(), expected_opt.opt());
+            } else {
+                assert!(opt.opt().is_empty());
+            }
+
+            let base = large_udp_response(&upstream_query, 0);
+            let response = large_udp_response(
+                &upstream_query,
+                u16::try_from(1400 - base.len()).unwrap(),
+            );
+            assert_eq!(response.len(), 1400);
+            let parsed = Message::from_octets(response.clone()).unwrap();
+            assert!(parsed.is_answer(&upstream_query));
+            assert!(!parsed.header().tc());
+            tokio::time::timeout(
+                TEST_TIMEOUT,
+                upstream_socket.send_to(&response, peer),
+            )
+            .await
+            .expect("UDP upstream should send the response")
+            .unwrap();
+            response
+        });
+
+        let mut events = send_raw_query(server_addr, &query).await;
+        let upstream_response = tokio::time::timeout(TEST_TIMEOUT, response_task)
+            .await
+            .expect("UDP response task should finish")
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let quiche::doq::Event::Response { data } = events.remove(0) else {
+            panic!("expected DoQ response");
+        };
+        let response = Message::from_octets(Bytes::from(data)).unwrap();
+        assert_eq!(response.header().id(), 0);
+        assert!(response.header().qr());
+        assert!(!response.header().tc());
+        assert_eq!(response.header().rcode(), Rcode::NOERROR);
+        assert!(response.is_answer(&Message::from_octets(query).unwrap()));
+        if edns {
+            let mut expected = upstream_response.to_vec();
+            // Set the expected DNS ID to zero for the DoQ response.
+            expected[..2].copy_from_slice(&[0, 0]);
+            assert_eq!(response.as_slice(), expected);
+        } else {
+            assert!(response.opt().is_none());
+            assert_eq!(response.header_counts().ancount(), 1);
+            assert_eq!(response.header_counts().nscount(), 1);
+            assert_eq!(response.header_counts().arcount(), 1);
+            let answers = response
+                .answer()
+                .unwrap()
+                .limit_to::<A>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(answers.len(), 1);
+            assert_eq!(*answers[0].data(), A::from_octets(192, 0, 2, 1));
+            assert_eq!(answers[0].ttl(), Ttl::from_secs(300));
+            let authorities = response
+                .authority()
+                .unwrap()
+                .limit_to::<Ns<_>>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(authorities.len(), 1);
+            assert_eq!(authorities[0].data().nsdname().to_string(), "ns.example");
+            assert_eq!(authorities[0].ttl(), Ttl::from_secs(301));
+            let additional = response
+                .additional()
+                .unwrap()
+                .limit_to::<A>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(additional.len(), 1);
+            assert_eq!(*additional[0].data(), A::from_octets(192, 0, 2, 2));
+            assert_eq!(additional[0].ttl(), Ttl::from_secs(302));
+        }
+        assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+        tokio::time::timeout(TEST_TIMEOUT, server_task)
+            .await
+            .expect("server should stop after client closes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv4_doq_to_udp_preserves_large_response() {
+        for edns in [false, true] {
+            large_udp_round_trip("127.0.0.1:0", edns).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_doq_to_udp_preserves_large_response() {
+        for edns in [false, true] {
+            large_udp_round_trip("[::1]:0", edns).await;
+        }
+    }
+
     /// Start a loopback DoQ listener for the requested number of connections.
     async fn start_server<U: Upstream + 'static>(
         upstream: Arc<U>, config: ServerConfig, connections: usize,
@@ -517,7 +717,21 @@ mod tests {
         upstream: Arc<U>, config: ServerConfig, connections: usize,
         disable_0rtt: bool,
     ) -> (SocketAddr, JoinHandle<()>) {
-        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        start_server_on(
+            upstream,
+            config,
+            connections,
+            disable_0rtt,
+            "127.0.0.1:0",
+        )
+        .await
+    }
+
+    async fn start_server_on<U: Upstream + 'static>(
+        upstream: Arc<U>, config: ServerConfig, connections: usize,
+        disable_0rtt: bool, bind_address: &str,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let server_socket = UdpSocket::bind(bind_address).await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
         let settings = doq_settings(disable_0rtt);
         let max_streams_bidi = settings.initial_max_streams_bidi;
@@ -598,7 +812,12 @@ mod tests {
     async fn raw_client_after_retry(
         server_addr: SocketAddr, session: Option<&[u8]>, deadline: Instant,
     ) -> (UdpSocket, quiche::Connection, quiche::doq::Connection) {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind_address = if server_addr.is_ipv4() {
+            "127.0.0.1:0"
+        } else {
+            "[::1]:0"
+        };
+        let socket = UdpSocket::bind(bind_address).await.unwrap();
         let local_addr = socket.local_addr().unwrap();
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         config
@@ -940,6 +1159,80 @@ mod tests {
             .await
             .expect("server should stop after client closes")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mismatched_udp_response_sends_servfail_without_ede() {
+        enum Mismatch {
+            WrongQuestion,
+            WrongId,
+        }
+
+        for mismatch in [Mismatch::WrongQuestion, Mismatch::WrongId] {
+            let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let upstream =
+                Arc::new(UdpUpstream::new(upstream_socket.local_addr().unwrap()));
+            let (server_addr, server_task) =
+                start_server(upstream, ServerConfig::default(), 1).await;
+            let response_task = tokio::spawn(async move {
+                let mut buffer = [0; 1400];
+                let (len, peer) = tokio::time::timeout(
+                    TEST_TIMEOUT,
+                    upstream_socket.recv_from(&mut buffer),
+                )
+                .await
+                .expect("UDP upstream should receive the query")
+                .unwrap();
+                let upstream_query =
+                    Message::from_octets(Bytes::copy_from_slice(&buffer[..len]))
+                        .unwrap();
+                let response = match mismatch {
+                    Mismatch::WrongQuestion => {
+                        let wrong_question = Message::from_octets(query(
+                            upstream_query.header().id(),
+                            Rtype::AAAA,
+                        ))
+                        .unwrap();
+                        MessageBuilder::new_bytes()
+                            .start_answer(&wrong_question, Rcode::NOERROR)
+                            .unwrap()
+                            .additional()
+                            .into_message()
+                            .into_octets()
+                    },
+                    Mismatch::WrongId => {
+                        let mut answer = MessageBuilder::new_bytes()
+                            .start_answer(&upstream_query, Rcode::NOERROR)
+                            .unwrap();
+                        answer
+                            .header_mut()
+                            .set_id(upstream_query.header().id().wrapping_add(1));
+                        answer.additional().into_message().into_octets()
+                    },
+                };
+                tokio::time::timeout(
+                    TEST_TIMEOUT,
+                    upstream_socket.send_to(&response, peer),
+                )
+                .await
+                .expect("UDP upstream should send the response")
+                .unwrap();
+            });
+
+            let query = test_query(Rtype::A, Opcode::QUERY, true);
+            let mut events = send_raw_query(server_addr, &query).await;
+            assert_eq!(events.len(), 2);
+            assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            tokio::time::timeout(TEST_TIMEOUT, response_task)
+                .await
+                .expect("UDP response task should finish")
+                .unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .expect("server should stop after client closes")
+                .unwrap();
+        }
     }
 
     #[tokio::test]
