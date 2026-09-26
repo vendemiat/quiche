@@ -52,8 +52,8 @@ pub(crate) struct Request {
 
 impl Request {
     /// Start a request for `upstream` using the monotonic Tokio clock.
-    pub(crate) fn start<U: Upstream>(
-        config: &ServerConfig, query: DoqDnsQuery<Bytes>, upstream: &U,
+    pub(crate) fn start(
+        config: &ServerConfig, query: DoqDnsQuery<Bytes>, upstream: &dyn Upstream,
     ) -> Result<Self, DnsError> {
         let started_at = Instant::now();
         let deadline = started_at + config.transaction_timeout;
@@ -78,8 +78,8 @@ impl Request {
     }
 
     /// Resolve the request before its absolute deadline.
-    pub(crate) async fn resolve<U: Upstream>(
-        &self, upstream: &U, responder: &DoqResponder,
+    pub(crate) async fn resolve(
+        &self, upstream: &dyn Upstream, responder: &DoqResponder,
     ) -> Result<ResponseSequence, UpstreamError> {
         tokio::select! {
             result = tokio::time::timeout_at(
@@ -93,8 +93,8 @@ impl Request {
     }
 
     /// Resolve and forward all upstream responses for this request.
-    pub(crate) async fn respond<U: Upstream>(
-        &self, upstream: &U, responder: &DoqResponder,
+    pub(crate) async fn respond(
+        &self, upstream: &dyn Upstream, responder: &DoqResponder,
     ) -> Result<(), UpstreamError> {
         let mut responses = self.resolve(upstream, responder).await?;
         loop {
@@ -113,7 +113,7 @@ impl Request {
                     DnsError::InvalidResponse,
                 ));
             }
-            let data = self.validate_upstream_response(data)?;
+            let data = self.validate_upstream_response(data, upstream)?;
 
             tokio::select! {
                 result = responder.send(data.into_bytes(), fin) => {
@@ -137,11 +137,11 @@ impl Request {
     }
 
     fn validate_upstream_response(
-        &self, data: Bytes,
+        &self, data: Bytes, upstream: &dyn Upstream,
     ) -> Result<DoqDnsResponse<Bytes>, UpstreamError> {
         let response =
             DoqDnsResponse::from_upstream_bytes(data, &self.upstream_query)?;
-        if response.is_truncated() {
+        if response.is_truncated() && upstream.should_retry_tc() {
             return Err(UpstreamError::TcpRetryRequired);
         }
         Ok(response.prepare_client_response(&self.client_query)?)
@@ -226,7 +226,7 @@ mod tests {
             panic!("UDP adapter should return a final response");
         };
         assert!(matches!(
-            request.validate_upstream_response(response),
+            request.validate_upstream_response(response, &upstream),
             Err(UpstreamError::TcpRetryRequired)
         ));
         tokio::time::timeout(Duration::from_secs(5), response_task)

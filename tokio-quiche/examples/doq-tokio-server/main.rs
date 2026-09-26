@@ -37,6 +37,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use clap::Parser;
+use clap::ValueEnum;
 use futures::StreamExt;
 use quiche::doq::MAX_DOQ_MESSAGE_LEN;
 use tokio::net::UdpSocket;
@@ -54,7 +55,15 @@ use tokio_quiche::ConnectionParams;
 use crate::config::ServerConfig;
 use crate::config::DEFAULT_MAX_CONCURRENT_TRANSACTIONS;
 use crate::server::serve;
+use crate::upstream::TcpUpstream;
 use crate::upstream::UdpUpstream;
+use crate::upstream::Upstream;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum UpstreamProtocol {
+    Udp,
+    Tcp,
+}
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -62,9 +71,13 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8853")]
     address: String,
 
-    /// Address of the UDP DNS upstream resolver.
+    /// Address of the DNS upstream resolver.
     #[arg(long)]
     upstream_address: SocketAddr,
+
+    /// Transport used for ordinary upstream DNS queries.
+    #[arg(long, value_enum, default_value_t = UpstreamProtocol::Udp)]
+    upstream_protocol: UpstreamProtocol,
 
     /// Maximum number of concurrent upstream transactions across connections.
     #[arg(
@@ -108,7 +121,12 @@ async fn main() {
         .expect("DoQ UDP socket should be bindable");
     let settings = doq_settings(args.disable_0rtt);
     let max_streams_bidi = settings.initial_max_streams_bidi;
-    let upstream = Arc::new(UdpUpstream::new(args.upstream_address));
+    let upstream: Arc<dyn Upstream> = match args.upstream_protocol {
+        UpstreamProtocol::Udp =>
+            Arc::new(UdpUpstream::new(args.upstream_address)),
+        UpstreamProtocol::Tcp =>
+            Arc::new(TcpUpstream::new(args.upstream_address)),
+    };
     let config = ServerConfig {
         concurrent_transactions: Arc::new(Semaphore::new(
             args.max_concurrent_transactions.get(),
@@ -144,6 +162,29 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn upstream_protocol_defaults_to_udp_and_accepts_tcp() {
+        let default = Args::try_parse_from([
+            "doq-tokio-server",
+            "--upstream-address",
+            "192.0.2.1:53",
+        ])
+        .unwrap();
+        assert_eq!(default.upstream_protocol, UpstreamProtocol::Udp);
+
+        let tcp = Args::try_parse_from([
+            "doq-tokio-server",
+            "--upstream-address",
+            "192.0.2.1:53",
+            "--upstream-protocol",
+            "tcp",
+        ])
+        .unwrap();
+        assert_eq!(tcp.upstream_protocol, UpstreamProtocol::Tcp);
+        Args::command().debug_assert();
+    }
 
     #[test]
     fn enables_early_data_unless_disabled() {

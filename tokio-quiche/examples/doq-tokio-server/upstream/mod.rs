@@ -26,6 +26,8 @@
 
 //! Incremental upstream response abstractions.
 
+mod tcp;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -40,6 +42,8 @@ use tokio::time::error::Elapsed;
 use crate::dns::DnsError;
 use crate::dns::DoqDnsQuery;
 use crate::dns::MAX_DNS_UDP_BUFFER_SIZE;
+
+pub(crate) use tcp::TcpUpstream;
 
 /// One DNS response in an upstream sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +140,9 @@ pub(crate) enum UpstreamError {
     #[error("upstream network error")]
     Network(#[from] std::io::Error),
 
+    #[error("upstream DNS query exceeds the 65535-byte message limit")]
+    QueryTooLarge,
+
     #[error("upstream response requires TCP retry")]
     TcpRetryRequired,
 
@@ -151,6 +158,11 @@ pub(crate) trait Upstream: Send + Sync {
         &self, query: &DoqDnsQuery<Bytes>,
     ) -> Result<Message<Bytes>, DnsError> {
         query.prepare_upstream_query(None)
+    }
+
+    /// Whether a correlated truncated response needs a TCP retry.
+    fn should_retry_tc(&self) -> bool {
+        false
     }
 
     /// Start resolving one DNS request.
@@ -182,6 +194,10 @@ impl Upstream for UdpUpstream {
         &self, query: &DoqDnsQuery<Bytes>,
     ) -> Result<Message<Bytes>, DnsError> {
         query.prepare_upstream_query(Some(MAX_DNS_UDP_BUFFER_SIZE))
+    }
+
+    fn should_retry_tc(&self) -> bool {
+        true
     }
 
     fn resolve<'a>(
