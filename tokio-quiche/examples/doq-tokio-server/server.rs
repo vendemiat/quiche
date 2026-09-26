@@ -45,11 +45,10 @@ use crate::upstream::Upstream;
 use crate::upstream::UpstreamError;
 
 /// Process DoQ events for one connection.
-pub(crate) async fn serve<U>(
-    mut controller: DoqController, upstream: Arc<U>, config: ServerConfig,
-) where
-    U: Upstream + 'static,
-{
+pub(crate) async fn serve(
+    mut controller: DoqController, upstream: Arc<dyn Upstream>,
+    config: ServerConfig,
+) {
     let Some(mut events) = controller.take_event_receiver() else {
         return;
     };
@@ -215,7 +214,11 @@ mod tests {
     use crate::dns::query;
     use crate::doq_settings;
     use crate::upstream::ResponseSequence;
+    use crate::upstream::TcpUpstream;
     use crate::upstream::UdpUpstream;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -702,6 +705,217 @@ mod tests {
     async fn ipv6_doq_to_udp_preserves_large_response() {
         for edns in [false, true] {
             large_udp_round_trip("[::1]:0", edns).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn doq_to_tcp_preserves_query_response_wire_and_tc() {
+        // Exercise both TC values with and without EDNS.
+        for (edns, tc) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream =
+                Arc::new(TcpUpstream::new(listener.local_addr().unwrap()));
+            let (server_addr, server_task) =
+                start_server(upstream, ServerConfig::default(), 1).await;
+            let query = if edns {
+                padded_edns_query()
+            } else {
+                test_query(Rtype::A, Opcode::QUERY, false)
+            };
+            let client_query = Message::from_octets(query.clone()).unwrap();
+            let mut expected_response = MessageBuilder::new_bytes()
+                .start_answer(&client_query, Rcode::NOERROR)
+                .unwrap();
+            expected_response.header_mut().set_id(0);
+            expected_response.header_mut().set_tc(tc);
+            // Compare an answer in every case and an OPT option with EDNS.
+            expected_response
+                .push(Record::new(
+                    client_query.sole_question().unwrap().into_qname(),
+                    Class::IN,
+                    Ttl::from_secs(300),
+                    A::from_octets(192, 0, 2, 1),
+                ))
+                .unwrap();
+            let mut additional = expected_response.additional();
+            if edns {
+                additional
+                    .opt(|opt| {
+                        opt.set_udp_payload_size(1232);
+                        opt.padding(8)?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let expected_response = additional.into_message().into_octets();
+            let upstream_response = expected_response.clone();
+            let expected_query = query.clone();
+            let peer = tokio::spawn(async move {
+                // Receive the query forwarded by the DoQ server.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut prefix = [0; 2];
+                stream.read_exact(&mut prefix).await.unwrap();
+                let mut received =
+                    vec![0; usize::from(u16::from_be_bytes(prefix))];
+                stream.read_exact(&mut received).await.unwrap();
+                // Ignore the new upstream ID; all other query bytes must match.
+                let mut expected = expected_query.to_vec();
+                expected[..2].copy_from_slice(&received[..2]);
+                assert_eq!(received, expected);
+
+                // The TCP upstream replies with the forwarded query ID.
+                let mut response = upstream_response.to_vec();
+                response[..2].copy_from_slice(&received[..2]);
+                // Return one complete TCP frame to the DoQ server.
+                let mut framed = Vec::with_capacity(2 + response.len());
+                framed.extend_from_slice(
+                    &u16::try_from(response.len()).unwrap().to_be_bytes(),
+                );
+                framed.extend_from_slice(&response);
+                stream.write_all(&framed).await.unwrap();
+            });
+
+            // Send a client query to the DoQ server and collect its events.
+            let mut events = send_raw_query(server_addr, &query).await;
+            tokio::time::timeout(TEST_TIMEOUT, peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(events.len(), 2);
+            // The DoQ client receives the response forwarded by the server.
+            let quiche::doq::Event::Response { data } = events.remove(0) else {
+                panic!("expected DoQ response");
+            };
+            // Compare the received DoQ bytes with the expected response.
+            assert_eq!(&data[..], &expected_response[..]);
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_failures_map_to_terminal_servfail() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Malformed,
+            Mismatched,
+            MissingAnswer,
+            PrefixEof,
+            BodyEof,
+            Timeout,
+        }
+
+        // Cover invalid replies, incomplete TCP frames, and no reply.
+        for failure in [
+            Failure::Malformed,
+            Failure::Mismatched,
+            Failure::MissingAnswer,
+            Failure::PrefixEof,
+            Failure::BodyEof,
+            Failure::Timeout,
+        ] {
+            for edns in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream =
+                    Arc::new(TcpUpstream::new(listener.local_addr().unwrap()));
+                let config = if matches!(failure, Failure::Timeout) {
+                    ServerConfig {
+                        transaction_timeout: Duration::from_millis(100),
+                        ..ServerConfig::default()
+                    }
+                } else {
+                    ServerConfig::default()
+                };
+                let (server_addr, server_task) =
+                    start_server(upstream, config, 1).await;
+                let peer = tokio::spawn(async move {
+                    // Read the query forwarded by the DoQ server.
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut prefix = [0; 2];
+                    stream.read_exact(&mut prefix).await.unwrap();
+                    let mut query =
+                        vec![0; usize::from(u16::from_be_bytes(prefix))];
+                    stream.read_exact(&mut query).await.unwrap();
+                    match failure {
+                        Failure::Malformed => {
+                            // Send a complete frame with an invalid DNS body.
+                            stream.write_all(&[0, 3, 1, 2, 3]).await.unwrap();
+                        },
+                        Failure::Mismatched | Failure::MissingAnswer => {
+                            let query =
+                                Message::from_octets(Bytes::from(query)).unwrap();
+                            let mut response = MessageBuilder::new_bytes()
+                                .start_answer(&query, Rcode::NOERROR)
+                                .unwrap()
+                                .additional()
+                                .into_message()
+                                .into_octets()
+                                .to_vec();
+                            if matches!(failure, Failure::Mismatched) {
+                                // Change the DNS ID so the reply cannot match.
+                                response[0] ^= 1;
+                            } else {
+                                // Declare an answer record without its bytes.
+                                response[6..8]
+                                    .copy_from_slice(&1u16.to_be_bytes());
+                            }
+                            let prefix = u16::try_from(response.len())
+                                .unwrap()
+                                .to_be_bytes();
+                            let mut framed = prefix.to_vec();
+                            framed.extend_from_slice(&response);
+                            stream.write_all(&framed).await.unwrap();
+                        },
+                        Failure::PrefixEof => {
+                            // Close after one byte of the length prefix.
+                            stream.write_all(&[0]).await.unwrap();
+                        },
+                        Failure::BodyEof => {
+                            // Advertise four body bytes but send only one.
+                            stream.write_all(&[0, 4, 1]).await.unwrap();
+                        },
+                        Failure::Timeout => {
+                            // Keep the connection open past the deadline.
+                            tokio::time::sleep(TEST_TIMEOUT).await;
+                        },
+                    }
+                });
+
+                // The DoQ client sends a query and collects the reply events.
+                let query = test_query(Rtype::A, Opcode::QUERY, edns);
+                let mut events = send_raw_query(server_addr, &query).await;
+                // EOF and timeout get EDE 23 only when the client uses EDNS.
+                let network = matches!(
+                    failure,
+                    Failure::PrefixEof | Failure::BodyEof | Failure::Timeout
+                );
+                assert_eq!(events.len(), 2);
+                assert_dns_response(
+                    events.remove(0),
+                    &query,
+                    Rcode::SERVFAIL,
+                    (network && edns).then_some(ExtendedErrorCode::NETWORK_ERROR),
+                );
+                assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+                if matches!(failure, Failure::Timeout) {
+                    // Stop the peer still waiting past the server deadline.
+                    peer.abort();
+                } else {
+                    tokio::time::timeout(TEST_TIMEOUT, peer)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                tokio::time::timeout(TEST_TIMEOUT, server_task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
         }
     }
 

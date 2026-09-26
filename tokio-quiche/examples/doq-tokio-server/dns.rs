@@ -255,6 +255,15 @@ impl DoqDnsResponse<Bytes> {
             return Err(DnsError::InvalidResponse);
         }
 
+        let Ok(additional) = response.additional() else {
+            return Err(DnsError::InvalidResponse);
+        };
+        for record in additional {
+            if record.is_err() {
+                return Err(DnsError::InvalidResponse);
+            }
+        }
+
         // RFC 9250, Section 4.2.1: "When forwarding a DNS message from another
         // transport over DoQ, the Message ID MUST be set to 0."
         // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
@@ -294,7 +303,7 @@ impl DoqDnsResponse<Bytes> {
         Self::try_from(builder_from_msg_without_opt(&self.0)?.into_message())
     }
 
-    /// Return whether this response requires retrying over TCP.
+    /// Return whether this response has the TC bit set.
     pub(crate) fn is_truncated(&self) -> bool {
         self.0.header().tc()
     }
@@ -337,6 +346,7 @@ mod tests {
     use bytes::Bytes;
     use domain::base::iana::Class;
     use domain::base::iana::OptRcode;
+    use domain::base::HeaderCounts;
     use domain::base::Record;
     use domain::base::Ttl;
     use domain::rdata::A;
@@ -614,5 +624,42 @@ mod tests {
             .additional()
             .into_message();
         assert!(DoqDnsResponse::from_upstream(response, &upstream_query).is_err());
+    }
+
+    #[test]
+    fn rejects_response_with_missing_declared_record() {
+        let query = Message::from_octets(query(0, Rtype::A)).unwrap();
+        // Build a valid response with a question and no records.
+        let response = MessageBuilder::new_bytes()
+            .start_answer(&query, Rcode::NOERROR)
+            .unwrap()
+            .additional()
+            .into_message()
+            .into_octets();
+
+        // Three cases: missing answer, authority, or additional record.
+        let assert_rejected = |malformed: Vec<u8>| {
+            assert!(matches!(
+                DoqDnsResponse::from_upstream_bytes(
+                    Bytes::from(malformed),
+                    &query
+                ),
+                Err(DnsError::InvalidResponse)
+            ));
+        };
+
+        let mut missing_answer = response.to_vec();
+        HeaderCounts::for_message_slice_mut(&mut missing_answer).set_ancount(1);
+        assert_rejected(missing_answer);
+
+        let mut missing_authority = response.to_vec();
+        HeaderCounts::for_message_slice_mut(&mut missing_authority)
+            .set_nscount(1);
+        assert_rejected(missing_authority);
+
+        let mut missing_additional = response.to_vec();
+        HeaderCounts::for_message_slice_mut(&mut missing_additional)
+            .set_arcount(1);
+        assert_rejected(missing_additional);
     }
 }
