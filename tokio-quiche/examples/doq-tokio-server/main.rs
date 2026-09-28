@@ -75,7 +75,8 @@ struct Args {
     #[arg(long)]
     upstream_address: SocketAddr,
 
-    /// Transport used for ordinary upstream DNS queries.
+    /// Transport used for ordinary upstream DNS queries. UDP retries a valid
+    /// truncated response over TCP.
     #[arg(long, value_enum, default_value_t = UpstreamProtocol::Udp)]
     upstream_protocol: UpstreamProtocol,
 

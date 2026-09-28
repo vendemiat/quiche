@@ -26,6 +26,10 @@
 
 //! Per-query deadline, cancellation, and response forwarding state.
 
+use std::any::Any;
+use std::sync::Arc;
+use std::time::Duration;
+
 use bytes::Bytes;
 use domain::base::iana::Rcode;
 use domain::base::opt::exterr::ExtendedError;
@@ -33,12 +37,13 @@ use domain::base::Message;
 use tokio::time::Instant;
 use tokio_quiche::doq::DoqResponder;
 
-use crate::config::ServerConfig;
 use crate::dns::DnsError;
 use crate::dns::DoqDnsQuery;
 use crate::dns::DoqDnsResponse;
 use crate::upstream::ResponseItem;
 use crate::upstream::ResponseSequence;
+use crate::upstream::TcpUpstream;
+use crate::upstream::UdpUpstream;
 use crate::upstream::Upstream;
 use crate::upstream::UpstreamError;
 
@@ -47,20 +52,24 @@ pub(crate) struct Request {
     deadline: Instant,
     /// Keep the original DoQ query for terminal responses.
     client_query: DoqDnsQuery<Bytes>,
+    /// Upstream of the current attempt.
+    upstream: Arc<dyn Upstream>,
+    /// Query of the current upstream attempt.
     upstream_query: Message<Bytes>,
 }
 
 impl Request {
-    /// Start a request for `upstream` using the monotonic Tokio clock.
-    pub(crate) fn start(
-        config: &ServerConfig, query: DoqDnsQuery<Bytes>, upstream: &dyn Upstream,
+    /// Create a request for `upstream` that expires `timeout` after now on the
+    /// monotonic Tokio clock.
+    pub(crate) fn new(
+        timeout: Duration, query: DoqDnsQuery<Bytes>, upstream: Arc<dyn Upstream>,
     ) -> Result<Self, DnsError> {
-        let started_at = Instant::now();
-        let deadline = started_at + config.transaction_timeout;
+        let deadline = Instant::now() + timeout;
         let upstream_query = upstream.prepare_query(&query)?;
         Ok(Self {
             deadline,
             client_query: query,
+            upstream,
             upstream_query,
         })
     }
@@ -77,14 +86,14 @@ impl Request {
         now >= self.deadline
     }
 
-    /// Resolve the request before its absolute deadline.
-    pub(crate) async fn resolve(
-        &self, upstream: &dyn Upstream, responder: &DoqResponder,
+    /// Resolve the current upstream query before the absolute deadline.
+    async fn resolve(
+        &self, responder: &DoqResponder,
     ) -> Result<ResponseSequence, UpstreamError> {
         tokio::select! {
             result = tokio::time::timeout_at(
                 self.deadline,
-                upstream.resolve(&self.upstream_query),
+                self.upstream.resolve(&self.upstream_query),
             ) => {
                 Ok(result??)
             },
@@ -93,38 +102,68 @@ impl Request {
     }
 
     /// Resolve and forward all upstream responses for this request.
+    ///
+    /// A correlated truncated response from a UDP upstream is discarded. A TCP
+    /// upstream at the same address then resolves a new upstream query with a
+    /// fresh ID. Both attempts share the request deadline and stop when the
+    /// DoQ stream closes.
     pub(crate) async fn respond(
-        &self, upstream: &dyn Upstream, responder: &DoqResponder,
+        &mut self, responder: &DoqResponder,
     ) -> Result<(), UpstreamError> {
-        let mut responses = self.resolve(upstream, responder).await?;
-        loop {
-            let response = tokio::select! {
-                result = tokio::time::timeout_at(self.deadline, responses.next()) => {
-                result??
-            },
-            _ = responder.closed() => return Err(UpstreamError::Cancelled),
-            };
-            let (data, fin) = match response {
-                ResponseItem::More(data) => (data, false),
-                ResponseItem::Final(data) => (data, true),
-            };
-            if !self.upstream_query.is_xfr() && !fin {
-                return Err(UpstreamError::InvalidResponseSequence(
-                    DnsError::InvalidResponse,
-                ));
-            }
-            let data = self.validate_upstream_response(data, upstream)?;
-
-            tokio::select! {
-                result = responder.send(data.into_bytes(), fin) => {
-                    if result.is_err() {
-                        return Ok(());
-                    }
+        'attempt: loop {
+            let mut responses = self.resolve(responder).await?;
+            loop {
+                let response = tokio::select! {
+                    result = tokio::time::timeout_at(self.deadline, responses.next()) => {
+                    result??
                 },
-            _ = responder.closed() => return Err(UpstreamError::Cancelled),
-            }
-            if fin {
-                return Ok(());
+                _ = responder.closed() => return Err(UpstreamError::Cancelled),
+                };
+                let (data, fin) = match response {
+                    ResponseItem::More(data) => (data, false),
+                    ResponseItem::Final(data) => (data, true),
+                };
+                if !self.upstream_query.is_xfr() && !fin {
+                    return Err(UpstreamError::InvalidResponseSequence(
+                        DnsError::InvalidResponse,
+                    ));
+                }
+                let response = DoqDnsResponse::from_upstream_bytes(
+                    data,
+                    &self.upstream_query,
+                )?;
+                if response.is_truncated() {
+                    // Retry only from a UDP upstream. Forward a truncated TCP
+                    // response.
+                    if let Some(udp) = (self.upstream.as_ref() as &dyn Any)
+                        .downcast_ref::<UdpUpstream>()
+                    {
+                        // RFC 1123, Section 6.1.3.2: "If the Answer section of
+                        // the response is truncated and if the requester
+                        // supports TCP, it SHOULD try the query again using
+                        // TCP."
+                        // https://datatracker.ietf.org/doc/html/rfc1123#section-6.1.3.2
+                        let tcp = TcpUpstream::from(udp);
+                        self.upstream_query =
+                            tcp.prepare_query(&self.client_query)?;
+                        self.upstream = Arc::new(tcp);
+                        continue 'attempt;
+                    }
+                }
+                let data =
+                    response.prepare_client_response(&self.client_query)?;
+
+                tokio::select! {
+                    result = responder.send(data.into_bytes(), fin) => {
+                        if result.is_err() {
+                            return Ok(());
+                        }
+                    },
+                _ = responder.closed() => return Err(UpstreamError::Cancelled),
+                }
+                if fin {
+                    return Ok(());
+                }
             }
         }
     }
@@ -135,27 +174,16 @@ impl Request {
     ) -> Result<DoqDnsResponse<Bytes>, DnsError> {
         self.client_query.failed_reponse(rcode, ede)
     }
-
-    fn validate_upstream_response(
-        &self, data: Bytes, upstream: &dyn Upstream,
-    ) -> Result<DoqDnsResponse<Bytes>, UpstreamError> {
-        let response =
-            DoqDnsResponse::from_upstream_bytes(data, &self.upstream_query)?;
-        if response.is_truncated() && upstream.should_retry_tc() {
-            return Err(UpstreamError::TcpRetryRequired);
-        }
-        Ok(response.prepare_client_response(&self.client_query)?)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
     use crate::upstream::UdpUpstream;
     use domain::base::iana::Rtype;
     use domain::base::Message;
     use domain::base::MessageBuilder;
-    use std::time::Duration;
     use tokio::net::UdpSocket;
 
     fn query() -> DoqDnsQuery<Bytes> {
@@ -172,22 +200,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn deadline_is_based_on_configured_timeout() {
-        let config = ServerConfig {
-            transaction_timeout: Duration::from_secs(5),
-            ..ServerConfig::default()
-        };
-        let request = Request::start(&config, query(), &upstream()).unwrap();
+        let timeout = Duration::from_secs(5);
+        let request =
+            Request::new(timeout, query(), Arc::new(upstream())).unwrap();
         assert!(!request.is_expired(Instant::now()));
-        tokio::time::advance(config.transaction_timeout).await;
+        tokio::time::advance(timeout).await;
         assert!(request.is_expired(request.deadline()));
     }
 
     #[tokio::test]
-    async fn udp_truncated_response_requires_tcp_retry() {
+    async fn udp_truncated_response_is_correlated() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream = UdpUpstream::new(socket.local_addr().unwrap());
-        let request =
-            Request::start(&ServerConfig::default(), query(), &upstream).unwrap();
+        let upstream = Arc::new(UdpUpstream::new(socket.local_addr().unwrap()));
+        let request = Request::new(
+            ServerConfig::default().transaction_timeout,
+            query(),
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+        )
+        .unwrap();
         let response_task = tokio::spawn(async move {
             let mut buffer = [0; 1400];
             let (len, peer) = tokio::time::timeout(
@@ -225,10 +255,12 @@ mod tests {
         else {
             panic!("UDP adapter should return a final response");
         };
-        assert!(matches!(
-            request.validate_upstream_response(response, &upstream),
-            Err(UpstreamError::TcpRetryRequired)
-        ));
+        let response = DoqDnsResponse::from_upstream_bytes(
+            response,
+            &request.upstream_query,
+        )
+        .unwrap();
+        assert!(response.is_truncated());
         tokio::time::timeout(Duration::from_secs(5), response_task)
             .await
             .expect("UDP response task should finish")
