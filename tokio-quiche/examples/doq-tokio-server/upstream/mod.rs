@@ -28,6 +28,7 @@
 
 mod tcp;
 
+use std::any::Any;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -143,26 +144,18 @@ pub(crate) enum UpstreamError {
     #[error("upstream DNS query exceeds the 65535-byte message limit")]
     QueryTooLarge,
 
-    #[error("upstream response requires TCP retry")]
-    TcpRetryRequired,
-
     #[error("downstream request cancelled")]
     Cancelled,
 }
 
 /// The resolver interface used by the transaction layer.
-pub(crate) trait Upstream: Send + Sync {
+pub(crate) trait Upstream: Any + Send + Sync {
     /// Build the query that this upstream sends and validates responses
     /// against.
     fn prepare_query(
         &self, query: &DoqDnsQuery<Bytes>,
     ) -> Result<Message<Bytes>, DnsError> {
         query.prepare_upstream_query(None)
-    }
-
-    /// Whether a correlated truncated response needs a TCP retry.
-    fn should_retry_tc(&self) -> bool {
-        false
     }
 
     /// Start resolving one DNS request.
@@ -189,15 +182,18 @@ impl UdpUpstream {
     }
 }
 
+/// Build the TCP upstream at the same address as the UDP upstream.
+impl From<&UdpUpstream> for TcpUpstream {
+    fn from(udp: &UdpUpstream) -> Self {
+        TcpUpstream::new(udp.address)
+    }
+}
+
 impl Upstream for UdpUpstream {
     fn prepare_query(
         &self, query: &DoqDnsQuery<Bytes>,
     ) -> Result<Message<Bytes>, DnsError> {
         query.prepare_upstream_query(Some(MAX_DNS_UDP_BUFFER_SIZE))
-    }
-
-    fn should_retry_tc(&self) -> bool {
-        true
     }
 
     fn resolve<'a>(

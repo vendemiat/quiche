@@ -121,15 +121,18 @@ pub(crate) async fn serve(
             let config = config.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let request =
-                    match Request::start(&config, query, upstream.as_ref()) {
-                        Ok(request) => request,
-                        Err(_) => {
-                            send_terminal(responder, Err(())).await;
-                            return;
-                        },
-                    };
-                match request.respond(upstream.as_ref(), &responder).await {
+                let mut request = match Request::new(
+                    config.transaction_timeout,
+                    query,
+                    upstream,
+                ) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        send_terminal(responder, Err(())).await;
+                        return;
+                    },
+                };
+                match request.respond(&responder).await {
                     Ok(()) => {},
                     Err(UpstreamError::Cancelled) => {},
                     Err(error) => {
@@ -219,6 +222,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -919,6 +924,92 @@ mod tests {
         }
     }
 
+    /// Bind a UDP socket and a TCP listener to the same loopback port.
+    ///
+    /// The TCP listener is nonblocking, so `accept` reports a pending
+    /// connection without waiting.
+    async fn bind_udp_and_tcp() -> (UdpSocket, std::net::TcpListener) {
+        loop {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let Ok(listener) =
+                std::net::TcpListener::bind(socket.local_addr().unwrap())
+            else {
+                continue;
+            };
+            listener.set_nonblocking(true).unwrap();
+            return (socket, listener);
+        }
+    }
+
+    /// Assert that no TCP connection waits on `listener`.
+    fn assert_no_tcp_connection(listener: &std::net::TcpListener) {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// Receive one UDP upstream query and the address that sent it.
+    async fn recv_udp_query(socket: &UdpSocket) -> (Message<Bytes>, SocketAddr) {
+        let mut buffer = vec![0; 1400];
+        let (len, peer) =
+            tokio::time::timeout(TEST_TIMEOUT, socket.recv_from(&mut buffer))
+                .await
+                .expect("UDP upstream should receive the query")
+                .unwrap();
+        buffer.truncate(len);
+        (Message::from_octets(Bytes::from(buffer)).unwrap(), peer)
+    }
+
+    /// Accept one TCP upstream connection.
+    async fn accept_tcp(listener: &TcpListener) -> TcpStream {
+        let (stream, _) = tokio::time::timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("TCP upstream should accept a connection")
+            .unwrap();
+        stream
+    }
+
+    /// Read one length-prefixed DNS query from a TCP upstream connection.
+    async fn read_tcp_query(stream: &mut TcpStream) -> Message<Bytes> {
+        let mut prefix = [0; 2];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut query = vec![0; usize::from(u16::from_be_bytes(prefix))];
+        stream.read_exact(&mut query).await.unwrap();
+        Message::from_octets(Bytes::from(query)).unwrap()
+    }
+
+    /// Write one length-prefixed DNS response to a TCP upstream connection.
+    async fn write_tcp_response(stream: &mut TcpStream, response: &[u8]) {
+        let mut framed = u16::try_from(response.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        framed.extend_from_slice(response);
+        stream.write_all(&framed).await.unwrap();
+    }
+
+    /// Wait until the peer closes a TCP upstream connection.
+    async fn assert_tcp_closed(stream: &mut TcpStream) {
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut byte))
+                .await
+                .expect("TCP upstream connection should close")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Build an empty NOERROR response to `query` with the given TC bit.
+    fn answer_with_tc(query: &Message<Bytes>, tc: bool) -> Bytes {
+        let mut answer = MessageBuilder::new_bytes()
+            .start_answer(query, Rcode::NOERROR)
+            .unwrap();
+        answer.header_mut().set_tc(tc);
+        answer.additional().into_message().into_octets()
+    }
+
     /// Start a loopback DoQ listener for the requested number of connections.
     async fn start_server<U: Upstream + 'static>(
         upstream: Arc<U>, config: ServerConfig, connections: usize,
@@ -1489,6 +1580,389 @@ mod tests {
             .unwrap();
         control.close();
 
+        let permit =
+            tokio::time::timeout(TEST_TIMEOUT, concurrent_transactions.acquire())
+                .await
+                .expect("client close should release the transaction permit")
+                .unwrap();
+        drop(permit);
+        tokio::time::timeout(TEST_TIMEOUT, server_task)
+            .await
+            .expect("server should stop after client closes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_response_without_tc_does_not_open_tcp() {
+        // Cover a small response and one that fills the UDP receive buffer.
+        for fill_buffer in [false, true] {
+            let (udp_socket, listener) = bind_udp_and_tcp().await;
+            let upstream =
+                Arc::new(UdpUpstream::new(udp_socket.local_addr().unwrap()));
+            let (server_addr, server_task) =
+                start_server(upstream, ServerConfig::default(), 1).await;
+            let peer = tokio::spawn(async move {
+                let (udp_query, client) = recv_udp_query(&udp_socket).await;
+                let response = if fill_buffer {
+                    let base = large_udp_response(&udp_query, 0);
+                    large_udp_response(
+                        &udp_query,
+                        u16::try_from(1400 - base.len()).unwrap(),
+                    )
+                } else {
+                    answer_with_tc(&udp_query, false)
+                };
+                udp_socket.send_to(&response, client).await.unwrap();
+                response
+            });
+
+            let query = padded_edns_query();
+            let mut events = send_raw_query(server_addr, &query).await;
+            let upstream_response = tokio::time::timeout(TEST_TIMEOUT, peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(upstream_response.len() == 1400, fill_buffer);
+            assert_eq!(events.len(), 2);
+            let quiche::doq::Event::Response { data } = events.remove(0) else {
+                panic!("expected DoQ response");
+            };
+            // The DoQ response is the UDP response with DNS ID zero.
+            let mut expected = upstream_response.to_vec();
+            expected[..2].copy_from_slice(&[0, 0]);
+            assert_eq!(&data[..], &expected[..]);
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_no_tcp_connection(&listener);
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_truncated_udp_response_is_retried_once_over_tcp() {
+        // Cover clients with and without EDNS and a truncated TCP response.
+        for (edns, tcp_tc) in [(false, false), (true, false), (true, true)] {
+            let (udp_socket, listener) = bind_udp_and_tcp().await;
+            let upstream =
+                Arc::new(UdpUpstream::new(udp_socket.local_addr().unwrap()));
+            let (server_addr, server_task) =
+                start_server(upstream, ServerConfig::default(), 1).await;
+            let query = if edns {
+                padded_edns_query()
+            } else {
+                test_query(Rtype::A, Opcode::QUERY, false)
+            };
+            let expected_query = query.clone();
+            let peer = tokio::spawn(async move {
+                let (udp_query, client) = recv_udp_query(&udp_socket).await;
+                udp_socket
+                    .send_to(&answer_with_tc(&udp_query, true), client)
+                    .await
+                    .unwrap();
+
+                let listener = TcpListener::from_std(listener).unwrap();
+                let mut stream = accept_tcp(&listener).await;
+                let tcp_query = read_tcp_query(&mut stream).await;
+                // The TCP query is the client query with only a new ID.
+                let mut expected = expected_query.to_vec();
+                expected[..2].copy_from_slice(&tcp_query.as_slice()[..2]);
+                assert_eq!(tcp_query.as_slice(), &expected[..]);
+
+                // Answer with more bytes than the UDP receive buffer holds.
+                let mut response = Message::from_octets(
+                    large_udp_response(&tcp_query, 3000).to_vec(),
+                )
+                .unwrap();
+                response.header_mut().set_tc(tcp_tc);
+                let response = response.into_octets();
+                assert!(response.len() > 1400);
+                write_tcp_response(&mut stream, &response).await;
+                (response, listener.into_std().unwrap())
+            });
+
+            let mut events = send_raw_query(server_addr, &query).await;
+            let (upstream_response, listener) =
+                tokio::time::timeout(TEST_TIMEOUT, peer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(events.len(), 2);
+            let quiche::doq::Event::Response { data } = events.remove(0) else {
+                panic!("expected DoQ response");
+            };
+            let response = Message::from_octets(Bytes::from(data)).unwrap();
+            assert_eq!(response.header().id(), 0);
+            assert_eq!(response.header().rcode(), Rcode::NOERROR);
+            assert_eq!(response.header().tc(), tcp_tc);
+            assert!(response.is_answer(&Message::from_octets(query).unwrap()));
+            if edns {
+                let mut expected = upstream_response;
+                expected[..2].copy_from_slice(&[0, 0]);
+                assert_eq!(response.as_slice(), &expected[..]);
+            } else {
+                assert!(response.opt().is_none());
+                assert_eq!(response.header_counts().ancount(), 1);
+            }
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            // The peer task accepted the first TCP connection with
+            // `accept_tcp` and answered the retried query on it. Check that no
+            // second TCP connection waits on the listener.
+            assert_no_tcp_connection(&listener);
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_or_failed_udp_response_does_not_open_tcp() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            WrongId,
+            WrongQuestion,
+            MissingAnswer,
+            Timeout,
+        }
+
+        // Each invalid response sets TC. The timeout case sends no response.
+        for failure in [
+            Failure::WrongId,
+            Failure::WrongQuestion,
+            Failure::MissingAnswer,
+            Failure::Timeout,
+        ] {
+            let (udp_socket, listener) = bind_udp_and_tcp().await;
+            let upstream =
+                Arc::new(UdpUpstream::new(udp_socket.local_addr().unwrap()));
+            let config = if matches!(failure, Failure::Timeout) {
+                ServerConfig {
+                    transaction_timeout: Duration::from_millis(100),
+                    ..ServerConfig::default()
+                }
+            } else {
+                ServerConfig::default()
+            };
+            let (server_addr, server_task) =
+                start_server(upstream, config, 1).await;
+            let peer = tokio::spawn(async move {
+                let (udp_query, client) = recv_udp_query(&udp_socket).await;
+                let response = match failure {
+                    Failure::WrongId => {
+                        let mut answer = MessageBuilder::new_bytes()
+                            .start_answer(&udp_query, Rcode::NOERROR)
+                            .unwrap();
+                        answer
+                            .header_mut()
+                            .set_id(udp_query.header().id().wrapping_add(1));
+                        answer.header_mut().set_tc(true);
+                        answer.additional().into_message().into_octets()
+                    },
+                    Failure::WrongQuestion => {
+                        let other = Message::from_octets(query(
+                            udp_query.header().id(),
+                            Rtype::AAAA,
+                        ))
+                        .unwrap();
+                        answer_with_tc(&other, true)
+                    },
+                    Failure::MissingAnswer => {
+                        let mut response =
+                            answer_with_tc(&udp_query, true).to_vec();
+                        // Declare an answer record without its bytes.
+                        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+                        Bytes::from(response)
+                    },
+                    // Keep the socket open without a response.
+                    Failure::Timeout => return udp_socket,
+                };
+                udp_socket.send_to(&response, client).await.unwrap();
+                udp_socket
+            });
+
+            let query = test_query(Rtype::A, Opcode::QUERY, true);
+            let mut events = send_raw_query(server_addr, &query).await;
+            let _udp_socket = tokio::time::timeout(TEST_TIMEOUT, peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                matches!(failure, Failure::Timeout)
+                    .then_some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_no_tcp_connection(&listener);
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tcp_retry_sends_terminal_servfail() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Mismatched,
+            Eof,
+            Deadline,
+        }
+
+        const TRANSACTION_TIMEOUT: Duration = Duration::from_millis(600);
+        const UDP_DELAY: Duration = Duration::from_millis(300);
+
+        for failure in [Failure::Mismatched, Failure::Eof, Failure::Deadline] {
+            let (udp_socket, listener) = bind_udp_and_tcp().await;
+            let upstream =
+                Arc::new(UdpUpstream::new(udp_socket.local_addr().unwrap()));
+            let config = if matches!(failure, Failure::Deadline) {
+                ServerConfig {
+                    transaction_timeout: TRANSACTION_TIMEOUT,
+                    ..ServerConfig::default()
+                }
+            } else {
+                ServerConfig::default()
+            };
+            let (server_addr, server_task) =
+                start_server(upstream, config, 1).await;
+            let peer = tokio::spawn(async move {
+                let (udp_query, client) = recv_udp_query(&udp_socket).await;
+                if matches!(failure, Failure::Deadline) {
+                    // Use part of the deadline before the TCP retry starts.
+                    tokio::time::sleep(UDP_DELAY).await;
+                }
+                udp_socket
+                    .send_to(&answer_with_tc(&udp_query, true), client)
+                    .await
+                    .unwrap();
+
+                let listener = TcpListener::from_std(listener).unwrap();
+                let mut stream = accept_tcp(&listener).await;
+                let accepted_at = Instant::now();
+                let tcp_query = read_tcp_query(&mut stream).await;
+                match failure {
+                    Failure::Mismatched => {
+                        let mut response =
+                            answer_with_tc(&tcp_query, false).to_vec();
+                        // Change the DNS ID so the reply cannot match.
+                        response[0] ^= 1;
+                        write_tcp_response(&mut stream, &response).await;
+                    },
+                    Failure::Eof => drop(stream),
+                    Failure::Deadline => {
+                        // A restarted timeout would keep the retry open for
+                        // the full transaction timeout.
+                        assert_tcp_closed(&mut stream).await;
+                        assert!(
+                            accepted_at.elapsed() <
+                                TRANSACTION_TIMEOUT - UDP_DELAY / 2
+                        );
+                    },
+                }
+                listener.into_std().unwrap()
+            });
+
+            let query = test_query(Rtype::A, Opcode::QUERY, true);
+            let mut events = send_raw_query(server_addr, &query).await;
+            let listener = tokio::time::timeout(TEST_TIMEOUT, peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(events.len(), 2);
+            assert_dns_response(
+                events.remove(0),
+                &query,
+                Rcode::SERVFAIL,
+                (!matches!(failure, Failure::Mismatched))
+                    .then_some(ExtendedErrorCode::NETWORK_ERROR),
+            );
+            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_no_tcp_connection(&listener);
+            tokio::time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// Check that a client close during a TCP retry cancels the retry and
+    /// releases the transaction permit.
+    ///
+    /// The UDP peer answers with TC=1, so the server retries over TCP. The TCP
+    /// peer reads the retried query but never answers it. The client then
+    /// closes the connection while the retry is in flight.
+    #[tokio::test]
+    async fn closing_client_cancels_tcp_retry_and_releases_capacity() {
+        let (udp_socket, listener) = bind_udp_and_tcp().await;
+        let upstream =
+            Arc::new(UdpUpstream::new(udp_socket.local_addr().unwrap()));
+        // Allow one transaction. A permit that the request does not release
+        // blocks the `acquire` at the end of the test.
+        let config = ServerConfig {
+            concurrent_transactions: Arc::new(Semaphore::new(1)),
+            ..ServerConfig::default()
+        };
+        let concurrent_transactions = Arc::clone(&config.concurrent_transactions);
+        let (server_addr, server_task) = start_server(upstream, config, 1).await;
+        let (retry_tx, retry_rx) = oneshot::channel();
+        // Answer the UDP query with TC=1. Accept the TCP retry and read its
+        // query, but do not answer it.
+        let peer = tokio::spawn(async move {
+            let (udp_query, client) = recv_udp_query(&udp_socket).await;
+            udp_socket
+                .send_to(&answer_with_tc(&udp_query, true), client)
+                .await
+                .unwrap();
+            let listener = TcpListener::from_std(listener).unwrap();
+            let mut stream = accept_tcp(&listener).await;
+            read_tcp_query(&mut stream).await;
+            // Tell the test that the TCP retry is in flight.
+            retry_tx.send(()).unwrap();
+            // Cancellation closes the TCP retry connection.
+            assert_tcp_closed(&mut stream).await;
+        });
+
+        // `QueryClient` sends one query when the connection is established.
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_socket.connect(server_addr).await.unwrap();
+        let (client, control) = QueryClient::new();
+        let mut client_settings = doq_settings(true);
+        client_settings.verify_peer = false;
+        let _connection = tokio::time::timeout_at(
+            deadline,
+            connect_with_config(
+                Socket::try_from(client_socket).unwrap(),
+                Some("localhost"),
+                &ConnectionParams::new_client(
+                    client_settings,
+                    None,
+                    Hooks::default(),
+                ),
+                client,
+            ),
+        )
+        .await
+        .expect("client connection should complete")
+        .unwrap();
+        // Close the client only after the TCP retry starts.
+        tokio::time::timeout_at(deadline, retry_rx)
+            .await
+            .expect("truncated UDP response should start the TCP retry")
+            .unwrap();
+        control.close();
+
+        tokio::time::timeout(TEST_TIMEOUT, peer)
+            .await
+            .unwrap()
+            .unwrap();
+        // The only permit is free only if the cancelled request released it.
         let permit =
             tokio::time::timeout(TEST_TIMEOUT, concurrent_transactions.acquire())
                 .await
