@@ -130,6 +130,9 @@ where
 
     /// The error code received via STOP_SENDING.
     error: Option<u64>,
+
+    /// Whether the STOP_SENDING error was returned to the application.
+    error_reported: bool,
 }
 
 impl<F: BufFactory> SendBuf<F> {
@@ -543,6 +546,14 @@ impl<F: BufFactory> SendBuf<F> {
     /// Returns true if the stream was stopped before completion.
     pub fn is_stopped(&self) -> bool {
         self.error.is_some()
+    }
+
+    pub fn has_unreported_stop(&self) -> bool {
+        self.error.is_some() && !self.error_reported
+    }
+
+    pub fn mark_stop_reported(&mut self) {
+        self.error_reported = true;
     }
 
     /// Returns true if the stream was shut down.

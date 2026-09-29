@@ -3731,6 +3731,186 @@ fn stop_sending_fin(
 }
 
 #[rstest]
+fn stop_sending_recv_completion_preserves_unreported_error(
+    #[values(true, false)] discard: bool,
+    #[values(true, false)] stop_first: bool,
+    #[values("data_fin", "empty_fin", "reset")] receive_end: &str,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let stop = frame::Frame::StopSending {
+        stream_id: 0,
+        error_code: 42,
+    };
+    let receive = match receive_end {
+        "data_fin" => frame::Frame::Stream {
+            stream_id: 0,
+            data: RangeBuf::from(b"req", 0, true),
+        },
+
+        "empty_fin" => frame::Frame::Stream {
+            stream_id: 0,
+            data: RangeBuf::from(b"", 0, true),
+        },
+
+        "reset" => frame::Frame::ResetStream {
+            stream_id: 0,
+            error_code: 77,
+            final_size: 0,
+        },
+
+        _ => unreachable!(),
+    };
+    let frames = if stop_first {
+        [stop, receive]
+    } else {
+        [receive, stop]
+    };
+    let written =
+        test_utils::encode_pkt(&mut pipe.client, Type::Short, &frames, &mut buf)
+            .unwrap();
+    assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
+
+    let expected = match receive_end {
+        "data_fin" => Ok((3, true)),
+        "empty_fin" => Ok((0, true)),
+        "reset" => Err(Error::StreamReset(77)),
+        _ => unreachable!(),
+    };
+    assert_eq!(stream_recv_discard(&mut pipe.server, discard, 0), expected);
+    assert_eq!(pipe.server.streams.len(), 1);
+
+    assert_eq!(
+        pipe.server.stream_capacity(0),
+        Err(Error::StreamStopped(42))
+    );
+    assert_eq!(pipe.server.streams.len(), 0);
+    assert!(pipe.server.streams.is_collected(0));
+}
+
+#[rstest]
+fn stop_sending_writable_with_no_connection_capacity(
+    #[values(true, false)] flow_control_blocked: bool,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_send(0, b"req", false), Ok(3));
+    assert_eq!(pipe.client.stream_send(4, b"req", false), Ok(3));
+    assert_eq!(pipe.client.stream_send(8, b"req", false), Ok(3));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let stop = [
+        frame::Frame::StopSending {
+            stream_id: 0,
+            error_code: 42,
+        },
+        frame::Frame::StopSending {
+            stream_id: 8,
+            error_code: 43,
+        },
+    ];
+    let written =
+        test_utils::encode_pkt(&mut pipe.client, Type::Short, &stop, &mut buf)
+            .unwrap();
+    assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
+    assert_eq!(pipe.server.stream_priority(0, 42, false), Ok(()));
+    assert_eq!(pipe.server.stream_priority(8, 10, false), Ok(()));
+
+    if flow_control_blocked {
+        pipe.server.max_tx_data = pipe.server.tx_data;
+        pipe.server.update_tx_cap();
+    } else {
+        assert!(pipe.server.max_tx_data > pipe.server.tx_data);
+        pipe.server.tx_cap = 0;
+    }
+    assert_eq!(pipe.server.tx_cap, 0);
+
+    assert_eq!(pipe.server.writable().collect::<Vec<_>>(), vec![8, 0]);
+    assert_eq!(pipe.server.stream_writable_next(), Some(8));
+    assert_eq!(pipe.server.writable().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(pipe.server.stream_writable_next(), Some(0));
+    assert_eq!(pipe.server.stream_writable_next(), None);
+    assert_eq!(pipe.server.writable().next(), None);
+    assert_eq!(
+        pipe.server.stream_capacity(0),
+        Err(Error::StreamStopped(42))
+    );
+    assert_eq!(
+        pipe.server.stream_capacity(8),
+        Err(Error::StreamStopped(43))
+    );
+}
+
+#[rstest]
+fn stop_sending_implicitly_opened_local_stream(#[values(0, 2)] stream_id: u64) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(
+        pipe.client.stream_send(stream_id + 4, b"data", false),
+        Ok(4)
+    );
+    assert!(pipe.client.streams.get(stream_id).is_none());
+
+    let stop = [frame::Frame::StopSending {
+        stream_id,
+        error_code: 42,
+    }];
+    let written =
+        test_utils::encode_pkt(&mut pipe.server, Type::Short, &stop, &mut buf)
+            .unwrap();
+    assert_eq!(pipe.client_recv(&mut buf[..written]), Ok(written));
+    assert_eq!(
+        pipe.client.stream_capacity(stream_id),
+        Err(Error::StreamStopped(42))
+    );
+
+    if stream_id == 2 {
+        assert!(pipe.client.streams.is_collected(stream_id));
+        let written = test_utils::encode_pkt(
+            &mut pipe.server,
+            Type::Short,
+            &stop,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(pipe.client_recv(&mut buf[..written]), Ok(written));
+        assert!(pipe.client.streams.is_collected(stream_id));
+    } else {
+        assert!(pipe.client.streams.get(stream_id).is_some());
+    }
+}
+
+#[rstest]
+fn stop_sending_unopened_local_stream_rejected(
+    #[values(2, 3, 8)] stream_id: u64,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_send(4, b"data", false), Ok(4));
+
+    let stop = [frame::Frame::StopSending {
+        stream_id,
+        error_code: 42,
+    }];
+    let written =
+        test_utils::encode_pkt(&mut pipe.server, Type::Short, &stop, &mut buf)
+            .unwrap();
+    assert_eq!(
+        pipe.client_recv(&mut buf[..written]),
+        Err(Error::InvalidStreamState(stream_id))
+    );
+    assert!(pipe.client.streams.get(stream_id).is_none());
+}
+
+#[rstest]
 /// Tests that resetting a stream restores flow control for unsent data.
 fn stop_sending_unsent_tx_cap(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
@@ -4109,6 +4289,18 @@ fn stream_shutdown_read(
         pipe.client.stream_send(4, b"bye", false),
         Err(Error::StreamStopped(42))
     );
+    assert_eq!(pipe.client.streams.len(), 1);
+    assert!(!pipe.client.writable().any(|id| id == 4));
+
+    // A duplicate STOP must not replace the reported code or rearm readiness.
+    pipe.server.streams.insert_stopped(4, 99);
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    assert_eq!(
+        pipe.client.stream_capacity(4),
+        Err(Error::StreamStopped(42))
+    );
+    assert!(!pipe.client.writable().any(|id| id == 4));
 
     // Server sends some data, without reading the incoming data, and closes
     // the stream.
@@ -12253,6 +12445,9 @@ fn stop_sending_signal_survives_writable_unlink_before_ack() {
     assert_eq!(pipe.client.stream_send(0, b"req", true), Ok(3));
     assert_eq!(pipe.advance(), Ok(()));
     assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((3, true)));
+    // Ordinary readiness can be consumed before STOP arrives.
+    assert_eq!(pipe.server.stream_writable_next(), Some(0));
+    assert_eq!(pipe.server.stream_writable_next(), None);
 
     // Client no longer wants the response and sends STOP_SENDING. Deliver
     // only that packet to the server, without letting the server's
@@ -12261,9 +12456,10 @@ fn stop_sending_signal_survives_writable_unlink_before_ack() {
     let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
     test_utils::process_flight(&mut pipe.server, flight).unwrap();
 
-    // The application polls the stream as writable, which unlinks it from
-    // the writable queue, before sending anything on it. This mirrors an
-    // async driver's write loop running before the RESET_STREAM ack.
+    // STOP restores the queue entry even though the stream was writable.
+    assert_eq!(pipe.server.writable().collect::<Vec<_>>(), vec![0]);
+
+    // Polling the stopped entry unlinks it without consuming the error.
     assert_eq!(pipe.server.stream_writable_next(), Some(0));
 
     // Let the RESET_STREAM reach the client and its ack come back to the

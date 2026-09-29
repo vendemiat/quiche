@@ -3648,38 +3648,10 @@ impl<F: BufFactory> Connection<F> {
 
                         let dropped = stream.send.ack_and_drop(offset, length);
 
-                        // Only collect the stream if it is complete and not
-                        // readable or stopped.
-                        //
-                        // If it is readable, it will get collected when
-                        // stream_recv() is next used.
-                        //
-                        // If the stream has been stopped by the peer (i.e. a
-                        // STOP_SENDING frame is received), before collecting
-                        // the stream we need to propagate the
-                        // `StreamStopped` error to the application. It will
-                        // instead get collected when one of stream_capacity(),
-                        // stream_writable(), stream_send(), ... is next called.
-                        //
-                        // Note that we can't use `is_writable()` here because
-                        // it returns false if the stream is stopped. Instead,
-                        // we check `stream.send.is_stopped()` directly. We
-                        // can't check the writable queue instead:
-                        // `stream_writable_next()` unlinks the stream from
-                        // the writable queue on its very next poll, which
-                        // happens every `IoWorker` iteration before any
-                        // network round trip completes. By the time an ack
-                        // for a stopped stream arrives, the stream is
-                        // already unlinked from the writable queue
-                        // regardless of whether the app observed it as
-                        // writable.
-                        let is_complete = stream.is_complete();
-                        let is_readable = stream.is_readable();
-
-                        if is_complete &&
-                            !is_readable &&
-                            !stream.send.is_stopped()
-                        {
+                        // A stopped stream remains until its error has been
+                        // returned by a write or capacity query. Writable
+                        // polling alone does not report the error.
+                        if stream.is_collectable() {
                             let local = stream.local;
                             self.streams.collect(stream_id, local);
                         }
@@ -3707,38 +3679,8 @@ impl<F: BufFactory> Connection<F> {
                             None => continue,
                         };
 
-                        // Only collect the stream if it is complete and not
-                        // readable or stopped.
-                        //
-                        // If it is readable, it will get collected when
-                        // stream_recv() is next used.
-                        //
-                        // If the stream has been stopped by the peer (i.e. a
-                        // STOP_SENDING frame is received), before collecting
-                        // the stream we need to propagate the
-                        // `StreamStopped` error to the application. It will
-                        // instead get collected when one of stream_capacity(),
-                        // stream_writable(), stream_send(), ... is next called.
-                        //
-                        // Note that we can't use `is_writable()` here because
-                        // it returns false if the stream is stopped. Instead,
-                        // we check `stream.send.is_stopped()` directly. We
-                        // can't check the writable queue instead:
-                        // `stream_writable_next()` unlinks the stream from
-                        // the writable queue on its very next poll, which
-                        // happens every `IoWorker` iteration before any
-                        // network round trip completes. By the time an ack
-                        // for a stopped stream arrives, the stream is
-                        // already unlinked from the writable queue
-                        // regardless of whether the app observed it as
-                        // writable.
-                        let is_complete = stream.is_complete();
-                        let is_readable = stream.is_readable();
-
-                        if is_complete &&
-                            !is_readable &&
-                            !stream.send.is_stopped()
-                        {
+                        // Writable polling alone does not report a stop.
+                        if stream.is_collectable() {
                             let local = stream.local;
                             self.streams.collect(stream_id, local);
                         }
@@ -5860,11 +5802,9 @@ impl<F: BufFactory> Connection<F> {
             Ok(v) => v,
 
             Err(e) => {
-                // Collect the stream if it is now complete. This can happen if
-                // we got a `StreamReset` error which will now be propagated to
-                // the application, so we don't need to keep the stream's state
-                // anymore.
-                if stream.is_complete() {
+                // A StreamReset read completes the receive side, but an
+                // unreported STOP error still needs the send-side state.
+                if stream.is_collectable() {
                     self.streams.collect(stream_id, local);
                 }
 
@@ -5877,7 +5817,7 @@ impl<F: BufFactory> Connection<F> {
 
         let readable = stream.is_readable();
 
-        let complete = stream.is_complete();
+        let collectable = stream.is_collectable();
 
         if stream.recv.almost_full() {
             self.streams.insert_almost_full(stream_id);
@@ -5887,7 +5827,7 @@ impl<F: BufFactory> Connection<F> {
             self.streams.remove_readable(&priority_key);
         }
 
-        if complete {
+        if collectable {
             self.streams.collect(stream_id, local);
         }
 
@@ -6071,26 +6011,13 @@ impl<F: BufFactory> Connection<F> {
 
         let was_flushable = stream.is_flushable();
 
-        let is_complete = stream.is_complete();
-        let is_readable = stream.is_readable();
-
-        let priority_key = Arc::clone(&stream.priority_key);
-
-        // Return early if the stream has been stopped, and collect its state
-        // if complete.
+        // Return the stop before collecting a completed stream.
         if let Err(Error::StreamStopped(e)) = stream.send.cap() {
-            // Only collect the stream if it is complete and not readable.
-            // If it is readable, it will get collected when stream_recv()
-            // is used.
-            //
-            // The stream can't be writable if it has been stopped.
-            if is_complete && !is_readable {
-                let local = stream.local;
-                self.streams.collect(stream_id, local);
-            }
-
+            self.streams.mark_stop_reported(stream_id);
             return Err(Error::StreamStopped(e));
         };
+
+        let priority_key = Arc::clone(&stream.priority_key);
 
         // Truncate the input buffer based on the connection's send capacity if
         // necessary.
@@ -6385,19 +6312,12 @@ impl<F: BufFactory> Connection<F> {
     /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
     #[inline]
     pub fn stream_capacity(&mut self, stream_id: u64) -> Result<usize> {
-        if let Some(stream) = self.streams.get(stream_id) {
+        if let Some(stream) = self.streams.get_mut(stream_id) {
             let stream_cap = match stream.send.cap() {
                 Ok(v) => v,
 
                 Err(Error::StreamStopped(e)) => {
-                    // Only collect the stream if it is complete and not
-                    // readable. If it is readable, it will get collected when
-                    // stream_recv() is used.
-                    if stream.is_complete() && !stream.is_readable() {
-                        let local = stream.local;
-                        self.streams.collect(stream_id, local);
-                    }
-
+                    self.streams.mark_stop_reported(stream_id);
                     return Err(Error::StreamStopped(e));
                 },
 
@@ -6482,13 +6402,15 @@ impl<F: BufFactory> Connection<F> {
     /// The [`stream_writable()`] method can also be used to fine-tune when a
     /// stream is reported as writable again.
     ///
+    /// A stopped stream is returned even without send capacity. Querying its
+    /// capacity or writing to it returns [`StreamStopped`].
+    ///
     /// [`stream_writable()`]: struct.Connection.html#method.stream_writable
     /// [`writable()`]: struct.Connection.html#method.writable
+    /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
     pub fn stream_writable_next(&mut self) -> Option<u64> {
-        // If there is not enough connection-level send capacity, none of the
-        // streams are writable.
         if self.tx_cap == 0 {
-            return None;
+            return self.streams.pop_stopped_writable();
         }
 
         let mut cursor = self.streams.writable.front();
@@ -6698,6 +6620,9 @@ impl<F: BufFactory> Connection<F> {
     /// streams are only allowed to buffer outgoing data up to the amount that
     /// the peer allows to send.
     ///
+    /// Stopped streams are also included so that a write or capacity query can
+    /// return [`StreamStopped`], even without connection send capacity.
+    ///
     /// Note that the iterator will only include streams that were writable at
     /// the time the iterator itself was created (i.e. when `writable()` was
     /// called). To account for newly writable streams, the iterator needs to be
@@ -6723,12 +6648,12 @@ impl<F: BufFactory> Connection<F> {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     /// [`stream_priority()`]: struct.Connection.html#method.stream_priority
+    /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
     #[inline]
     pub fn writable(&self) -> StreamIter {
-        // If there is not enough connection-level send capacity, none of the
-        // streams are writable, so return an empty iterator.
+        // Stopped streams must be reported even without send capacity.
         if self.tx_cap == 0 {
-            return StreamIter::default();
+            return self.streams.stopped_writable();
         }
 
         self.streams.writable()
@@ -8511,15 +8436,21 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let local = stream::is_local(stream_id, self.is_server);
+
+                // A higher-numbered local stream implicitly opens all lower
+                // streams of the same type, even without a Stream object.
+                if local && !self.streams.local_stream_opened(stream_id) {
+                    return Err(Error::InvalidStreamState(stream_id));
+                }
+
+                let stream = match self.get_or_create_stream(stream_id, local) {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
 
                     Err(e) => return Err(e),
                 };
-
-                let was_writable = stream.is_writable();
 
                 let priority_key = Arc::clone(&stream.priority_key);
 
@@ -8565,9 +8496,7 @@ impl<F: BufFactory> Connection<F> {
 
                     self.streams.insert_reset(stream_id, error_code, final_size);
 
-                    if !was_writable {
-                        self.streams.insert_writable(&priority_key);
-                    }
+                    self.streams.insert_stopped_writable(&priority_key);
 
                     self.stopped_stream_remote_count =
                         self.stopped_stream_remote_count.saturating_add(1);
