@@ -27,7 +27,9 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::future::poll_fn;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -51,19 +53,15 @@ use crate::quic::QuicheConnection;
 use crate::ApplicationOverQuic;
 use crate::QuicResult;
 
-/// The error type used internally in [`DoqServerDriver`].
+/// Driver failures from [`DoqServerDriver`].
 ///
-/// Note that [`ApplicationOverQuic`] errors are not exposed to users at this
-/// time. The type is public to document the failure modes in
-/// [`DoqServerDriver`].
+/// These errors are boxed at the [`ApplicationOverQuic`] [`QuicResult`]
+/// boundary. The controller does not retain the worker's terminal error.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DoqConnectionError {
     /// The transport connection has not been established yet.
     ConnectionNotEstablished,
-
-    /// The consumer is not draining [`DoqEvent`]s fast enough.
-    EventChannelFull,
 
     /// The driver no longer tracks the stream: it was closed, cancelled, or
     /// never opened.
@@ -77,8 +75,6 @@ impl fmt::Display for DoqConnectionError {
         let s = match self {
             Self::ConnectionNotEstablished =>
                 "DoQ transport connection has not been established yet",
-            Self::EventChannelFull =>
-                "DoQ event channel is full; consumer too slow",
             Self::UnknownStream => "unknown stream",
         };
 
@@ -93,13 +89,6 @@ impl fmt::Display for DoqConnectionError {
 const RESPONDER_CAPACITY: usize = 16;
 #[cfg(any(test, debug_assertions))]
 const RESPONDER_CAPACITY: usize = 1;
-
-// Extra `EVENT_CAPACITY` headroom for `DoqEvent::HandshakeConfirmed`, which
-// can be pending in the channel at the same time as a full burst of
-// `Query` events (reads are processed before writes each iteration, and
-// `HandshakeConfirmed` is only sent from `process_writes`). See
-// `DoqServerDriver::new` for the rest of the sizing rationale.
-const EVENT_CAPACITY_MARGIN: u64 = 1;
 
 /// Per-query tracking, keyed by `stream_id` in
 /// [`DoqServerDriver::streams`]: the sole source of truth for whether a
@@ -119,6 +108,18 @@ struct QueryState {
     /// `rx` is `Some`, i.e. while parked awaiting `Connection`'s buffered
     /// remainder to drain.
     pending_fin: bool,
+}
+
+/// Work selected by `wait_for_data` for the driver to process.
+///
+/// The `work` future returns this value with a reserved event queue slot.
+enum ReadyWork {
+    /// A result from reading a DoQ event.
+    Read(doq::Result<(u64, doq::Event)>),
+    /// A stream with buffered response bytes ready to send.
+    Flush(u64),
+    /// A responder message or channel closure ready to process.
+    Response(ResponderReady),
 }
 
 /// A thin [`ApplicationOverQuic`] pump over [`quiche::doq::Connection`],
@@ -169,38 +170,41 @@ impl DoqServerDriver {
     /// [`QuicSettings`](crate::settings::QuicSettings) field, set before
     /// this driver is created.
     ///
-    /// `initial_max_streams_bidi` must be the same value configured on the
-    /// [`QuicSettings`](crate::settings::QuicSettings)/[`quiche::Config`]
-    /// used for this connection. It sizes the bounded `DoqEvent` channel:
-    /// a `DoqEvent::Query` is emitted once per stream, exactly when that
-    /// stream's query is fully received, and quiche only credits back a
-    /// stream-limit slot once the stream is fully complete in both
-    /// directions (`Stream::is_complete()`, `quiche/src/stream/mod.rs`) —
-    /// i.e. once the driver has fully sent its response. So the number of
-    /// streams that have produced a `Query` event but not yet finished
-    /// responding can never exceed `initial_max_streams_bidi`, and sizing
-    /// the channel to that (plus `EVENT_CAPACITY_MARGIN` for
-    /// `HandshakeConfirmed`) means it only ever fills up because the
-    /// consumer has stopped draining it, not because of a legitimate
-    /// concurrent-query burst. RFC 9250, Section 5.5.1 recommends clients
-    /// send all their queries concurrently.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-5.5.1
+    /// `event_capacity` is the maximum number of events in the queue at once.
+    /// The caller chooses this limit. For example, a capacity of 10 allows
+    /// up to 10 queued events. Each event read frees a slot for another event,
+    /// so the connection can process more than 10 queries over its lifetime.
+    /// All event types share the slots. The driver reserves one slot before
+    /// consuming a query, reset, response message, or writable notification.
     ///
-    /// This bound relies on quiche's specific policy of only replenishing
-    /// the stream limit as streams complete
-    /// (`quiche/src/stream/mod.rs`'s `collect()`). RFC 9000, Section 4.6
-    /// leaves that replenishment policy up to the implementation, so this is a
-    /// quiche-implementation guarantee, not a protocol one; revisit if
-    /// that policy ever changes.
-    /// https://datatracker.ietf.org/doc/html/rfc9000#section-4.6
-    pub fn new(initial_max_streams_bidi: u64) -> (Self, DoqController) {
-        let event_capacity = initial_max_streams_bidi
-            .saturating_add(EVENT_CAPACITY_MARGIN)
-            as usize;
+    /// When the queue is full, the driver pauses query reads and response
+    /// writes until a slot is available. Pending query bytes and responses
+    /// stay buffered.
+    /// Keep reading events while response tasks run. If event reads stop,
+    /// a full queue can prevent response sends from completing.
+    /// `HandshakeConfirmed` and `ConnectionClosed` can be dropped when the
+    /// queue is full. Connection cleanup runs even if `ConnectionClosed`
+    /// cannot be queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns a boxed [`io::Error`] with [`io::ErrorKind::InvalidInput`] if
+    /// `event_capacity` is zero or exceeds
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`].
+    pub fn new(event_capacity: usize) -> QuicResult<(Self, DoqController)> {
+        if event_capacity == 0 ||
+            event_capacity > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid DoQ event capacity: {event_capacity}"),
+            )
+            .into());
+        }
         let (event_sender, event_recv) = mpsc::channel(event_capacity);
         let (cmd_sender, cmd_recv) = mpsc::unbounded_channel();
 
-        (
+        Ok((
             DoqServerDriver {
                 conn: None,
                 event_sender,
@@ -214,7 +218,7 @@ impl DoqServerDriver {
                 cmd_sender,
                 event_recv: Some(event_recv),
             },
-        )
+        ))
     }
 
     /// Returns the underlying transport connection.
@@ -251,50 +255,27 @@ impl DoqServerDriver {
     /// [`doq::Connection::poll`].
     fn process_read_event(
         &mut self, stream_id: u64, event: doq::Event,
+        permit: mpsc::OwnedPermit<DoqEvent>,
     ) -> QuicResult<()> {
         match event {
             doq::Event::Query { data, is_0rtt } => {
                 let (tx, rx) = mpsc::channel(RESPONDER_CAPACITY);
 
-                match self.event_sender.try_send(DoqEvent::Query {
+                permit.send(DoqEvent::Query {
                     data: Bytes::from(data),
                     is_0rtt,
-                    responder: DoqResponder::new(tx),
-                }) {
-                    Ok(()) => {
-                        self.check_out_into_waiting(stream_id, rx);
-                        Ok(())
-                    },
-
-                    // The consumer isn't draining events fast enough.
-                    // Rather than grow this channel without bound, fail
-                    // the connection so a stalled consumer can't pin
-                    // unbounded memory.
-                    Err(mpsc::error::TrySendError::Full(_)) =>
-                        Err(DoqConnectionError::EventChannelFull.into()),
-
-                    // A dropped event receiver is handled by the
-                    // `event_sender.closed()` arm in `wait_for_data`,
-                    // which closes the connection; this is just the send
-                    // that lost the race.
-                    Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
-                }
+                    responder: DoqResponder::new(stream_id, tx),
+                });
+                self.check_out_into_waiting(stream_id, rx);
+                Ok(())
             },
 
-            // Handle peer RESET_STREAM as required by RFC 9250, Section 4.3.1.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
-            //
-            // Two cases:
-            // 1. The client gave up before finishing the query. We never made a
-            //    responder for this stream, so there's nothing to clean up.
-            // 2. The client finished the query (so we made a responder), but then
-            //    still sent RESET_STREAM. This is legal even after STREAM FIN. We
-            //    need to clean up that responder now.
-            //
-            // `cancel_responder` handles both: it's a no-op for case 1,
-            // and resolves `DoqResponder::closed()` for case 2.
-            doq::Event::Reset(_wire_error) => {
+            // Only resets exposed by the transport reach this path. A reset
+            // after the complete query and FIN have been read can be suppressed.
+            // Close any tracked receiver before queuing the peer code.
+            doq::Event::Reset(code) => {
                 self.cancel_responder(stream_id);
+                permit.send(DoqEvent::PeerReset { stream_id, code });
                 Ok(())
             },
 
@@ -309,14 +290,20 @@ impl DoqServerDriver {
         }
     }
 
+    /// Reserves event space without waiting. Receiver drop is handled by
+    /// `wait_for_data`; either unavailable condition pauses application work.
+    fn try_reserve_event(&self) -> Option<mpsc::OwnedPermit<DoqEvent>> {
+        self.event_sender.clone().try_reserve_owned().ok()
+    }
+
     /// Stops tracking `stream_id`'s query, if any, so its responder's
     /// `closed()` future resolves for the consumer.
     ///
-    /// Used for peer cancellation (`Event::Reset`) per RFC 9250, Section 4.3.1.
-    /// A `StreamStopped` write error is handled inline in
-    /// `handle_write_error` instead, since that path already owns `rx` and
-    /// doesn't need the `waiting` scan below.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    /// Used only for resets exposed by the transport. Such a reset can arrive
+    /// without a query event, in which case there is no responder to close.
+    /// Resets after a complete query and FIN have been read can be suppressed.
+    /// A `StreamStopped` write error already owns its receiver and closes it
+    /// in `handle_write_error`.
     fn cancel_responder(&mut self, stream_id: u64) {
         let Some(state) = self.streams.get(&stream_id) else {
             return;
@@ -375,6 +362,7 @@ impl DoqServerDriver {
     /// channel, or its closure.
     fn responder_ready(
         &mut self, qconn: &mut QuicheConnection, ready: ResponderReady,
+        permit: mpsc::OwnedPermit<DoqEvent>,
     ) -> QuicResult<()> {
         let ResponderReady {
             stream_id,
@@ -396,7 +384,7 @@ impl DoqServerDriver {
 
         match message {
             ResponderMessage::Response { data, fin } =>
-                self.send_response(qconn, stream_id, rx, &data, fin),
+                self.send_response(qconn, stream_id, rx, &data, fin, permit),
 
             ResponderMessage::Reset { error } => {
                 drop(rx);
@@ -413,10 +401,15 @@ impl DoqServerDriver {
     fn send_response(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
         rx: mpsc::Receiver<ResponderMessage>, data: &[u8], fin: bool,
+        permit: mpsc::OwnedPermit<DoqEvent>,
     ) -> QuicResult<()> {
         match self.conn_mut()?.send_response(qconn, stream_id, data, fin) {
-            Ok(()) => self.update_stream_state(stream_id, rx, fin),
-            Err(err) => self.handle_write_error(qconn, stream_id, rx, err),
+            Ok(()) => {
+                drop(permit);
+                self.update_stream_state(stream_id, rx, fin)
+            },
+            Err(err) =>
+                self.handle_write_error(qconn, stream_id, rx, err, permit),
         }
     }
 
@@ -426,10 +419,15 @@ impl DoqServerDriver {
     fn flush_stream(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
         rx: mpsc::Receiver<ResponderMessage>, fin: bool,
+        permit: mpsc::OwnedPermit<DoqEvent>,
     ) -> QuicResult<()> {
         match self.conn_mut()?.flush_response(qconn, stream_id) {
-            Ok(()) => self.update_stream_state(stream_id, rx, fin),
-            Err(err) => self.handle_write_error(qconn, stream_id, rx, err),
+            Ok(()) => {
+                drop(permit);
+                self.update_stream_state(stream_id, rx, fin)
+            },
+            Err(err) =>
+                self.handle_write_error(qconn, stream_id, rx, err, permit),
         }
     }
 
@@ -470,11 +468,12 @@ impl DoqServerDriver {
     /// Handles an error from a write attempt (`send_response` or
     /// `flush_response`) on `stream_id`.
     ///
-    /// The arms below are per-stream: peer-triggered or benign local races,
-    /// not treated as connection-fatal.
+    /// Peer stops and benign local races close only this query. A reserved
+    /// event slot carries the observed stop code.
     fn handle_write_error(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
         rx: mpsc::Receiver<ResponderMessage>, error: doq::Error,
+        permit: mpsc::OwnedPermit<DoqEvent>,
     ) -> QuicResult<()> {
         match error {
             // A stale race: the stream already completed or was cancelled.
@@ -487,10 +486,11 @@ impl DoqServerDriver {
             // Stop sending when requested by the peer.
             // See RFC 9250, Section 4.3.1.
             // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
-            // Per-stream, not fatal.
-            doq::Error::TransportError(quiche::Error::StreamStopped(_)) => {
+            // Close the query before attempting the cancellation enqueue.
+            doq::Error::TransportError(quiche::Error::StreamStopped(code)) => {
                 drop(rx);
                 self.streams.remove(&stream_id);
+                permit.send(DoqEvent::PeerStopped { stream_id, code });
                 Ok(())
             },
 
@@ -517,6 +517,17 @@ impl DoqServerDriver {
         }
     }
 
+    /// Closes the connection when the event consumer drops its receiver.
+    ///
+    /// The flag disables the receiver-drop branch to prevent repeated closes.
+    fn handle_event_receiver_drop(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        self.event_receiver_dropped = true;
+        let _ = qconn.close(true, DoqError::NoError.to_wire(), b"");
+        Ok(())
+    }
+
     /// Executes a [`DoqCommand`] received from the [`DoqController`].
     fn handle_command(
         &mut self, qconn: &mut QuicheConnection, cmd: DoqCommand,
@@ -534,8 +545,8 @@ impl DoqServerDriver {
 ///
 /// Receives [`DoqEvent`]s from the driver and sends connection-level
 /// [`DoqCommand`]s to it. Per-query operations (sending responses,
-/// resetting a transaction, observing peer cancellation) go through the
-/// [`DoqResponder`] attached to each [`DoqEvent::Query`] instead.
+/// resetting a transaction) go through the [`DoqResponder`] attached to each
+/// [`DoqEvent::Query`]. Peer cancellation codes arrive as [`DoqEvent`]s.
 pub struct DoqController {
     /// Sends [`DoqCommand`]s to the paired [`DoqServerDriver`].
     cmd_sender: mpsc::UnboundedSender<DoqCommand>,
@@ -585,10 +596,14 @@ impl ApplicationOverQuic for DoqServerDriver {
     /// into the corresponding [`DoqEvent`] via
     /// [`process_read_event`](Self::process_read_event).
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.conn_mut()?;
         loop {
+            let Some(permit) = self.try_reserve_event() else {
+                return Ok(());
+            };
             match self.conn_mut()?.poll(qconn) {
                 Ok((stream_id, event)) =>
-                    self.process_read_event(stream_id, event)?,
+                    self.process_read_event(stream_id, event, permit)?,
 
                 Err(doq::Error::Done) => break,
 
@@ -621,18 +636,30 @@ impl ApplicationOverQuic for DoqServerDriver {
             let _ = self.event_sender.try_send(DoqEvent::HandshakeConfirmed);
         }
 
-        while let Some(stream_id) = qconn.stream_writable_next() {
+        loop {
+            let Some(permit) = self.try_reserve_event() else {
+                return Ok(());
+            };
+            let Some(stream_id) = qconn.stream_writable_next() else {
+                break;
+            };
             let Some(state) = self.streams.get_mut(&stream_id) else {
                 continue;
             };
             let Some(rx) = state.rx.take() else { continue };
             let fin = state.pending_fin;
 
-            self.flush_stream(qconn, stream_id, rx, fin)?;
+            self.flush_stream(qconn, stream_id, rx, fin, permit)?;
         }
 
-        while let Some(Some(ready)) = self.waiting.next().now_or_never() {
-            self.responder_ready(qconn, ready)?;
+        loop {
+            let Some(permit) = self.try_reserve_event() else {
+                return Ok(());
+            };
+            let Some(Some(ready)) = self.waiting.next().now_or_never() else {
+                break;
+            };
+            self.responder_ready(qconn, ready, permit)?;
         }
 
         Ok(())
@@ -642,51 +669,172 @@ impl ApplicationOverQuic for DoqServerDriver {
         &mut self, _qconn: &mut QuicheConnection, _metrics: &M,
         _connection_result: &QuicResult<()>,
     ) {
+        self.streams.clear();
+        self.waiting.clear();
         let _ = self.event_sender.try_send(DoqEvent::ConnectionClosed);
     }
 
-    /// Waits for the next responder message, connection-level command, or
-    /// controller-drop signal.
+    /// Waits for application work, a command, or event receiver drop.
     ///
-    /// The trailing `else` branch keeps this panic-safe. Two things can
-    /// permanently disable a `select!` branch: the controller dropping (so
-    /// `cmd_recv.recv()` returns `None` forever), and the event receiver
-    /// having already dropped once (so `event_sender.closed()`'s `if`
-    /// guard is now false). If both happen, every branch is disabled at
-    /// once. Per tokio's documented `select!` semantics, that panics
-    /// ("all branches are disabled and there is no provided else branch")
-    /// unless an `else` branch is present to block forever instead.
+    /// Reads and writes share one event slot reservation. Reserve before
+    /// consuming a writable notification, responder message, or DoQ event.
+    /// Writes need a slot because they can expose a peer cancellation. The
+    /// handler sends that event through the permit or releases the unused
+    /// permit after a successful write. A full queue leaves queries, response
+    /// messages, and buffered writes in their current storage.
+    ///
+    /// Once a slot is available, check work in this order:
+    ///
+    /// 1. Flush a parked response after connection establishment.
+    /// 2. Take one ready responder message or channel closure.
+    /// 3. Poll DoQ for a query, reset, or error.
+    ///
+    /// Only the flush check requires an established connection. Reads can
+    /// process early data before the handshake completes. Checking reads here
+    /// resumes buffered queries after capacity returns without another packet.
+    /// Normal worker reads run after packet reception.
+    ///
+    /// Two waits return Pending. With a full queue, the reservation registers
+    /// a capacity wake-up. With capacity but no work, release the permit and
+    /// return Pending without a self-wake. Responder polling registers a data
+    /// wake-up. The outer worker select handles incoming packets and timers.
+    /// Do not retain an event slot while idle, even when capacity is one.
+    ///
+    /// The outer worker can cancel this wait when a packet or timer wins its
+    /// select. Cancellation drops a pending reservation without taking work.
+    /// Once work is consumed, return its ReadyWork and permit together. The
+    /// selected branch dispatches them without another await, so a consumed
+    /// event or response is not held across a cancellation point.
+    ///
+    /// The biased select checks commands, event receiver drop, then work.
+    /// Control input does not require event capacity. Receiver drop initiates
+    /// connection close once and disables the receiver-drop and work branches.
+    /// A closed command channel disables its Some pattern. If all branches
+    /// are disabled, remain pending so the outer worker can handle packets and
+    /// timers. After dispatch, also handle one command that arrived meanwhile.
     async fn wait_for_data(
         &mut self, qconn: &mut QuicheConnection,
     ) -> QuicResult<()> {
+        let sender = self.event_sender.clone();
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or(DoqConnectionError::ConnectionNotEstablished)?;
+        let streams = &self.streams;
+        let waiting = &mut self.waiting;
+        // Create a future that reserves an event slot when polled.
+        let mut reservation = std::pin::pin!(sender.clone().reserve_owned());
+        // Create a future for the work branch of select.
+        // Each poll calls this closure with the task context, cx.
+        // The closure reserves an event slot, then selects one operation.
+        // It returns Pending, or Ready with the operation and permit.
+        let work = poll_fn(|cx| {
+            // A full queue returns Pending and registers the task's waker.
+            // Freeing a slot wakes this task.
+            let result = match reservation.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result,
+            };
+            // A completed reservation must not be polled again. Install a
+            // fresh pinned future for the next poll if this poll finds no work.
+            reservation.set(sender.clone().reserve_owned());
+            let permit = match result {
+                Ok(permit) => permit,
+                // The receiver-drop branch handles a closed event channel.
+                Err(_) => return Poll::Pending,
+            };
+
+            // Flush buffered response bytes first. This write path requires
+            // establishment; responder and read checks remain available below.
+            if qconn.is_established() {
+                while let Some(stream_id) = qconn.stream_writable_next() {
+                    if streams
+                        .get(&stream_id)
+                        .is_some_and(|state| state.rx.is_some())
+                    {
+                        // Select this stream for flushing. Keep its receiver
+                        // in streams; the select handler takes it and flushes
+                        // the buffered bytes without another await.
+                        return Poll::Ready((
+                            permit,
+                            ReadyWork::Flush(stream_id),
+                        ));
+                    }
+                }
+            }
+            // Take a response only after parked writes have been checked.
+            // A pending responder poll registers a wake for data or closure.
+            if let Poll::Ready(Some(ready)) =
+                futures_util::StreamExt::poll_next_unpin(waiting, cx)
+            {
+                return Poll::Ready((permit, ReadyWork::Response(ready)));
+            }
+            // Check reads last, including early data before establishment.
+            // Capacity recovery must resume buffered queries without a packet.
+            match conn.poll(qconn) {
+                Err(doq::Error::Done) => {
+                    // Release idle capacity. Leave the fresh reservation
+                    // unpolled until a data wake or an outer worker wake.
+                    drop(permit);
+                    Poll::Pending
+                },
+                result => Poll::Ready((permit, ReadyWork::Read(result))),
+            }
+        });
         select! {
-            biased;
-            Some(ready) = self.waiting.next() => self.responder_ready(qconn, ready),
-            Some(cmd) = self.cmd_recv.recv() => self.handle_command(qconn, cmd),
-            // `closed()`'s output is `()`; `_` discards it since only the
-            // fact that it resolved matters. The `if` guard turns this
-            // branch off after it fires once, so a later call to
-            // `wait_for_data` doesn't try to close the connection again.
-            _ = self.event_sender.closed(), if !self.event_receiver_dropped => {
-                self.event_receiver_dropped = true;
-                // Unlike `H3Driver::close_if_idle`, DoQ has no
-                // per-connection idle/dangling-stream tracking to make a
-                // conditional close meaningful here. Close unconditionally.
-                let _ = qconn.close(true, DoqError::NoError.to_wire(), b"");
-                Ok(())
+            biased; // Check commands and receiver drop before consuming work.
+
+            // Receive a connection command from DoqController.
+            // handle_command applies it to the QUIC connection.
+            // A closed and empty command channel returns None.
+            // None fails the Some pattern and disables this branch.
+            Some(cmd) = self.cmd_recv.recv() => {
+                self.handle_command(qconn, cmd)
             },
-            // `std::future::pending()` never resolves. This branch only
-            // runs once every other branch is permanently disabled: the
-            // controller dropped (`cmd_recv.recv()` returns `None`
-            // forever) and the `if` guard above is already false.
-            // Without this, `select!` would panic instead of blocking
-            // forever in that case.
+
+            // Handle event receiver drop once.
+            _ = self.event_sender.closed(), if !self.event_receiver_dropped => {
+                self.handle_event_receiver_drop(qconn)
+            },
+
+            // Stop processing queries and responses after event receiver drop.
+            // Pass the reserved event slot to the handler.
+            // Handle the result immediately. An async wait here could allow
+            // cancellation before the event or response is processed.
+            (permit, ready) = work, if !self.event_receiver_dropped => {
+                match ready {
+                    ReadyWork::Read(Ok((stream_id, event))) =>
+                        self.process_read_event(stream_id, event, permit),
+                    // DoQ already initiated close. Let the worker send it.
+                    ReadyWork::Read(Err(doq::Error::ProtocolError)) => Ok(()),
+                    // Propagate other read failures to the worker.
+                    ReadyWork::Read(Err(error)) => Err(error.into()),
+                    // Take the responder receiver for the selected flush.
+                    // Use its saved FIN flag with the buffered response bytes.
+                    ReadyWork::Flush(stream_id) => {
+                        let state = self.streams.get_mut(&stream_id)
+                            .ok_or(DoqConnectionError::UnknownStream)?;
+                        let rx = state.rx.take()
+                            .ok_or(DoqConnectionError::UnknownStream)?;
+                        let fin = state.pending_fin;
+                        self.flush_stream(qconn, stream_id, rx, fin, permit)
+                    },
+                    // The handler owns the consumed message and receiver, and
+                    // uses the permit if the write reports a peer stop.
+                    ReadyWork::Response(ready) =>
+                        self.responder_ready(qconn, ready, permit),
+                }
+            },
+
+            // A closed command channel fails the Some pattern. After receiver
+            // drop disables the other branches, keep this future pending so
+            // the outer worker select can continue without a select! panic.
             else => std::future::pending().await,
         }?;
 
-        // Make sure the controller isn't starved, but also not prioritized
-        // in the biased select. Poll it last, and also perform a
-        // `try_recv` each iteration (mirrors `H3Driver::wait_for_data`).
+        // A command can arrive after select polls its branch.
+        // Handle one without waiting after dispatching application work.
+        // Limit this check to one command so this call can return.
         if let Ok(cmd) = self.cmd_recv.try_recv() {
             self.handle_command(qconn, cmd)?;
         }
@@ -738,5 +886,547 @@ impl Future for WaitForResponder {
                     .expect("WaitForResponder polled after completion"),
                 message,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::doq::test_utils::default_quiche_config;
+    use crate::doq::test_utils::DoqDriverTestHelper;
+    use crate::doq::test_utils::Pipe;
+    use crate::metrics::DefaultMetrics;
+
+    fn fill_events(driver: &DoqServerDriver) {
+        while driver.event_sender.capacity() > 0 {
+            driver
+                .event_sender
+                .try_send(DoqEvent::HandshakeConfirmed)
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn event_capacity_and_retained_errors() {
+        // Check that the queue uses the exact capacity requested by the caller.
+        for capacity in [1, 2, 302] {
+            let (_, mut controller) = DoqServerDriver::new(capacity).unwrap();
+            assert_eq!(
+                controller.event_receiver_mut().unwrap().max_capacity(),
+                capacity
+            );
+        }
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        // Read before initialization and check that the boxed error preserves
+        // the ConnectionNotEstablished enum variant.
+        let (mut uninitialized, _) = DoqServerDriver::new(1).unwrap();
+        let err = uninitialized
+            .process_reads(&mut helper.pipe.server)
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<DoqConnectionError>(),
+            Some(&DoqConnectionError::ConnectionNotEstablished)
+        );
+        let id = helper.peer_send_query(b"q").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        // Use a response large enough to leave bytes pending after the send.
+        helper
+            .driver
+            .conn_mut()
+            .unwrap()
+            .send_response(&mut helper.pipe.server, id, &vec![b'x'; 20_000], true)
+            .unwrap();
+        assert!(helper.driver.conn_mut().unwrap().response_pending(id));
+        // Remove driver tracking while the core still has buffered bytes.
+        // Updating this stream must return the boxed UnknownStream variant.
+        helper.driver.streams.remove(&id);
+        let (tx, rx) = mpsc::channel(1);
+        let err = helper.driver.update_stream_state(id, rx, true).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<DoqConnectionError>(),
+            Some(&DoqConnectionError::UnknownStream)
+        );
+        // The failed update drops the supplied receiver and closes its sender.
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn event_capacity_rejects_invalid_capacities() {
+        let largest = tokio::sync::Semaphore::MAX_PERMITS;
+        let (_, mut controller) = DoqServerDriver::new(largest).unwrap();
+        assert_eq!(
+            controller.event_receiver_mut().unwrap().max_capacity(),
+            largest
+        );
+        for capacity in [0, largest + 1, usize::MAX] {
+            let err = DoqServerDriver::new(capacity).err().unwrap();
+            let err = err.downcast_ref::<io::Error>().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.to_string(),
+                format!("invalid DoQ event capacity: {capacity}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_and_reset_resume_after_event_capacity_returns() {
+        // Test a complete query and a reset after a partial stream write.
+        for reset in [false, true] {
+            let mut helper = DoqDriverTestHelper::new().unwrap();
+            // Keep one query active to check that queue saturation preserves it.
+            helper.peer_send_query(b"active").unwrap();
+            helper.advance_and_run_loop().unwrap();
+            let (_, _, active) = helper.expect_query_event();
+            // Fill the queue with test events before sending the next input.
+            fill_events(&helper.driver);
+            let stream_id = 4;
+            if reset {
+                helper
+                    .pipe
+                    .client
+                    .stream_send(stream_id, b"partial", false)
+                    .unwrap();
+                helper
+                    .pipe
+                    .client
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 0x1234)
+                    .unwrap();
+            } else {
+                helper.peer_send_query(b"q").unwrap();
+            }
+            // Deliver the next query or reset while the event queue is full.
+            helper.pipe.advance().unwrap();
+            helper
+                .driver
+                .process_reads(&mut helper.pipe.server)
+                .unwrap();
+            // Reading must pause without dropping the active query or closing
+            // the connection. Only the first query is tracked and waiting.
+            assert_eq!(helper.driver.streams.len(), 1);
+            assert_eq!(helper.driver.waiting.len(), 1);
+            assert!(active.closed().now_or_never().is_none());
+            assert!(helper.pipe.server.local_error().is_none());
+            // Free one slot, then process data already received. No new packet
+            // is delivered between freeing capacity and waiting for work.
+            helper.try_recv_event().unwrap();
+            helper
+                .driver
+                .wait_for_data(&mut helper.pipe.server)
+                .await
+                .unwrap();
+            let mut delivered = false;
+            // Skip the remaining test events and check the delayed query or
+            // reset, including its stream ID and original peer error code.
+            while let Ok(event) = helper.try_recv_event() {
+                match event {
+                    DoqEvent::HandshakeConfirmed => (),
+                    DoqEvent::PeerReset {
+                        stream_id: id,
+                        code,
+                    } if reset => {
+                        assert_eq!(id, stream_id);
+                        assert_eq!(code, 0x1234);
+                        delivered = true;
+                        break;
+                    },
+                    DoqEvent::Query {
+                        data, responder, ..
+                    } if !reset => {
+                        assert_eq!(data, Bytes::from_static(b"q"));
+                        assert_eq!(responder.stream_id(), stream_id);
+                        delivered = true;
+                        break;
+                    },
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            assert!(delivered);
+            // Delivering the delayed event must leave the first query open.
+            assert!(active.closed().now_or_never().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_event_capacity_without_closing_connection() {
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        let id = helper.peer_send_query(b"q").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let (_, _, responder) = helper.expect_query_event();
+        // Fill the event queue before the peer sends STOP_SENDING.
+        fill_events(&helper.driver);
+        helper
+            .pipe
+            .client
+            .stream_shutdown(id, quiche::Shutdown::Read, 0x1234)
+            .unwrap();
+        helper.pipe.advance().unwrap();
+        // Queue response data so a write can detect the peer stop.
+        responder
+            .send(Bytes::from_static(b"resp"), true)
+            .await
+            .unwrap();
+        helper
+            .driver
+            .process_writes(&mut helper.pipe.server)
+            .unwrap();
+        // Without space for the stop event, keep the response and query alive.
+        assert!(responder.closed().now_or_never().is_none());
+        assert_eq!(helper.driver.streams.len(), 1);
+        // Free one slot and retry the write without receiving another packet.
+        helper.try_recv_event().unwrap();
+        helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .await
+            .unwrap();
+        // The stop closes only this query, leaving the connection open.
+        assert!(responder.closed().now_or_never().is_some());
+        assert!(helper.driver.streams.is_empty());
+        assert!(helper.pipe.server.local_error().is_none());
+        let mut stopped = false;
+        // Skip test events and check the stream ID and raw peer stop code.
+        while let Ok(event) = helper.try_recv_event() {
+            if let DoqEvent::PeerStopped { stream_id, code } = event {
+                assert_eq!(stream_id, id);
+                assert_eq!(code, 0x1234);
+                stopped = true;
+            }
+        }
+        assert!(stopped);
+    }
+
+    #[tokio::test]
+    async fn handshake_overflow_is_nonfatal() {
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        fill_events(&helper.driver);
+        helper
+            .driver
+            .process_writes(&mut helper.pipe.server)
+            .unwrap();
+        assert!(helper.driver.handshake_confirmed);
+        assert!(helper.pipe.server.local_error().is_none());
+    }
+
+    /// Creates two active queries with receivers in different driver storage.
+    /// The first receiver waits for application data in `driver.waiting`.
+    /// The second receiver is stored in `driver.streams` while the core DoQ
+    /// connection holds response bytes that cannot yet be sent.
+    /// Returns the helper, the waiting responder, and the buffered responder.
+    async fn waiting_and_parked_queries(
+    ) -> (DoqDriverTestHelper, DoqResponder, DoqResponder) {
+        let mut config = default_quiche_config();
+        // Use a 20-byte receive window so the 200-byte final response cannot
+        // be sent in full. The remaining bytes must stay in the core DoQ buffer.
+        config.set_initial_max_stream_data_bidi_local(20);
+        let mut helper = DoqDriverTestHelper::with_pipe(
+            Pipe::with_config_and_buf(&mut config).unwrap(),
+        )
+        .unwrap();
+        helper.peer_send_query(b"waiting").unwrap();
+        helper.peer_send_query(b"parked").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let (_, _, waiting) = helper.expect_query_event();
+        let (_, _, parked) = helper.expect_query_event();
+        // Send nothing through the first responder. Its receiver stays in
+        // driver.waiting. Send a final response through the second responder
+        // so it fills the receive window and leaves buffered response bytes.
+        parked
+            .send(Bytes::from(vec![b'x'; 200]), true)
+            .await
+            .unwrap();
+        // Process the response without advancing packets or letting the client
+        // read it. The second receiver moves to driver.streams because the
+        // response cannot finish until the client grants more stream credit.
+        helper.work_loop_iter().unwrap();
+        // Check both receiver locations: stored in a stream entry, and waiting
+        // for application data. Neither responder may be closed yet.
+        assert!(helper
+            .driver
+            .streams
+            .values()
+            .any(|state| state.rx.is_some()));
+        assert!(!helper.driver.waiting.is_empty());
+        assert!(waiting.closed().now_or_never().is_none());
+        assert!(parked.closed().now_or_never().is_none());
+        (helper, waiting, parked)
+    }
+
+    #[tokio::test]
+    async fn full_close_event_queue_does_not_delay_query_cleanup() {
+        // Keep one query waiting for application data and another with buffered
+        // response bytes. Their receivers occupy waiting and streams.
+        let (mut helper, waiting, parked) = waiting_and_parked_queries().await;
+        // Fill every event slot with test events. Record the queue length so
+        // the test can check that ConnectionClosed could not be added.
+        fill_events(&helper.driver);
+        let len = helper.controller.event_receiver_mut().unwrap().len();
+        // Initiate QUIC close, then invoke the driver's close hook directly.
+        // This tests query cleanup without exchanging connection-close packets.
+        helper.pipe.server.close(true, 0, b"").unwrap();
+        helper.driver.on_conn_close(
+            &mut helper.pipe.server,
+            &DefaultMetrics,
+            &Ok(()),
+        );
+        // No events have been read to free capacity. now_or_never checks that
+        // both responder channels are already closed, without awaiting cleanup.
+        assert!(waiting.closed().now_or_never().is_some());
+        assert!(parked.closed().now_or_never().is_some());
+        // Neither receiver location may retain query state after close.
+        assert!(helper.driver.streams.is_empty());
+        assert!(helper.driver.waiting.is_empty());
+        // The queue is still full and its length is unchanged. Query cleanup
+        // succeeds even though the ConnectionClosed event could not be queued.
+        assert_eq!(helper.controller.event_receiver_mut().unwrap().len(), len);
+    }
+
+    #[tokio::test]
+    async fn buffered_flush_resumes_after_event_capacity_returns() {
+        let (mut helper, waiting, parked) = waiting_and_parked_queries().await;
+        let id = parked.stream_id();
+        // The response is already buffered. Fill the queue before the peer
+        // stops reading, so detecting its stop must wait for event space.
+        fill_events(&helper.driver);
+        helper
+            .pipe
+            .client
+            .stream_shutdown(id, quiche::Shutdown::Read, 42)
+            .unwrap();
+        helper.pipe.advance().unwrap();
+        helper
+            .driver
+            .process_writes(&mut helper.pipe.server)
+            .unwrap();
+        // Keep the buffered bytes and responder until a stop event can be sent.
+        assert!(parked.closed().now_or_never().is_none());
+        assert!(helper.driver.conn_mut().unwrap().response_pending(id));
+        // Free one slot so the flush can detect and report the peer stop.
+        helper.try_recv_event().unwrap();
+        helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .await
+            .unwrap();
+        // Close the stopped query while keeping the unrelated query open.
+        assert!(parked.closed().now_or_never().is_some());
+        assert!(waiting.closed().now_or_never().is_none());
+        let mut delivered = false;
+        while let Ok(event) = helper.try_recv_event() {
+            if let DoqEvent::PeerStopped { stream_id, code } = event {
+                assert_eq!(stream_id, id);
+                assert_eq!(code, 42);
+                delivered = true;
+            }
+        }
+        assert!(delivered);
+        assert!(helper.pipe.server.local_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn response_bytes_survive_full_event_queue() {
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        let id = helper.peer_send_query(b"q").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let (_, _, responder) = helper.expect_query_event();
+        fill_events(&helper.driver);
+        // Submit a final response while event capacity blocks driver writes.
+        responder
+            .send(Bytes::from_static(b"response"), true)
+            .await
+            .unwrap();
+        helper
+            .driver
+            .process_writes(&mut helper.pipe.server)
+            .unwrap();
+        assert!(responder.closed().now_or_never().is_none());
+        // Free one slot so the driver can take and send the queued response.
+        helper.try_recv_event().unwrap();
+        helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .await
+            .unwrap();
+        // Deliver the response and check its exact bytes and final stream state.
+        helper.pipe.advance().unwrap();
+        assert_eq!(
+            helper.peer.poll(&mut helper.pipe.client),
+            Ok((id, doq::Event::Response {
+                data: b"response".to_vec()
+            }))
+        );
+        assert_eq!(
+            helper.peer.poll(&mut helper.pipe.client),
+            Ok((id, doq::Event::Finished))
+        );
+        assert!(responder.closed().now_or_never().is_some());
+        assert!(helper.pipe.server.local_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_wait_releases_capacity_and_cancelled_wait_preserves_query() {
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        // Use one slot so an idle reservation would block all later events.
+        let (mut driver, controller) = DoqServerDriver::new(1).unwrap();
+        driver
+            .on_conn_established(
+                &mut helper.pipe.server,
+                &HandshakeInfo::new(std::time::Instant::now(), None),
+            )
+            .unwrap();
+        helper.driver = driver;
+        helper.controller = controller;
+        // now_or_never polls once and drops a wait that returns Pending.
+        // Each idle wait must leave the only event slot available.
+        for _ in 0..3 {
+            assert!(helper
+                .driver
+                .wait_for_data(&mut helper.pipe.server)
+                .now_or_never()
+                .is_none());
+            assert_eq!(helper.driver.event_sender.capacity(), 1);
+        }
+        fill_events(&helper.driver);
+        let id = helper.peer_send_query(b"q").unwrap();
+        helper.pipe.advance().unwrap();
+        // Cancel waits while the query is received but the event queue is full.
+        // They must leave the query available for a later wait.
+        for _ in 0..3 {
+            assert!(helper
+                .driver
+                .wait_for_data(&mut helper.pipe.server)
+                .now_or_never()
+                .is_none());
+        }
+        // Free the slot and check that the query survived the cancelled waits.
+        helper.try_recv_event().unwrap();
+        helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .await
+            .unwrap();
+        let (_, _, responder) = helper.expect_query_event();
+        assert_eq!(responder.stream_id(), id);
+        assert!(helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .now_or_never()
+            .is_none());
+        assert_eq!(helper.driver.event_sender.capacity(), 1);
+        // Connection commands must remain usable while application work waits
+        // for event capacity.
+        fill_events(&helper.driver);
+        helper
+            .controller
+            .close_connection(DoqError::NoError, Vec::new());
+        helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .await
+            .unwrap();
+        assert!(helper.pipe.server.local_error().is_some());
+    }
+
+    #[tokio::test]
+    async fn flow_blocked_flush_releases_idle_reservation() {
+        let (mut helper, waiting, parked) = waiting_and_parked_queries().await;
+        let capacity = helper.driver.event_sender.capacity();
+        // QUIC flow control blocks the buffered response.
+        // now_or_never polls each wait once and drops it if it is pending.
+        // Repeat without receiving more stream credit.
+        for _ in 0..3 {
+            assert!(helper
+                .driver
+                .wait_for_data(&mut helper.pipe.server)
+                .now_or_never()
+                .is_none());
+        }
+        // Dropping pending waits must leave event capacity unchanged.
+        assert_eq!(helper.driver.event_sender.capacity(), capacity);
+        assert!(waiting.closed().now_or_never().is_none());
+        assert!(parked.closed().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_while_full_remains_independent_of_capacity() {
+        let (helper, waiting, parked) = waiting_and_parked_queries().await;
+        fill_events(&helper.driver);
+        let DoqDriverTestHelper {
+            mut driver,
+            mut pipe,
+            controller,
+            ..
+        } = helper;
+        // The controller still owns the event receiver. Dropping it must
+        // initiate close without waiting for space in the full event queue.
+        drop(controller);
+        driver.wait_for_data(&mut pipe.server).await.unwrap();
+        assert!(pipe.server.local_error().is_some());
+        // Connection cleanup closes both waiting and buffered responders.
+        driver.on_conn_close(&mut pipe.server, &DefaultMetrics, &Ok(()));
+        assert!(waiting.closed().now_or_never().is_some());
+        assert!(parked.closed().now_or_never().is_some());
+        // A later wait must remain pending after receiver drop.
+        assert!(driver
+            .wait_for_data(&mut pipe.server)
+            .now_or_never()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn early_query_resumes_before_handshake_when_capacity_returns() {
+        let mut config = default_quiche_config();
+        config.enable_early_data();
+        // Complete one connection to obtain a TLS session for 0-RTT resumption.
+        let mut ticket_pipe = Pipe::with_config_and_buf(&mut config).unwrap();
+        ticket_pipe.handshake().unwrap();
+        let session = ticket_pipe.client.session().unwrap().to_vec();
+        // Deliver only the resumed client's flight, leaving the new handshake
+        // incomplete while the server can receive early application data.
+        let mut pipe = Pipe::with_config_and_buf(&mut config).unwrap();
+        pipe.client.set_session(&session).unwrap();
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        let mut helper =
+            DoqDriverTestHelper::with_initialized_pipe(pipe).unwrap();
+        // Receive the early query while the event queue blocks query delivery.
+        fill_events(&helper.driver);
+        helper.peer_send_query(b"early").unwrap();
+        helper.advance_client_to_server().unwrap();
+        helper
+            .driver
+            .process_reads(&mut helper.pipe.server)
+            .unwrap();
+        // Release one slot and resume reads without advancing the handshake.
+        helper.try_recv_event().unwrap();
+        helper
+            .driver
+            .wait_for_data(&mut helper.pipe.server)
+            .await
+            .unwrap();
+        assert!(!helper.pipe.server.is_established());
+        let mut delivered = false;
+        // The delayed query must retain its bytes and early-data flag.
+        while let Ok(event) = helper.try_recv_event() {
+            if let DoqEvent::Query { data, is_0rtt, .. } = event {
+                assert_eq!(data, Bytes::from_static(b"early"));
+                assert!(is_0rtt);
+                delivered = true;
+            }
+        }
+        assert!(delivered);
+    }
+
+    #[tokio::test]
+    async fn driver_drop_releases_waiting_and_parked_queries() {
+        let (helper, waiting, parked) = waiting_and_parked_queries().await;
+        // Dropping the driver releases receivers from both waiting and streams,
+        // even without an explicit connection-close callback.
+        drop(helper.driver);
+        assert!(waiting.closed().now_or_never().is_some());
+        assert!(parked.closed().now_or_never().is_some());
     }
 }

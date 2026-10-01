@@ -746,12 +746,9 @@ impl Connection {
                 Err(crate::Error::Done) => break,
 
                 Err(crate::Error::StreamReset(error)) => {
-                    // If the client had already sent FIN, this branch
-                    // isn't entered at all: a RESET_STREAM matching the
-                    // already-known final size doesn't resurface as
-                    // `StreamReset` from `stream_recv` (it keeps
-                    // returning `Done`), so there is nothing to check for
-                    // that case here.
+                    // A reset after the complete query and FIN have been read
+                    // can be suppressed by the transport. Such a reset does
+                    // not reach this branch.
                     //
                     // We don't check whether this stream was already
                     // reset (e.g. via `reset_stream`) because calling
@@ -1715,11 +1712,8 @@ mod tests {
             }))
         );
 
-        // The client resets the stream after its FIN was already sent.
-        // quiche accepts a matching-final-size reset here but does not
-        // resurface it as `StreamReset` from `stream_recv` (see
-        // `RecvBuf::reset`), so the DoQ layer never sees this as a
-        // reset to echo.
+        // The server has read the complete query and FIN. The transport counts
+        // this matching-final-size reset without exposing it to the DoQ layer.
         pipe.client
             .stream_shutdown(0, crate::Shutdown::Write, 42)
             .unwrap();
