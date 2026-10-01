@@ -63,6 +63,7 @@ async fn query_event_and_response_roundtrip() {
     helper.advance_and_run_loop().unwrap();
 
     let (data, is_0rtt, responder) = helper.expect_query_event();
+    assert_eq!(responder.stream_id(), stream_id);
     assert_eq!(data, Bytes::from_static(b"hello"));
     assert!(!is_0rtt);
 
@@ -339,8 +340,11 @@ async fn client_reset_before_query_completes_is_noop() {
         Ok((abandoned, doq::Event::Reset(42)))
     );
 
-    // No `Query` was ever emitted for the abandoned stream; the only event
-    // in the channel is the `HandshakeConfirmed` from this first round.
+    assert!(matches!(
+        helper.try_recv_event(),
+        Ok(super::DoqEvent::PeerReset { stream_id, code: 42 })
+            if stream_id == abandoned
+    ));
     assert!(matches!(
         helper.try_recv_event(),
         Ok(super::DoqEvent::HandshakeConfirmed)
@@ -366,37 +370,199 @@ async fn client_reset_before_query_completes_is_noop() {
     );
 }
 
-/// A client `STOP_SENDING` on the response direction surfaces to
-/// `send_response` as `Error::TransportError(StreamStopped)`, which
-/// `handle_write_error` treats as a benign per-stream close: the
-/// responder's `closed()` resolves and further `send`/`reset` calls
-/// return `StreamClosed`.
 #[tokio::test]
 async fn client_stop_sending_resolves_responder_closed() {
-    let mut helper = DoqDriverTestHelper::new().unwrap();
+    // Preserve zero, known DoQ, unknown, and large raw peer error codes.
+    for code in [
+        0,
+        DoqError::RequestCancelled.to_wire(),
+        0x1234,
+        (1 << 62) - 1,
+    ] {
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        let stream_id = helper.peer_send_query(b"q").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        // Take the query responder and drain the handshake event. Later empty
+        // queue checks must show whether a cancellation event was emitted.
+        let (_, _, responder) = helper.expect_query_event();
+        assert_eq!(responder.stream_id(), stream_id);
+        assert!(matches!(
+            helper.try_recv_event(),
+            Ok(super::DoqEvent::HandshakeConfirmed)
+        ));
 
+        // Shut down the client's read side to send STOP_SENDING for the
+        // server's response direction. Deliver it before queuing a response.
+        helper
+            .pipe
+            .client
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, code)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        // With no response to write, the driver has not observed the stop yet.
+        // The responder stays open and no PeerStopped event is queued.
+        assert!(responder.closed().now_or_never().is_none());
+        assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
+
+        // Queue a final response, then run the driver. Its write attempt must
+        // detect the stop, drop the responder receiver, and report the code.
+        responder
+            .send(Bytes::from_static(b"resp"), true)
+            .await
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        // Closure must already be observable. The event must carry the same
+        // stream ID and raw error code supplied by the client.
+        assert!(responder.closed().now_or_never().is_some());
+        assert!(matches!(
+            helper.try_recv_event(),
+            Ok(super::DoqEvent::PeerStopped {
+                stream_id: id,
+                code: observed,
+            }) if id == stream_id && observed == code
+        ));
+        // Both response operations fail once the driver has closed the channel.
+        assert_eq!(
+            responder.send(Bytes::from_static(b"too-late"), true).await,
+            Err(StreamClosed)
+        );
+        assert_eq!(
+            responder.reset(DoqError::RequestCancelled).await,
+            Err(StreamClosed)
+        );
+        // Extra packet exchanges and driver iterations must not duplicate the
+        // cancellation event that was already delivered.
+        helper.advance_and_run_loop().unwrap();
+        assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
+    }
+}
+
+#[tokio::test]
+async fn peer_reset_preserves_codes_once() {
+    for code in [
+        0,
+        DoqError::RequestCancelled.to_wire(),
+        0x1234,
+        (1 << 62) - 1,
+    ] {
+        let mut helper = DoqDriverTestHelper::new().unwrap();
+        let resets = helper.pipe.server.stats().reset_stream_count_remote;
+        helper
+            .pipe
+            .client
+            .stream_send(0, b"partial", false)
+            .unwrap();
+        helper
+            .pipe
+            .client
+            .stream_shutdown(0, quiche::Shutdown::Write, code)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.pipe.server.stats().reset_stream_count_remote,
+            resets + 1
+        );
+        assert!(matches!(
+            helper.try_recv_event(),
+            Ok(super::DoqEvent::PeerReset {
+                stream_id: 0,
+                code: observed,
+            }) if observed == code
+        ));
+        assert!(matches!(
+            helper.try_recv_event(),
+            Ok(super::DoqEvent::HandshakeConfirmed)
+        ));
+        assert_eq!(
+            helper.peer.poll(&mut helper.pipe.client),
+            Ok((0, doq::Event::Reset(code)))
+        );
+        helper.advance_and_run_loop().unwrap();
+        assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
+    }
+}
+
+#[tokio::test]
+async fn reset_after_complete_query_fin_is_not_observed() {
+    let mut helper = DoqDriverTestHelper::new().unwrap();
     let stream_id = helper.peer_send_query(b"q").unwrap();
     helper.advance_and_run_loop().unwrap();
     let (_, _, responder) = helper.expect_query_event();
-
+    assert!(matches!(
+        helper.try_recv_event(),
+        Ok(super::DoqEvent::HandshakeConfirmed)
+    ));
+    let resets = helper.pipe.server.stats().reset_stream_count_remote;
     helper
         .pipe
         .client
-        .stream_shutdown(stream_id, quiche::Shutdown::Read, 7)
+        .stream_shutdown(stream_id, quiche::Shutdown::Write, 0x1234)
         .unwrap();
-    helper.pipe.advance().unwrap();
-
+    helper.advance_and_run_loop().unwrap();
+    assert_eq!(
+        helper.pipe.server.stats().reset_stream_count_remote,
+        resets + 1
+    );
+    assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
+    assert!(responder.closed().now_or_never().is_none());
     responder
         .send(Bytes::from_static(b"resp"), true)
         .await
         .unwrap();
-    helper.work_loop_iter().unwrap();
-
-    assert!(responder.closed().now_or_never().is_some());
+    helper.advance_and_run_loop().unwrap();
     assert_eq!(
-        responder.send(Bytes::from_static(b"too-late"), true).await,
-        Err(StreamClosed)
+        helper.peer.poll(&mut helper.pipe.client),
+        Ok((stream_id, doq::Event::Response {
+            data: b"resp".to_vec()
+        }))
     );
+    assert_eq!(
+        helper.peer.poll(&mut helper.pipe.client),
+        Ok((stream_id, doq::Event::Finished))
+    );
+    assert!(responder.closed().now_or_never().is_some());
+}
+
+#[tokio::test]
+async fn peer_stop_code_is_observed_on_response_flush() {
+    let mut config = default_quiche_config();
+    config.set_initial_max_stream_data_bidi_local(20);
+    let mut helper = DoqDriverTestHelper::with_pipe(
+        Pipe::with_config_and_buf(&mut config).unwrap(),
+    )
+    .unwrap();
+    let stream_id = helper.peer_send_query(b"q").unwrap();
+    helper.advance_and_run_loop().unwrap();
+    let (_, _, responder) = helper.expect_query_event();
+    assert!(matches!(
+        helper.try_recv_event(),
+        Ok(super::DoqEvent::HandshakeConfirmed)
+    ));
+    responder
+        .send(Bytes::from(vec![b'x'; 200]), true)
+        .await
+        .unwrap();
+    helper.work_loop_iter().unwrap();
+    assert!(responder.closed().now_or_never().is_none());
+
+    helper
+        .pipe
+        .client
+        .stream_shutdown(stream_id, quiche::Shutdown::Read, 0x1234)
+        .unwrap();
+    helper.pipe.advance().unwrap();
+
+    helper.work_loop_iter().unwrap();
+    assert!(responder.closed().now_or_never().is_some());
+    assert!(matches!(
+        helper.try_recv_event(),
+        Ok(super::DoqEvent::PeerStopped {
+            stream_id: id,
+            code: 0x1234,
+        }) if id == stream_id
+    ));
+    helper.advance_and_run_loop().unwrap();
+    assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
 }
 
 /// A response too large to frame (`Error::MessageTooLarge`, only possible
