@@ -51,13 +51,17 @@
 //! https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
 //!
 //! Each [`DoqEvent::Query`] carries a dedicated [`DoqResponder`] bound to that
-//! query's stream; the consumer replies through it and never handles a raw
-//! `stream_id`. DoQ maps **exactly one query per client-initiated
+//! query's stream; the consumer replies through it and uses
+//! [`DoqResponder::stream_id`] to correlate peer cancellation events. DoQ maps
+//! **exactly one query per client-initiated
 //! bidirectional stream** (RFC 9250, Section 4.2), but a single query may
 //! receive **one or more** responses (zone transfers, RFC
 //! 9250, Section 5.7).
 //! The consumer calls [`DoqResponder::send`] once per response message, marking
 //! the last one with `fin = true`.
+//! The consumer must keep draining events while response tasks run. A full
+//! event queue pauses application reads and writes until a slot is released.
+//! Response data stays in the responder channels and core DoQ buffers.
 //! https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
 //! https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
 //!
@@ -119,11 +123,10 @@ pub(crate) enum ResponderMessage {
 /// Error returned by [`DoqResponder`] operations when the transaction is no
 /// longer live.
 ///
-/// The peer cancelled the stream (`STOP_SENDING` / `RESET_STREAM`) or the
-/// connection closed, so the driver dropped the receiving end of the
-/// responder's channel. This is a normal race, not a bug: the consumer should
-/// stop working on the query. It is the same condition [`DoqResponder::closed`]
-/// reports.
+/// The driver closed the responder channel after response completion,
+/// local reset, observed cancellation, or connection closure. The consumer
+/// should stop working on the query. This is also the condition
+/// [`DoqResponder::closed`] reports; it does not carry a peer error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamClosed;
 
@@ -146,14 +149,22 @@ impl std::error::Error for StreamClosed {}
 /// [`send`]: DoqResponder::send
 #[derive(Debug)]
 pub struct DoqResponder {
+    stream_id: u64,
     tx: mpsc::Sender<ResponderMessage>,
 }
 
 impl DoqResponder {
     /// Wraps the sending end of a per-query channel. The driver owns the
     /// paired receiver and chooses the channel's bound.
-    pub(crate) fn new(tx: mpsc::Sender<ResponderMessage>) -> Self {
-        DoqResponder { tx }
+    pub(crate) fn new(
+        stream_id: u64, tx: mpsc::Sender<ResponderMessage>,
+    ) -> Self {
+        DoqResponder { stream_id, tx }
+    }
+
+    /// Returns the stream ID used to correlate peer cancellation events.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
     }
 
     /// Queues one DNS response message for the query; the driver frames it
@@ -189,9 +200,16 @@ impl DoqResponder {
             .map_err(|_| StreamClosed)
     }
 
-    /// Resolves when the transaction stops being live: the peer sent
-    /// `STOP_SENDING` / `RESET_STREAM`, or the connection closed. A consumer
-    /// can `select!` on this to cancel in-progress work for the query.
+    /// Resolves after response completion, local reset, observed peer
+    /// cancellation, or connection cleanup. A consumer can `select!` on this
+    /// to stop query work.
+    ///
+    /// Peer codes are available only in [`DoqEvent::PeerStopped`] and
+    /// [`DoqEvent::PeerReset`]. A stop is observed on a response write or
+    /// flush; it can remain unobserved while the application has no
+    /// response data. A reset after the complete query and FIN have been
+    /// read can be suppressed by the transport and does not close this
+    /// channel.
     ///
     /// After this resolves, [`send`](Self::send) and [`reset`](Self::reset)
     /// return [`StreamClosed`].
@@ -201,6 +219,11 @@ impl DoqResponder {
 }
 
 /// An event emitted by a `DoqServerDriver` to its paired `DoqController`.
+///
+/// At most one event is emitted for each observed cancellation direction on
+/// a stream. Peer codes are stored only in these events. Queue saturation
+/// pauses application work; receiver drop or connection shutdown can prevent
+/// delivery. See [`DoqServerDriver::new`] for the backpressure policy.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DoqEvent {
@@ -240,16 +263,39 @@ pub enum DoqEvent {
     /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
     HandshakeConfirmed,
 
-    /// The QUIC connection has closed. No further events will be emitted and
-    /// commands sent after this are ignored.
+    /// The QUIC connection has closed. Delivery is best effort, including
+    /// when the event queue is full. Query cleanup does not depend on delivery.
     ConnectionClosed,
+
+    /// The peer's `STOP_SENDING` was observed on a response write or flush.
+    ///
+    /// The responder channel is closed before this event is queued. No extra
+    /// checks are made while a query is waiting for application response data.
+    PeerStopped {
+        /// The query's stream ID, also available on its responder.
+        stream_id: u64,
+        /// The raw peer application error code, including unknown codes.
+        code: u64,
+    },
+
+    /// The transport exposed a peer `RESET_STREAM`.
+    ///
+    /// This can occur without a preceding `Query` event. A reset after the
+    /// complete query and FIN have been read can be suppressed by the
+    /// transport. Any tracked responder channel is closed before this event
+    /// is queued.
+    PeerReset {
+        /// The reset stream ID.
+        stream_id: u64,
+        /// The raw peer application error code, including unknown codes.
+        code: u64,
+    },
 }
 
 /// A command sent from a `DoqController` to its paired `DoqServerDriver`.
 ///
-/// Per-query operations (sending responses, resetting a single transaction,
-/// observing peer cancellation) are **not** here; they live on the per-query
-/// [`DoqResponder`]. `DoqCommand` carries connection-level operations only.
+/// Per-query operations use [`DoqResponder`]. Peer cancellation codes use
+/// [`DoqEvent`]. `DoqCommand` carries connection-level operations only.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DoqCommand {

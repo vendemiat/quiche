@@ -42,6 +42,7 @@ use crate::doq::DoqResponder;
 use crate::doq::DoqServerDriver;
 use crate::quic::HandshakeInfo;
 use crate::ApplicationOverQuic as _;
+use crate::QuicResult;
 
 pub(crate) type Pipe = quiche::test_utils::Pipe<BufFactory>;
 
@@ -73,34 +74,30 @@ pub struct DoqDriverTestHelper {
 }
 
 impl DoqDriverTestHelper {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> QuicResult<Self> {
         Self::with_pipe(Pipe::with_config_and_buf(&mut default_quiche_config())?)
     }
 
-    pub fn with_pipe(mut pipe: Pipe) -> anyhow::Result<Self> {
+    pub fn with_pipe(mut pipe: Pipe) -> QuicResult<Self> {
         pipe.handshake().context("handshake")?;
 
         Self::with_initialized_pipe(pipe)
     }
 
-    pub(crate) fn with_initialized_pipe(mut pipe: Pipe) -> anyhow::Result<Self> {
-        // The client's own `peer_streams_left_bidi()`, read before it has
-        // opened any stream, is exactly the server's negotiated
-        // `initial_max_streams_bidi`: it's derived from the server's
-        // advertised transport parameter (`update_peer_max_streams_bidi`,
-        // `quiche/src/lib.rs`, called with `peer_params
-        // .initial_max_streams_bidi` once the handshake completes).
+    pub(crate) fn with_initialized_pipe(mut pipe: Pipe) -> QuicResult<Self> {
+        // The harness reserves space for a query, stop, and reset event per
+        // initial stream credit, plus two lifecycle events.
         let initial_max_streams_bidi = pipe.client.peer_streams_left_bidi();
-
-        let (mut driver, controller) =
-            DoqServerDriver::new(initial_max_streams_bidi);
-        driver
-            .on_conn_established(
-                &mut pipe.server,
-                &HandshakeInfo::new(Instant::now(), None),
-            )
-            .map_err(anyhow::Error::from_boxed)
-            .context("on_conn_established")?;
+        let event_capacity = usize::try_from(initial_max_streams_bidi)
+            .ok()
+            .and_then(|n| n.checked_mul(3))
+            .and_then(|n| n.checked_add(2))
+            .expect("test event capacity must fit in usize");
+        let (mut driver, controller) = DoqServerDriver::new(event_capacity)?;
+        driver.on_conn_established(
+            &mut pipe.server,
+            &HandshakeInfo::new(Instant::now(), None),
+        )?;
 
         let peer = doq::Connection::with_transport(&pipe.client)
             .context("create doq peer connection")?;

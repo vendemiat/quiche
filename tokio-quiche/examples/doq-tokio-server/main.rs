@@ -32,6 +32,7 @@ mod request;
 mod server;
 mod upstream;
 
+use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ use tokio_quiche::settings::Hooks;
 use tokio_quiche::settings::QuicSettings;
 use tokio_quiche::settings::TlsCertificatePaths;
 use tokio_quiche::ConnectionParams;
+use tokio_quiche::QuicResult;
 
 use crate::config::ServerConfig;
 use crate::config::DEFAULT_MAX_CONCURRENT_TRANSACTIONS;
@@ -112,8 +114,30 @@ fn doq_settings(disable_0rtt: bool) -> QuicSettings {
     settings
 }
 
+fn event_capacity(initial_max_streams_bidi: u64) -> io::Result<usize> {
+    // Allow a burst of queries, stops, and resets for the configured stream
+    // limit, plus two lifecycle events. All event types share these slots.
+    let capacity = usize::try_from(initial_max_streams_bidi)
+        .ok()
+        .and_then(|n| n.checked_mul(3))
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DoQ event capacity must fit in usize",
+            )
+        })?;
+    if capacity > Semaphore::MAX_PERMITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DoQ event capacity exceeds the channel limit",
+        ));
+    }
+    Ok(capacity)
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> QuicResult<()> {
     env_logger::init();
 
     let args = Args::parse();
@@ -121,7 +145,7 @@ async fn main() {
         .await
         .expect("DoQ UDP socket should be bindable");
     let settings = doq_settings(args.disable_0rtt);
-    let max_streams_bidi = settings.initial_max_streams_bidi;
+    let event_capacity = event_capacity(settings.initial_max_streams_bidi)?;
     let upstream: Arc<dyn Upstream> = match args.upstream_protocol {
         UpstreamProtocol::Udp =>
             Arc::new(UdpUpstream::new(args.upstream_address)),
@@ -154,16 +178,29 @@ async fn main() {
         let Ok(connection) = connection else {
             continue;
         };
-        let (driver, controller) = DoqServerDriver::new(max_streams_bidi);
+        let (driver, controller) = DoqServerDriver::new(event_capacity)?;
         connection.start(driver);
         tokio::spawn(serve(controller, Arc::clone(&upstream), config.clone()));
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn event_capacity_checks_caller_sizing_policy() {
+        assert_eq!(event_capacity(0).unwrap(), 2);
+        assert_eq!(event_capacity(100).unwrap(), 302);
+        for limit in [Semaphore::MAX_PERMITS as u64 / 3 + 1, u64::MAX] {
+            assert_eq!(
+                event_capacity(limit).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
 
     #[test]
     fn upstream_protocol_defaults_to_udp_and_accepts_tcp() {

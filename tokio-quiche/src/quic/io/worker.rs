@@ -1318,6 +1318,323 @@ fn random_u128() -> u128 {
     u128::from_ne_bytes(buf)
 }
 
+#[cfg(all(test, feature = "doq"))]
+mod doq_close_tests {
+    use std::future::Future;
+    use std::io;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use std::task::Context;
+
+    use bytes::Bytes;
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::doq::test_utils::default_quiche_config;
+    use crate::doq::test_utils::DoqDriverTestHelper;
+    use crate::doq::test_utils::Pipe;
+    use crate::doq::DoqError;
+    use crate::doq::DoqEvent;
+    use crate::doq::DoqServerDriver;
+    use crate::metrics::DefaultMetrics;
+    use crate::quic::HandshakeInfo;
+
+    struct PendingSend(Arc<AtomicUsize>);
+
+    struct ReadySend;
+
+    struct WakeCounter(AtomicUsize);
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl DatagramSocketSend for ReadySend {
+        fn poll_send(
+            &self, _cx: &mut Context, buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_send_to(
+            &self, cx: &mut Context, buf: &[u8], _addr: SocketAddr,
+        ) -> Poll<io::Result<usize>> {
+            self.poll_send(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn doq_capacity_release_resumes_worker_without_packets() {
+        for mode in 0..3 {
+            let mut config = default_quiche_config();
+            config.set_initial_max_stream_data_bidi_local(20);
+            let mut helper = DoqDriverTestHelper::with_pipe(
+                Pipe::with_config_and_buf(&mut config).unwrap(),
+            )
+            .unwrap();
+            let (mut driver, controller) = DoqServerDriver::new(1).unwrap();
+            driver
+                .on_conn_established(
+                    &mut helper.pipe.server,
+                    &HandshakeInfo::new(Instant::now(), None),
+                )
+                .unwrap();
+            helper.driver = driver;
+            helper.controller = controller;
+            let id = helper.peer_send_query(b"q").unwrap();
+            helper.pipe.advance().unwrap();
+            let mut responder = None;
+            if mode > 0 {
+                helper
+                    .driver
+                    .process_reads(&mut helper.pipe.server)
+                    .unwrap();
+                responder = Some(helper.expect_query_event().2);
+            }
+            helper
+                .driver
+                .process_writes(&mut helper.pipe.server)
+                .unwrap();
+            if let Some(responder) = &responder {
+                if mode == 2 {
+                    helper.try_recv_event().unwrap();
+                }
+                responder
+                    .send(Bytes::from(vec![b'x'; 200]), true)
+                    .await
+                    .unwrap();
+                if mode == 2 {
+                    helper
+                        .driver
+                        .process_writes(&mut helper.pipe.server)
+                        .unwrap();
+                    helper.peer_send_query(b"fill").unwrap();
+                    helper.pipe.advance().unwrap();
+                    helper
+                        .driver
+                        .process_reads(&mut helper.pipe.server)
+                        .unwrap();
+                }
+                helper
+                    .pipe
+                    .client
+                    .stream_shutdown(id, quiche::Shutdown::Read, 42)
+                    .unwrap();
+                helper.pipe.advance().unwrap();
+            }
+            assert_eq!(
+                helper.controller.event_receiver_mut().unwrap().capacity(),
+                0
+            );
+            let DoqDriverTestHelper {
+                mut pipe,
+                driver,
+                mut controller,
+                ..
+            } = helper;
+            let path = pipe.server.path_stats().next().unwrap();
+            let stats = Arc::new(Mutex::new(QuicConnectionStats::from_conn(
+                &pipe.server,
+            )));
+            let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+            let (conn_map_cmd_tx, _conn_map_cmd_rx) = mpsc::unbounded_channel();
+            let (_incoming_tx, incoming_pkt_receiver) = mpsc::channel(1);
+            let mut worker = IoWorker::new(
+                IoWorkerParams {
+                    socket: MaybeConnectedSocket::new(ReadySend),
+                    shutdown_tx,
+                    cfg: WriterConfig {
+                        pending_cid: None,
+                        peer_addr: path.peer_addr,
+                        local_addr: path.local_addr,
+                        with_gso: false,
+                        pacing_offload: false,
+                        with_pktinfo: false,
+                        pool_send_buffer: false,
+                    },
+                    audit_log_stats: Arc::new(QuicAuditStats::new(
+                        pipe.server.source_id().to_vec(),
+                    )),
+                    write_state: WriteState::default(),
+                    conn_map_cmd_tx,
+                    cid_generator: None,
+                    #[cfg(feature = "perf-quic-listener-metrics")]
+                    init_rx_time: None,
+                    metrics: DefaultMetrics,
+                },
+                RunningApplication,
+            );
+            let mut context = ConnectionStageContext {
+                in_pkt: None,
+                application: driver,
+                incoming_pkt_receiver,
+                stats,
+            };
+            let mut running =
+                Box::pin(worker.work_loop(&mut pipe.server, &mut context));
+            let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(running.as_mut().poll(&mut cx).is_pending());
+            if let Some(responder) = &responder {
+                assert!(responder.closed().now_or_never().is_none());
+            }
+            let before = wakes.0.load(Ordering::SeqCst);
+            controller.event_receiver_mut().unwrap().try_recv().unwrap();
+            assert!(wakes.0.load(Ordering::SeqCst) > before);
+            assert!(running.as_mut().poll(&mut cx).is_pending());
+            let event =
+                controller.event_receiver_mut().unwrap().try_recv().unwrap();
+            match event {
+                DoqEvent::Query {
+                    data, responder, ..
+                } if mode == 0 => {
+                    assert_eq!(data, Bytes::from_static(b"q"));
+                    assert_eq!(responder.stream_id(), id);
+                },
+                DoqEvent::PeerStopped { stream_id, code } if mode > 0 => {
+                    assert_eq!(stream_id, id);
+                    assert_eq!(code, 42);
+                    assert!(responder
+                        .as_ref()
+                        .unwrap()
+                        .closed()
+                        .now_or_never()
+                        .is_some());
+                },
+                other => panic!("unexpected event: {other:?}"),
+            }
+            drop(running);
+            assert!(pipe.server.local_error().is_none());
+        }
+    }
+
+    impl DatagramSocketSend for PendingSend {
+        fn poll_send(
+            &self, _cx: &mut Context, buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            assert!(!buf.is_empty());
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+
+        fn poll_send_to(
+            &self, cx: &mut Context, buf: &[u8], _addr: SocketAddr,
+        ) -> Poll<io::Result<usize>> {
+            self.poll_send(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn doq_cleanup_precedes_pending_final_close_flush() {
+        let mut config = default_quiche_config();
+        config.set_initial_max_streams_bidi(3);
+        config.set_initial_max_stream_data_bidi_local(2);
+        let mut helper = DoqDriverTestHelper::with_pipe(
+            Pipe::with_config_and_buf(&mut config).unwrap(),
+        )
+        .unwrap();
+        helper.peer_send_query(b"first").unwrap();
+        helper.peer_send_query(b"second").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let (_, _, parked) = helper.expect_query_event();
+        let (_, _, waiting) = helper.expect_query_event();
+        parked
+            .send(Bytes::from_static(b"response"), true)
+            .await
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let slots = helper.controller.event_receiver_mut().unwrap().capacity();
+        for index in 0..slots {
+            let stream_id =
+                DoqDriverTestHelper::raw_client_stream_id(index as u64 + 2);
+            helper
+                .pipe
+                .client
+                .stream_send(stream_id, b"\0", false)
+                .unwrap();
+            helper
+                .pipe
+                .client
+                .stream_shutdown(stream_id, quiche::Shutdown::Write, 42)
+                .unwrap();
+            helper.advance_and_run_loop().unwrap();
+        }
+        assert_eq!(
+            helper.controller.event_receiver_mut().unwrap().capacity(),
+            0
+        );
+        assert!(parked.closed().now_or_never().is_none());
+        assert!(waiting.closed().now_or_never().is_none());
+
+        let DoqDriverTestHelper {
+            mut pipe,
+            driver,
+            mut controller,
+            ..
+        } = helper;
+        let path = pipe.server.path_stats().next().unwrap();
+        let stats =
+            Arc::new(Mutex::new(QuicConnectionStats::from_conn(&pipe.server)));
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let (conn_map_cmd_tx, _conn_map_cmd_rx) = mpsc::unbounded_channel();
+        let (_incoming_tx, incoming_pkt_receiver) = mpsc::channel(1);
+        let send_polls = Arc::new(AtomicUsize::new(0));
+        let worker = IoWorker::new(
+            IoWorkerParams {
+                socket: MaybeConnectedSocket::new(PendingSend(
+                    send_polls.clone(),
+                )),
+                shutdown_tx,
+                cfg: WriterConfig {
+                    pending_cid: None,
+                    peer_addr: path.peer_addr,
+                    local_addr: path.local_addr,
+                    with_gso: false,
+                    pacing_offload: false,
+                    with_pktinfo: false,
+                    pool_send_buffer: false,
+                },
+                audit_log_stats: Arc::new(QuicAuditStats::new(
+                    pipe.server.source_id().to_vec(),
+                )),
+                write_state: WriteState::default(),
+                conn_map_cmd_tx,
+                cid_generator: None,
+                #[cfg(feature = "perf-quic-listener-metrics")]
+                init_rx_time: None,
+                metrics: DefaultMetrics,
+            },
+            Close {
+                work_loop_result: Ok(()),
+            },
+        );
+        let mut context = ConnectionStageContext {
+            in_pkt: None,
+            application: driver,
+            incoming_pkt_receiver,
+            stats,
+        };
+        pipe.server
+            .close(true, DoqError::NoError.to_wire(), b"")
+            .unwrap();
+        let mut close = Box::pin(worker.close(&mut pipe.server, &mut context));
+        assert!(close.as_mut().now_or_never().is_none());
+        assert!(send_polls.load(Ordering::SeqCst) > 0);
+        assert!(parked.closed().now_or_never().is_some());
+        assert!(waiting.closed().now_or_never().is_some());
+        assert_eq!(controller.event_receiver_mut().unwrap().capacity(), 0);
+    }
+}
+
 #[cfg(test)]
 mod pooled_send_buf_tests {
     use super::*;

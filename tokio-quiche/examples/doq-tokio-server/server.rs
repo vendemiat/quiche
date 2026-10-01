@@ -216,6 +216,7 @@ mod tests {
     use super::*;
     use crate::dns::query;
     use crate::doq_settings;
+    use crate::event_capacity;
     use crate::upstream::ResponseSequence;
     use crate::upstream::TcpUpstream;
     use crate::upstream::UdpUpstream;
@@ -1039,7 +1040,8 @@ mod tests {
         let server_socket = UdpSocket::bind(bind_address).await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
         let settings = doq_settings(disable_0rtt);
-        let max_streams_bidi = settings.initial_max_streams_bidi;
+        let event_capacity =
+            event_capacity(settings.initial_max_streams_bidi).unwrap();
         let mut listeners = tokio_quiche::listen(
             [server_socket],
             ConnectionParams::new_server(
@@ -1059,7 +1061,8 @@ mod tests {
             let mut tasks = JoinSet::new();
             for _ in 0..connections {
                 let connection = listener.next().await.unwrap().unwrap();
-                let (driver, controller) = DoqServerDriver::new(max_streams_bidi);
+                let (driver, controller) =
+                    DoqServerDriver::new(event_capacity).unwrap();
                 connection.start(driver);
                 let upstream = Arc::clone(&upstream);
                 let config = config.clone();
@@ -2393,7 +2396,8 @@ mod tests {
         let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
         let settings = doq_settings(true);
-        let max_streams_bidi = settings.initial_max_streams_bidi;
+        let event_capacity =
+            event_capacity(settings.initial_max_streams_bidi).unwrap();
         let mut listeners = tokio_quiche::listen(
             [server_socket],
             ConnectionParams::new_server(
@@ -2412,7 +2416,8 @@ mod tests {
         let server_upstream = Arc::clone(&upstream);
         let server_task = tokio::spawn(async move {
             let connection = listener.next().await.unwrap().unwrap();
-            let (driver, controller) = DoqServerDriver::new(max_streams_bidi);
+            let (driver, controller) =
+                DoqServerDriver::new(event_capacity).unwrap();
             connection.start(driver);
             serve(controller, server_upstream, ServerConfig {
                 transaction_timeout: Duration::from_secs(30),
