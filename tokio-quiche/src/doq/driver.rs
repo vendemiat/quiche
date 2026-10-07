@@ -1333,6 +1333,8 @@ mod tests {
     #[tokio::test]
     async fn flow_blocked_flush_releases_idle_reservation() {
         let (mut helper, waiting, parked) = waiting_and_parked_queries().await;
+        let waiting_id = waiting.stream_id();
+        let parked_id = parked.stream_id();
         let capacity = helper.driver.event_sender.capacity();
         // QUIC flow control blocks the buffered response.
         // now_or_never polls each wait once and drops it if it is pending.
@@ -1347,6 +1349,25 @@ mod tests {
         // Dropping pending waits must leave event capacity unchanged.
         assert_eq!(helper.driver.event_sender.capacity(), capacity);
         assert!(waiting.closed().now_or_never().is_none());
+        assert!(parked.closed().now_or_never().is_none());
+        // Complete the short response while the other stream remains blocked.
+        waiting.send(Bytes::from_static(b"ok"), true).await.unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.peer.poll(&mut helper.pipe.client),
+            Ok((waiting_id, doq::Event::Response {
+                data: b"ok".to_vec()
+            }))
+        );
+        assert_eq!(
+            helper.peer.poll(&mut helper.pipe.client),
+            Ok((waiting_id, doq::Event::Finished))
+        );
+        assert!(helper
+            .driver
+            .conn_mut()
+            .unwrap()
+            .response_pending(parked_id));
         assert!(parked.closed().now_or_never().is_none());
     }
 
