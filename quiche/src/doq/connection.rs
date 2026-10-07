@@ -1774,7 +1774,7 @@ mod tests {
         let mut server = Connection::with_transport(&pipe.server).unwrap();
         let mut client = Connection::with_transport(&pipe.client).unwrap();
 
-        pipe.client.stream_send(0, &framed(b"hello"), true).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"hello"), Ok(0));
         pipe.advance().unwrap();
 
         assert_eq!(
@@ -1999,9 +1999,7 @@ mod tests {
         let mut server = Connection::with_transport(&pipe.server).unwrap();
         let mut client = Connection::with_transport(&pipe.client).unwrap();
 
-        pipe.client
-            .stream_send(0, &framed(b"axfr query"), true)
-            .unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"axfr query"), Ok(0));
         pipe.advance().unwrap();
 
         assert_eq!(
