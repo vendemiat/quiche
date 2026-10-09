@@ -131,3 +131,8 @@ tokio = { workspace = true, features = ["net", "time", "test-util", "rt-multi-th
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 nix = { workspace = true, features = ["signal"] }
+
+[[example]]
+name = "doq-tokio-server"
+path = "examples/doq-tokio-server/main.rs"
+required-features = ["doq"]
