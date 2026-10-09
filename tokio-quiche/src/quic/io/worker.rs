@@ -1550,11 +1550,13 @@ mod doq_close_tests {
                         pipe.server.source_id().to_vec(),
                     )),
                     write_state: WriteState::default(),
+                    dscp_handle: None,
                     conn_map_cmd_tx,
                     cid_generator: None,
                     #[cfg(feature = "perf-quic-listener-metrics")]
                     init_rx_time: None,
                     metrics: DefaultMetrics,
+                    handshake_info: HandshakeInfo::new(Instant::now(), None),
                 },
                 RunningApplication,
             );
@@ -1563,6 +1565,7 @@ mod doq_close_tests {
                 application: driver,
                 incoming_pkt_receiver,
                 stats,
+                connection_hook: None,
             };
             let mut running =
                 Box::pin(worker.work_loop(&mut pipe.server, &mut context));
@@ -1705,11 +1708,13 @@ mod doq_close_tests {
                     pipe.server.source_id().to_vec(),
                 )),
                 write_state: WriteState::default(),
+                dscp_handle: None,
                 conn_map_cmd_tx,
                 cid_generator: None,
                 #[cfg(feature = "perf-quic-listener-metrics")]
                 init_rx_time: None,
                 metrics: DefaultMetrics,
+                handshake_info: HandshakeInfo::new(Instant::now(), None),
             },
             Close {
                 work_loop_result: Ok(()),
@@ -1720,6 +1725,7 @@ mod doq_close_tests {
             application: driver,
             incoming_pkt_receiver,
             stats,
+            connection_hook: None,
         };
         // Queue CONNECTION_CLOSE, then run the worker's close path.
         pipe.server
