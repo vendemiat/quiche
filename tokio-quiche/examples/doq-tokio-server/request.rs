@@ -138,11 +138,12 @@ impl Request {
                     if let Some(udp) = (self.upstream.as_ref() as &dyn Any)
                         .downcast_ref::<UdpUpstream>()
                     {
-                        // RFC 1123, Section 6.1.3.2: "If the Answer section of
+                        // [RFC 1123, Section 6.1.3.2]: "If the Answer section of
                         // the response is truncated and if the requester
                         // supports TCP, it SHOULD try the query again using
                         // TCP."
-                        // https://datatracker.ietf.org/doc/html/rfc1123#section-6.1.3.2
+                        //
+                        // [RFC 1123, Section 6.1.3.2]: https://datatracker.ietf.org/doc/html/rfc1123#section-6.1.3.2
                         let tcp = TcpUpstream::from(udp);
                         self.upstream_query =
                             tcp.prepare_query(&self.client_query)?;

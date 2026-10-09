@@ -41,11 +41,12 @@ use domain::base::Message;
 use domain::base::MessageBuilder;
 use domain::rdata::AllRecordData;
 
-// RFC 9715, Section 3.2: "UDP requestors should limit the requestor's maximum
+// [RFC 9715, Section 3.2]: "UDP requestors should limit the requestor's maximum
 // UDP payload size to fit in the minimum of the interface MTU, the network MTU
 // value configured by the network operators, and the RECOMMENDED maximum
 // DNS/UDP payload size 1400. A smaller limit may be allowed."
-// https://datatracker.ietf.org/doc/html/rfc9715#section-3.2
+//
+// [RFC 9715, Section 3.2]: https://datatracker.ietf.org/doc/html/rfc9715#section-3.2
 pub(crate) const MAX_DNS_UDP_BUFFER_SIZE: u16 = 1400;
 
 /// A validated DNS query received over DoQ.
@@ -173,10 +174,11 @@ impl DoqDnsQuery<Bytes> {
     pub(crate) fn prepare_upstream_query(
         &self, udp_payload_size: Option<u16>,
     ) -> Result<Message<Bytes>, DnsError> {
-        // RFC 9250, Section 4.2.1: "When forwarding a DNS message from DoQ
+        // [RFC 9250, Section 4.2.1]: "When forwarding a DNS message from DoQ
         // over another transport, a DNS Message ID MUST be generated according
         // to the rules of the protocol that is in use."
-        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
+        //
+        // [RFC 9250, Section 4.2.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
         let mut header = Header::new();
         header.set_random_id();
         let Some(udp_payload_size) = udp_payload_size else {
@@ -186,11 +188,12 @@ impl DoqDnsQuery<Bytes> {
         let mut additional = builder_from_msg_without_opt(&self.0)?;
         additional.header_mut().set_id(header.id());
         let source_opt = self.0.opt();
-        // RFC 6891, Section 6.2.3: "The requestor's UDP payload size (encoded
+        // [RFC 6891, Section 6.2.3]: "The requestor's UDP payload size (encoded
         // in the RR CLASS field) is the number of octets of the largest UDP
         // payload that can be reassembled and delivered in the requestor's
         // network stack."
-        // https://datatracker.ietf.org/doc/html/rfc6891#section-6.2.3
+        //
+        // [RFC 6891, Section 6.2.3]: https://datatracker.ietf.org/doc/html/rfc6891#section-6.2.3
         additional.opt(|opt| {
             if let Some(source_opt) = source_opt.as_ref() {
                 opt.clone_from(source_opt)?;
@@ -213,9 +216,10 @@ impl TryFrom<Message<Bytes>> for DoqDnsQuery<Bytes> {
     type Error = DnsError;
 
     fn try_from(message: Message<Bytes>) -> Result<Self, Self::Error> {
-        // RFC 9250, Section 4.2.1: "When sending queries over a QUIC
+        // [RFC 9250, Section 4.2.1]: "When sending queries over a QUIC
         // connection, the DNS Message ID MUST be set to 0."
-        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
+        //
+        // [RFC 9250, Section 4.2.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
         if message.header().id() != 0 || message.header().qr() {
             return Err(DnsError::InvalidResponse);
         }
@@ -244,9 +248,10 @@ impl DoqDnsResponse<Bytes> {
     pub(crate) fn from_upstream(
         response: Message<Bytes>, query: &Message<Bytes>,
     ) -> Result<Self, DnsError> {
-        // RFC 5936, Section 2.2: "For subsequent messages, it MAY do the same
+        // [RFC 5936, Section 2.2]: "For subsequent messages, it MAY do the same
         // or leave the Question section empty."
-        // https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
+        //
+        // [RFC 5936, Section 2.2]: https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
         let xfr_response_without_question = query.is_xfr() &&
             response.header().qr() &&
             response.header().id() == query.header().id() &&
@@ -264,9 +269,10 @@ impl DoqDnsResponse<Bytes> {
             }
         }
 
-        // RFC 9250, Section 4.2.1: "When forwarding a DNS message from another
+        // [RFC 9250, Section 4.2.1]: "When forwarding a DNS message from another
         // transport over DoQ, the Message ID MUST be set to 0."
-        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
+        //
+        // [RFC 9250, Section 4.2.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
         let response = update_id(response, 0)?;
         Self::try_from(response)
     }
@@ -284,19 +290,21 @@ impl DoqDnsResponse<Bytes> {
             return Ok(self);
         }
 
-        // RFC 6891, Section 6.1.3: "Note that EXTENDED-RCODE value 0
+        // [RFC 6891, Section 6.1.3]: "Note that EXTENDED-RCODE value 0
         // indicates that an unextended RCODE is in use (values 0 through
         // 15)."
-        // https://datatracker.ietf.org/doc/html/rfc6891#section-6.1.3
+        //
+        // [RFC 6891, Section 6.1.3]: https://datatracker.ietf.org/doc/html/rfc6891#section-6.1.3
         if self.0.opt_rcode().to_int() >= 16 {
             return Err(DnsError::ExtendedRcodeOverflow);
         }
 
-        // RFC 6891, Section 7: "Lack of presence of an OPT record in a request
+        // [RFC 6891, Section 7]: "Lack of presence of an OPT record in a request
         // MUST be taken as an indication that the requestor does not implement
         // any part of this specification and that the responder MUST NOT
         // include an OPT record in its response."
-        // https://datatracker.ietf.org/doc/html/rfc6891#section-7
+        //
+        // [RFC 6891, Section 7]: https://datatracker.ietf.org/doc/html/rfc6891#section-7
         if self.0.opt().is_none() {
             return Ok(self);
         }

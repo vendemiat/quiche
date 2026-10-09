@@ -75,10 +75,12 @@ pub(crate) async fn serve(
             };
 
             if is_0rtt && !is_replayable_opcode(query.opcode()) {
-                // RFC 9250, Section 4.5: "Servers supporting 0-RTT MUST NOT
+                // [RFC 9250, Section 4.5]: "Servers supporting 0-RTT MUST NOT
                 // immediately process non-replayable transactions received in
                 // 0-RTT data but instead MUST adopt one of the following
-                // behaviors:" https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+                // behaviors:"
+                //
+                // [RFC 9250, Section 4.5]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
                 tokio::spawn(send_terminal(
                     responder,
                     query.failed_reponse(Rcode::REFUSED, vec![
@@ -103,10 +105,11 @@ pub(crate) async fn serve(
             {
                 Ok(permit) => permit,
                 Err(_) => {
-                    // RFC 8914, Section 4.15: "The server is unable to answer
+                    // [RFC 8914, Section 4.15]: "The server is unable to answer
                     // the query, as it was not fully functional when the query
                     // was received."
-                    // https://datatracker.ietf.org/doc/html/rfc8914#section-4.15
+                    //
+                    // [RFC 8914, Section 4.15]: https://datatracker.ietf.org/doc/html/rfc8914#section-4.15
                     tokio::spawn(send_terminal(
                         responder,
                         query.failed_reponse(Rcode::SERVFAIL, vec![
