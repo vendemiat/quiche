@@ -47,9 +47,10 @@ use domain::base::MessageBuilder;
 ///
 /// Accepts `ip`, `ip:port`, `[v6]`, `[v6]:port`, bare `v6`, `host`, and
 /// `host:port`; host names are resolved via the system resolver. For IP
-/// literals no SNI is returned because RFC 6066, Section 3 forbids IP-literal
+/// literals no SNI is returned because [RFC 6066, Section 3] forbids IP-literal
 /// SNI; for host names the host is returned as the SNI value.
-/// https://datatracker.ietf.org/doc/html/rfc6066#section-3
+///
+/// [RFC 6066, Section 3]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
 #[allow(unused)]
 pub fn resolve_server(
     server: &str, default_port: u16,

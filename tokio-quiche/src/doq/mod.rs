@@ -24,50 +24,223 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! DNS over QUIC (DoQ) driver for `tokio-quiche`.
+//! Build a DNS over QUIC (DoQ) server with Tokio.
 //!
-//! This module provides an
-//! [`ApplicationOverQuic`](crate::ApplicationOverQuic) implementation,
-//! `DoqServerDriver`, that implements the DoQ mapping specified by RFC 9250,
-//! Section 4. It mirrors the
-//! [`H3Driver`](crate::http3::driver::H3Driver) / controller split: the driver
-//! owns the QUIC side and runs inside the connection's IO worker task, while
-//! the async application logic (forwarding to a resolver, etc.) lives in a
-//! consumer task that drains the paired `DoqController`'s event channel.
-//! https://datatracker.ietf.org/doc/html/rfc9250#section-4
+//! Enable the `doq` feature to use this module. Application code accepts QUIC
+//! connections and uses [`DoqController`] to receive events and request
+//! connection closure. Query handlers send responses through [`DoqResponder`].
+//! The connection's IO worker moves packets and drives DoQ through
+//! [`DoqServerDriver`].
 //!
-//! ```text
-//!   client bidi stream -> DoqServerDriver --DoqEvent::Query{responder}--> app
-//!                              ^                                           |
-//!                              +------------ DoqResponder::send -----------+
+//! # Configure the listener
+//!
+//! Begin with [`QuicSettings`](crate::settings::QuicSettings). Set
+//! [`DOQ_ALPN`], choose flow-control and stream limits, and choose an idle
+//! timeout. This example selects limits and disables early data. The values
+//! are application choices:
+//!
+//! ```
+//! use tokio_quiche::doq::DOQ_ALPN;
+//! use tokio_quiche::settings::QuicSettings;
+//!
+//! let mut settings = QuicSettings::default();
+//! settings.alpn = vec![DOQ_ALPN.to_vec()];
+//! settings.enable_dgram = false;
+//! settings.enable_early_data = false;
+//! settings.initial_max_data = 1_048_576;
+//! settings.initial_max_stream_data_bidi_local = 65_537;
+//! settings.initial_max_stream_data_bidi_remote = 65_537;
+//! settings.initial_max_streams_bidi = 16;
+//! settings.initial_max_streams_uni = 0;
 //! ```
 //!
-//! Unlike [`H3Driver`](crate::http3::driver::H3Driver), `DoqServerDriver`
-//! does **not** parse or frame DNS messages itself: all per-stream
-//! reassembly, DoQ's 2-octet length-prefix framing, and the RFC 9250, Section
-//! 4.3.3 protocol-error matrix live in [`quiche::doq::Connection`], a
-//! synchronous, IO-less object shared with the blocking-mio DoQ examples. This
-//! driver is a thin pump over that `Connection`.
-//! https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+//! Pass the settings and TLS credentials to
+//! [`ConnectionParams::new_server`](crate::settings::ConnectionParams::new_server),
+//! then create a listener with [`listen`](crate::listen). See the
+//! [`doq-tokio-server` example] for socket, certificate, and listener setup.
 //!
-//! Each [`DoqEvent::Query`] carries a dedicated [`DoqResponder`] bound to that
-//! query's stream; the consumer replies through it and uses
-//! [`DoqResponder::stream_id`] to correlate peer cancellation events. DoQ maps
-//! **exactly one query per client-initiated
-//! bidirectional stream** (RFC 9250, Section 4.2), but a single query may
-//! receive **one or more** responses (zone transfers, RFC
-//! 9250, Section 5.7).
-//! The consumer calls [`DoqResponder::send`] once per response message, marking
-//! the last one with `fin = true`.
-//! The consumer must keep draining events while response tasks run. A full
-//! event queue pauses application reads and writes until a slot is released.
-//! Response data stays in the responder channels and core DoQ buffers.
-//! https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-//! https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
+//! # Start each accepted connection
 //!
-//! The wire-format primitives (`DoqError`, `read_dns_message`,
-//! `write_dns_message`, `is_replayable_opcode`, `DOQ_ALPN`, `DOQ_PORT`) live in
-//! [`quiche::doq`] and are re-exported here for convenience.
+//! For each accepted connection, call [`DoqServerDriver::new`] to create a
+//! driver and its paired [`DoqController`]. Choose a positive event capacity;
+//! all query and connection events share this queue. Then pass the driver to
+//! [`InitialQuicConnection::start`](crate::InitialQuicConnection::start).
+//! This helper starts an accepted connection from a UDP listener and returns
+//! the controller to application code:
+//!
+//! ```no_run
+//! use tokio::net::UdpSocket;
+//! use tokio_quiche::doq::DoqController;
+//! use tokio_quiche::doq::DoqServerDriver;
+//! use tokio_quiche::metrics::DefaultMetrics;
+//! use tokio_quiche::InitialQuicConnection;
+//! use tokio_quiche::QuicResult;
+//!
+//! fn start_connection(
+//!     connection: InitialQuicConnection<UdpSocket, DefaultMetrics>,
+//!     event_capacity: usize,
+//! ) -> QuicResult<DoqController> {
+//!     let (driver, controller) = DoqServerDriver::new(event_capacity)?;
+//!     connection.start(driver);
+//!     Ok(controller)
+//! }
+//! ```
+//!
+//! The IO worker owns the QUIC connection and driver. It handles packet input,
+//! timers, and packet output. The driver calls the synchronous
+//! [`quiche::doq::Connection`] to join message fragments, frame responses, and
+//! enforce the [RFC 9250, Section 4.3.3] protocol-error rules. Application code
+//! drives the controller's event receiver while the worker runs.
+//!
+//! ```text
+//! UDP socket <--> [Connection IO worker: QUIC + DoqServerDriver]
+//!                                              |
+//!                                              | events (bounded)
+//!                                              v
+//!                                Application event-loop task
+//!                                DoqController + event receiver
+//!                                              |
+//!                                              | query + responder
+//!                                              v
+//!                                      Query handler task
+//!                                      DoqResponder
+//!
+//! DoqController -- close commands (unbounded) --> DoqServerDriver
+//! DoqResponder -- response/reset (bounded per query) --> DoqServerDriver
+//! ```
+//!
+//! Events use one bounded queue per connection. Responses and reset requests
+//! use a separate bounded queue per query. Close commands use an unbounded
+//! connection queue. The controller and responder are application handles;
+//! the worker performs the corresponding QUIC operations.
+//!
+//! See [`DoqServerDriver::new`] for the event queue and its capacity,
+//! [`DoqResponder::send`] and [`DoqResponder::reset`] for the query queue,
+//! and [`DoqController::close_connection`] for the close-command queue.
+//!
+//! # Receive and dispatch queries
+//!
+//! Run an application task that owns the controller. Take its event receiver
+//! once with [`DoqController::take_event_receiver`] and keep receiving events
+//! while query handlers run. Each [`DoqEvent::Query`] contains the DNS message
+//! without a length prefix, an `is_0rtt` flag, and a [`DoqResponder`] for that
+//! query. The query uses its own bidirectional stream
+//! ([RFC 9250, Section 4.2]); the responder keeps replies on that stream.
+//!
+//! This event loop passes queries to an application-supplied `dispatch`
+//! function. That function must admit and schedule query work without waiting
+//! for the response. Choose a separate limit for active query tasks and an
+//! overload policy. Event capacity limits queued events; it does not bound
+//! active tasks or total response memory.
+//!
+//! ```no_run
+//! use bytes::Bytes;
+//! use tokio_quiche::doq::DoqController;
+//! use tokio_quiche::doq::DoqEvent;
+//! use tokio_quiche::doq::DoqResponder;
+//!
+//! async fn receive_queries(
+//!     mut controller: DoqController,
+//!     mut dispatch: impl FnMut(Bytes, bool, DoqResponder),
+//! ) {
+//!     let Some(mut events) = controller.take_event_receiver() else {
+//!         return;
+//!     };
+//!     while let Some(event) = events.recv().await {
+//!         match event {
+//!             DoqEvent::Query {
+//!                 data,
+//!                 is_0rtt,
+//!                 responder,
+//!             } => {
+//!                 dispatch(data, is_0rtt, responder);
+//!             },
+//!             DoqEvent::ConnectionClosed => break,
+//!             _ => {},
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! This snippet shows query dispatch. In the event loop, also handle peer
+//! cancellation events and handshake confirmation as application policy
+//! requires.
+//! Parse and validate DNS in the query handler, then choose how to answer.
+//! If early data is enabled, use `is_0rtt` to apply the DNS replay policy.
+//! The driver does not select forwarding, transfer, padding, or replay policy.
+//!
+//! # Send the response from a query task
+//!
+//! Prepare a DNS response without a length prefix and call
+//! [`DoqResponder::send`]. For one response, set `fin = true`:
+//!
+//! ```
+//! use bytes::Bytes;
+//! use tokio_quiche::doq::DoqResponder;
+//! use tokio_quiche::doq::StreamClosed;
+//!
+//! async fn answer_query(
+//!     responder: DoqResponder, response: Bytes,
+//! ) -> Result<(), StreamClosed> {
+//!     responder.send(response, true).await
+//! }
+//! ```
+//!
+//! For several responses, call `send` with `fin = false` for each earlier
+//! message and `fin = true` for the final message. This supports the
+//! multi-response stream used by zone transfers ([RFC 9250, Section 5.7]);
+//! application code determines when the DNS transaction is complete.
+//!
+//! A DNS message, including its header, can contain at most 65,535 bytes.
+//! The driver adds the two-byte DoQ prefix and preserves the message bytes.
+//! `send` waits for space in the query's response queue. Success means the
+//! queue accepted the response. The driver must still pass it to QUIC and
+//! the worker must send packets. Success does not mean the peer received or
+//! acknowledged the response.
+//!
+//! Keep the event loop running during response production. A full event queue
+//! pauses the driver's application reads and writes. Response data remains
+//! in responder queues and core DoQ buffers until event capacity is available.
+//! Waiting for response sends in the event loop can therefore stop progress.
+//! The driver flushes partial response writes when QUIC becomes writable;
+//! the query task only needs to await `send`.
+//!
+//! # Stop a query or close the connection
+//!
+//! To abandon a query, await [`DoqResponder::reset`]. This queues a reset after
+//! responses already in that query's queue. If application code drops the
+//! responder without a final response or reset, the driver processes queued
+//! responses and then resets the unfinished stream when it observes channel
+//! closure.
+//!
+//! Use [`DoqResponder::closed`] to stop application work when its response
+//! channel closes. It also resolves after the driver passes the final response
+//! and FIN to QUIC, so it does not identify peer cancellation by itself.
+//! Correlate [`DoqEvent::PeerStopped`] and [`DoqEvent::PeerReset`] with
+//! [`DoqResponder::stream_id`] when the raw peer code is needed. Stops are
+//! observed on response writes or flushes. A reset after the complete query
+//! and FIN have been read can be suppressed by the transport; see
+//! [`DoqResponder::closed`] for these visibility limits.
+//!
+//! Keep the event receiver alive while serving the connection. Dropping it
+//! makes the driver initiate connection close. To request a close explicitly,
+//! call [`DoqController::close_connection`] with a DoQ error and reason. It
+//! queues a command without waiting for transport close. After taking the
+//! receiver, application code can keep it in one task and retain the controller
+//! elsewhere for close commands.
+//!
+//! Stop query work when the connection ends. Delivery of
+//! [`DoqEvent::ConnectionClosed`] is best effort; responder cleanup does not
+//! depend on that event. Driver failures use [`DoqConnectionError`]; the
+//! controller does not retain the worker's terminal error. See the
+//! [`doq-tokio-server` example] for a controller loop and concurrent handlers
+//! with DNS validation, cancellation, and an application concurrency limit.
+//!
+//! [RFC 9250, Section 4]: https://datatracker.ietf.org/doc/html/rfc9250#section-4
+//! [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+//! [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+//! [RFC 9250, Section 5.7]: https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
+//! [`doq-tokio-server` example]: ../../src/doq_tokio_server/main.rs.html
 
 use std::fmt;
 
@@ -146,6 +319,12 @@ impl std::error::Error for StreamClosed {}
 /// channel, which provides automatic per-query backpressure: [`send`] awaits
 /// channel capacity when the driver is behind.
 ///
+/// Complete the transaction by queuing a final [`send`](Self::send) call or
+/// [`reset`](Self::reset). If the consumer drops the handle without queuing
+/// either, the driver processes queued messages, then resets the unfinished
+/// stream with [`DoqError::InternalError`] when it observes channel closure.
+/// Observation can wait for buffered response writes or event capacity.
+///
 /// [`send`]: DoqResponder::send
 #[derive(Debug)]
 pub struct DoqResponder {
@@ -173,13 +352,26 @@ impl DoqResponder {
     /// `data` is the raw DNS message *without* the length prefix and is sent
     /// verbatim (no padding or other mutation). `fin` marks the last response
     /// of the transaction: a single-response query sends one call with
-    /// `fin = true`, while a zone transfer per RFC 9250, Section 5.7 sends one
-    /// or more `fin = false` calls followed by a final `fin = true`.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
+    /// `fin = true`, while a zone transfer per [RFC 9250, Section 5.7] sends
+    /// one or more `fin = false` calls followed by a final `fin = true`.
     ///
     /// Awaits channel capacity, applying backpressure to a producer that
     /// outruns the driver. Returns [`StreamClosed`] if the transaction is no
     /// longer live (see [`closed`](Self::closed)); the response is dropped.
+    ///
+    /// Success means the response entered the bounded channel. It does not
+    /// mean the driver wrote it to QUIC or the peer received or acknowledged
+    /// it. A final response closes the responder channel after the driver
+    /// passes all response bytes and FIN to the transport, without waiting
+    /// for a peer acknowledgement.
+    ///
+    /// `data` must be at most 65,535 bytes.
+    /// [`quiche::doq::MAX_DOQ_MESSAGE_LEN`] includes the two-byte prefix.
+    /// The channel accepts an oversized message; when the driver processes
+    /// it, it resets the stream with [`DoqError::InternalError`] and closes
+    /// the responder channel.
+    ///
+    /// [RFC 9250, Section 5.7]: https://datatracker.ietf.org/doc/html/rfc9250#section-5.7
     pub async fn send(&self, data: Bytes, fin: bool) -> Result<(), StreamClosed> {
         self.tx
             .send(ResponderMessage::Response { data, fin })
@@ -188,11 +380,16 @@ impl DoqResponder {
     }
 
     /// Abandons the transaction, asking the driver to send `RESET_STREAM` with
-    /// the given DoQ error code (RFC 9250, Section 4.3.2), typically
+    /// the given DoQ error code ([RFC 9250, Section 4.3.2]), typically
     /// [`DoqError::InternalError`].
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     ///
-    /// Returns [`StreamClosed`] if the transaction is no longer live.
+    /// Uses the same bounded channel as [`send`](Self::send). It waits for
+    /// capacity and follows responses already queued on that channel.
+    /// Success means the reset was queued, not that it was applied or received
+    /// by the peer. Returns [`StreamClosed`] if the transaction is no longer
+    /// live.
+    ///
+    /// [RFC 9250, Section 4.3.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     pub async fn reset(&self, error: DoqError) -> Result<(), StreamClosed> {
         self.tx
             .send(ResponderMessage::Reset { error })
@@ -240,12 +437,13 @@ pub enum DoqEvent {
 
         /// Whether the query was received in 0-RTT (early data).
         ///
-        /// RFC 9250, Section 4.5 requires that a non-replayable transaction
+        /// [RFC 9250, Section 4.5] requires that a non-replayable transaction
         /// received in 0-RTT MUST NOT be processed
         /// immediately. The driver does not parse opcodes itself; it surfaces
         /// this flag so the consumer can enforce the replay rules (see
         /// [`is_replayable_opcode`]).
-        /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+        ///
+        /// [RFC 9250, Section 4.5]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
         is_0rtt: bool,
 
         /// The per-query handle used to send the response(s); bound to this
@@ -256,11 +454,12 @@ pub enum DoqEvent {
     /// The QUIC handshake has been confirmed (the connection is no longer only
     /// in early data).
     ///
-    /// RFC 9250, Section 4.5 allows a consumer that deferred non-replayable
+    /// [RFC 9250, Section 4.5] allows a consumer that deferred non-replayable
     /// 0-RTT queries (rather than
     /// rejecting them outright) can use this event as the signal to process
     /// its queue.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+    ///
+    /// [RFC 9250, Section 4.5]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
     HandshakeConfirmed,
 
     /// The QUIC connection has closed. Delivery is best effort, including
@@ -301,16 +500,17 @@ pub enum DoqEvent {
 pub enum DoqCommand {
     /// Close the whole connection with a DoQ error code and reason.
     ///
-    /// Used for fatal protocol violations (RFC 9250, Section 4.3.3) and for
+    /// Used for fatal protocol violations ([RFC 9250, Section 4.3.3]) and for
     /// normal shutdown ([`DoqError::NoError`]).
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     ///
     /// `reason` is an opaque byte string (the QUIC CONNECTION_CLOSE reason
-    /// phrase, RFC 9000, Section 19.19). It matches the byte-oriented
+    /// phrase, [RFC 9000, Section 19.19]). It matches the byte-oriented
     /// [`quiche::Connection::close`] API and the crate's existing
     /// [`ConnectionShutdownBehaviour`](crate::quic::ConnectionShutdownBehaviour)
     /// `reason` field.
-    /// https://datatracker.ietf.org/doc/html/rfc9000#section-19.19
+    ///
+    /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+    /// [RFC 9000, Section 19.19]: https://datatracker.ietf.org/doc/html/rfc9000#section-19.19
     CloseConnection {
         /// The DoQ error code (wire-encoded via [`DoqError::to_wire`]).
         error: DoqError,

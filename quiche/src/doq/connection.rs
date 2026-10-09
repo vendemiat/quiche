@@ -28,12 +28,9 @@
 //!
 //! [`Connection`] mirrors [`crate::h3::Connection`]'s shape and lifecycle: it
 //! is driven by repeatedly calling [`Connection::poll`] on top of a
-//! `&mut quiche::Connection`, and owns everything needed to turn QUIC stream
-//! bytes into framed DNS messages (and back) without parsing DNS content
-//! itself. It is shared by the blocking-mio DoQ examples and the async
-//! `tokio-quiche` drivers so the per-stream reassembly and the protocol-error
-//! matrix in RFC 9250, Section 4.3.3 are implemented exactly once.
-//! https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+//! [`crate::Connection`], and owns everything needed to turn QUIC
+//! stream bytes into framed DNS messages (and back) without parsing DNS content
+//! itself.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -57,8 +54,10 @@ pub enum Error {
     /// There is no more work to do right now.
     Done,
 
-    /// A fatal DoQ protocol violation was detected.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+    /// A fatal DoQ protocol violation under [RFC 9250, Section 4.3.3] was
+    /// detected.
+    ///
+    /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     ProtocolError,
 
     /// DNS message is larger than the 65535 bytes the 2-octet length prefix
@@ -135,12 +134,13 @@ pub enum Event {
         data: Vec<u8>,
 
         /// Whether these bytes arrived while the QUIC connection was still
-        /// in early data (0-RTT). RFC 9250, Section 4.5 restricts which
+        /// in early data (0-RTT). [RFC 9250, Section 4.5] restricts which
         /// operations may proceed before handshake confirmation, which
         /// restricts which DNS opcodes may be safely acted on before
         /// the handshake is confirmed; that policy decision belongs to the
         /// consumer, not the transport.
-        /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+        ///
+        /// [RFC 9250, Section 4.5]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
         is_0rtt: bool,
     },
 
@@ -160,10 +160,11 @@ pub enum Event {
 
     /// The peer reset the stream (`RESET_STREAM`). The raw wire error code is
     /// passed through unmapped; a caller that needs the unknown-code mapping
-    /// in RFC 9250, Section 4.3.4 must do it itself. A client receiving
+    /// in [RFC 9250, Section 4.3.4] must do it itself. A client receiving
     /// `STOP_SENDING` instead gets [`Error::ProtocolError`] because RFC 9250,
     /// Section 4.3.3 makes that fatal.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
+    ///
+    /// [RFC 9250, Section 4.3.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
     Reset(u64),
 }
 
@@ -178,8 +179,9 @@ struct StreamState {
     fin_received: bool,
 
     /// Whether the QUIC connection was in early data when the first byte on
-    /// this stream arrived (captures `is_0rtt`, per RFC 9250, Section 4.5).
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
+    /// this stream arrived (captures `is_0rtt`, per [RFC 9250, Section 4.5]).
+    ///
+    /// [RFC 9250, Section 4.5]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.5
     is_0rtt: bool,
 
     /// Whether this `Connection` opened the stream itself, as opposed to
@@ -196,13 +198,14 @@ struct StreamState {
     ///
     /// Server role reads it as a latch. Buffered bytes arriving after the
     /// query was surfaced are a second query on the same stream, a protocol
-    /// error under RFC 9250, Section 4.3.3.
+    /// error under [RFC 9250, Section 4.3.3].
     ///
     /// Client role reads it at STREAM FIN. A FIN with no response surfaced is
-    /// a protocol error under RFC 9250, Sections 4.2 and 4.3.3.
+    /// a protocol error under [RFC 9250, Section 4.2] and
+    /// [RFC 9250, Section 4.3.3].
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+    /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     event_triggered: bool,
 
     /// Framed outgoing query or response bytes that QUIC has not yet accepted.
@@ -230,10 +233,11 @@ impl StreamState {
 /// `Connection` sits directly on top of a `quiche::Connection` (like
 /// [`crate::h3::Connection`] does for HTTP/3): it owns per-stream byte
 /// reassembly, DoQ's 2-octet length-prefix framing, stream-role
-/// classification, and the parts of the RFC 9250, Section 4.3.3 protocol-error
-/// matrix that are detectable from QUIC-stream usage and
+/// classification, and the parts of the [RFC 9250, Section 4.3.3]
+/// protocol-error matrix that are detectable from QUIC-stream usage and
 /// framing alone. It does **not** parse DNS message content.
-/// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+///
+/// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
 pub struct Connection {
     is_server: bool,
     next_query_stream_id: u64,
@@ -310,14 +314,26 @@ impl Connection {
     /// Opens a client-initiated bidirectional stream and queues one framed DNS
     /// query on it.
     ///
-    /// RFC 9250, Section 4.2: "The client MUST send the DNS query over the
+    /// [RFC 9250, Section 4.2]: "The client MUST send the DNS query over the
     /// selected stream and MUST indicate through the STREAM FIN mechanism
     /// that no further data will be sent on that stream."
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
     ///
     /// Call [`flush_query`](Self::flush_query) for every writable notification
     /// on a tracked query stream, including when
     /// [`query_pending`](Self::query_pending) returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ClientOnly`] on a server and [`Error::MessageTooLarge`]
+    /// if `data` exceeds 65,535 bytes. Stream creation and query flushing
+    /// errors are propagated; these failures remove the local stream state.
+    /// A peer `STOP_SENDING` attempts a protocol-error close. The close error
+    /// is propagated if that attempt fails.
+    ///
+    /// Returns [`Error::StreamIdExhausted`] if advancing the next stream ID
+    /// overflows. This check occurs after queuing the current query.
+    ///
+    /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
     pub fn send_query<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, data: &[u8],
     ) -> Result<u64> {
@@ -370,6 +386,16 @@ impl Connection {
     /// Flushes framed query bytes queued by [`send_query`](Self::send_query).
     ///
     /// This probes the QUIC send side even after the query bytes have drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ClientOnly`] on a server and [`Error::UnknownStream`]
+    /// if the stream is not a tracked local query. A peer `STOP_SENDING`
+    /// attempts a protocol-error close. Other transport errors, including
+    /// errors from that close attempt, are propagated.
+    ///
+    /// A write with no capacity returns `Ok(())` and retains queued bytes.
+    /// An error does not remove local query state.
     pub fn flush_query<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<()> {
@@ -409,13 +435,14 @@ impl Connection {
             // below, which would surface backpressure as `Error::Done`.
             Err(crate::Error::Done) => Ok(()),
 
-            // RFC 9250, Section 4.3.3 lists "a client receives a STOP_SENDING
+            // [RFC 9250, Section 4.3.3] lists "a client receives a STOP_SENDING
             // request" among the fatal error conditions.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-            // The server role stays per-stream. RFC 9250, Section 4.3.1:
+            // The server role stays per-stream. [RFC 9250, Section 4.3.1]:
             // "Servers SHOULD NOT continue processing a DNS transaction if
             // they receive a STOP_SENDING."
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+            //
+            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            // [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
             Err(crate::Error::StreamStopped(_)) => self.fail_protocol_error(conn),
 
             Err(e) => Err(e.into()),
@@ -431,25 +458,31 @@ impl Connection {
 
     /// Cancels the outstanding query on `stream_id`.
     ///
-    /// RFC 9250, Section 4.3.1: "If a DoQ client wishes to cancel an
+    /// [RFC 9250, Section 4.3.1]: "If a DoQ client wishes to cancel an
     /// outstanding request, it MUST issue a QUIC STOP_SENDING, and it SHOULD
     /// use the error code DOQ_REQUEST_CANCELLED.  It MAY use a more specific
     /// error code registered according to Section 8.4."
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     /// Pass [`DoqError::RequestCancelled`] as `error` unless a more specific
     /// code applies.
     ///
-    /// RFC 9250, Section 4.3.1: "The STOP_SENDING request may be sent at any
+    /// [RFC 9250, Section 4.3.1]: "The STOP_SENDING request may be sent at any
     /// time but will have no effect if the server response has already been
     /// sent, in which case the client will simply discard the incoming
     /// response.  The corresponding DNS transaction MUST be abandoned."
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     /// The stream state is dropped, so a response already in flight is
     /// discarded instead of being surfaced as an [`Event`].
     ///
-    /// Returns `Err(Error::UnknownStream)` if `stream_id` is not a query
-    /// stream this `Connection` opened, which includes an already-completed
-    /// or already-cancelled one.
+    /// # Errors
+    ///
+    /// Returns [`Error::ClientOnly`] on a server and [`Error::UnknownStream`]
+    /// if the stream is not a tracked local query, including an already
+    /// completed or cancelled query.
+    ///
+    /// Local stream state is removed before transport shutdown. Shutdown
+    /// errors are propagated, except [`crate::Error::Done`], which is treated
+    /// as success. A shutdown error does not restore local state.
+    ///
+    /// [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     pub fn cancel_query<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64, error: u64,
     ) -> Result<()> {
@@ -480,12 +513,13 @@ impl Connection {
         }
 
         if query_unsent {
-            // RFC 9250, Section 4.3.1: "Servers MUST NOT continue processing
+            // [RFC 9250, Section 4.3.1]: "Servers MUST NOT continue processing
             // a DNS transaction if they receive a RESET_STREAM request from
             // the client before the client indicates the STREAM FIN."
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
             // A half-sent query would otherwise leave the server waiting on
             // a fin that never arrives.
+            //
+            // [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
             match conn.stream_shutdown(stream_id, crate::Shutdown::Write, error) {
                 Ok(()) | Err(crate::Error::Done) => (),
                 Err(e) => return Err(e.into()),
@@ -510,12 +544,10 @@ impl Connection {
     /// reported writable again to send more. Splitting a single framed
     /// message across several QUIC stream writes is transparent to the peer,
     /// which reassembles the length prefix and body from the ordered byte
-    /// stream exactly as DNS over TCP does (RFC 9250, Section 4.2; RFC 1035,
-    /// Section 4.2.2).
+    /// stream exactly as DNS over TCP does ([RFC 9250, Section 4.2];
+    /// [RFC 1035, Section 4.2.2]).
     /// Use [`response_pending`](Self::response_pending) to tell whether queued
     /// bytes remain.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-    /// https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2
     ///
     /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen as a
     /// query stream, has already been completed (its final response was
@@ -523,6 +555,9 @@ impl Connection {
     /// peer, not a bug, to be treated as a no-op. Returns
     /// `Err(Error::MessageTooLarge)` if `data` is larger than the 65535 bytes
     /// the 2-octet length prefix can represent.
+    ///
+    /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// [RFC 1035, Section 4.2.2]: https://datatracker.ietf.org/doc/html/rfc1035#section-4.2.2
     pub fn send_response<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64, data: &[u8],
         fin: bool,
@@ -559,8 +594,9 @@ impl Connection {
     /// [`response_pending`](Self::response_pending) to tell whether data
     /// remains queued. Returns `Err(Error::UnknownStream)` if the stream
     /// isn't tracked, or a [`Error::TransportError`] if the peer stopped the
-    /// stream (`STOP_SENDING`) as described by RFC 9250, Section 4.3.1.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    /// stream (`STOP_SENDING`) as described by [RFC 9250, Section 4.3.1].
+    ///
+    /// [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     pub fn flush_response<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<()> {
@@ -613,11 +649,16 @@ impl Connection {
 
     /// Abandons the transaction on `stream_id`, sending `RESET_STREAM` with
     /// the given DoQ error code and dropping the stream's state as described
-    /// by RFC 9250, Section 4.3.2.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
+    /// by [RFC 9250, Section 4.3.2].
     ///
-    /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen or
-    /// has already been completed or reset.
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownStream`] if the stream is not tracked.
+    /// Local stream state is removed before transport shutdown. Shutdown
+    /// errors are propagated, except [`crate::Error::Done`], which is treated
+    /// as success. A shutdown error does not restore local state.
+    ///
+    /// [RFC 9250, Section 4.3.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     pub fn reset_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64, error: u64,
     ) -> Result<()> {
@@ -649,19 +690,21 @@ impl Connection {
                 return Ok(Vec::new());
             }
 
-            // Clients MUST send queries on a bidirectional stream per RFC
-            // 9250, Section 4.3.3.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            // Clients MUST send queries on a bidirectional stream per
+            // [RFC 9250, Section 4.3.3].
+            //
+            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             if !is_bidi(stream_id) {
                 return Err(Error::ProtocolError);
             }
         } else {
             // A client-role `Connection` only ever reads on the
             // bidirectional streams it opened itself to send queries;
-            // servers never initiate streams in DoQ per RFC 9250, Sections
-            // 3.4 and 4.3.3.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-3.4
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            // servers never initiate streams in DoQ per [RFC 9250, Section
+            // 3.4] and [RFC 9250, Section 4.3.3].
+            //
+            // [RFC 9250, Section 3.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-3.4
+            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             if peer_initiated {
                 return Err(Error::ProtocolError);
             }
@@ -689,14 +732,15 @@ impl Connection {
     /// wire error code, dropping the stream's state and not draining any
     /// further; the caller should surface this as `Event::Reset(error)`. If
     /// the server's own reset below fails instead, this returns that error.
-    /// RFC 9250, Section 4.3.1 requires the following behavior:
+    /// [RFC 9250, Section 4.3.1] requires the following behavior:
     /// "Servers MUST NOT continue processing a DNS transaction if they
     /// receive a RESET_STREAM request from the client before the client
     /// indicates the STREAM FIN. The server MUST issue a RESET_STREAM to
     /// indicate that the transaction is abandoned unless: it has already
     /// done so for another reason or it has already both sent the
     /// response and indicated the STREAM FIN."
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    ///
+    /// [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     fn read_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<Option<u64>> {
@@ -809,9 +853,10 @@ impl Connection {
         match read_dns_message(&state.recv_buf) {
             Ok((data, consumed)) => {
                 // Bytes beyond the first complete message are a second
-                // query framed on the same stream per RFC 9250, Section
-                // 4.3.3, regardless of whether FIN has arrived yet.
-                // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+                // query framed on the same stream per [RFC 9250, Section
+                // 4.3.3], regardless of whether FIN has arrived yet.
+                //
+                // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
                 if consumed < state.recv_buf.len() {
                     return Err(Error::ProtocolError);
                 }
@@ -831,8 +876,9 @@ impl Connection {
             Err(DnsWireError::LenDataIncomplete) |
             Err(DnsWireError::DnsMessageIncomplete) => {
                 // STREAM FIN before a full message arrived is a truncated
-                // message per RFC 9250, Section 4.3.3.
-                // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+                // message per [RFC 9250, Section 4.3.3].
+                //
+                // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
                 if state.fin_received {
                     return Err(Error::ProtocolError);
                 }
@@ -880,10 +926,12 @@ impl Connection {
         }
 
         if state.fin_received {
-            // RFC 9250, Section 4.2 requires a server response before FIN.
-            // Section 4.3.3 makes a FIN before a response a protocol error.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            // [RFC 9250, Section 4.2] requires a server response before FIN.
+            // [RFC 9250, Section 4.3.3] makes a FIN before a response a
+            // protocol error.
+            //
+            // [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             if !state.event_triggered || !state.recv_buf.is_empty() {
                 return Err(Error::ProtocolError);
             }
@@ -902,10 +950,11 @@ impl Connection {
         match conn.stream_capacity(stream_id) {
             Ok(_) => Ok(()),
 
-            // Fatal for the client role, as in `flush_query`. RFC 9250,
-            // Section 4.3.3 lists "a client receives a STOP_SENDING request"
-            // among the fatal error conditions.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+            // Fatal for the client role, as in `flush_query`.
+            // [RFC 9250, Section 4.3.3] lists "a client receives a STOP_SENDING
+            // request" among the fatal error conditions.
+            //
+            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             Err(crate::Error::StreamStopped(_)) => self.fail_protocol_error(conn),
 
             Err(e) => Err(e.into()),
@@ -1682,9 +1731,10 @@ mod tests {
 
         assert_eq!(server.poll(&mut pipe.server), Ok((0, Event::Reset(42))));
 
-        // RFC 9250, Section 4.3.1 forbids a second RESET_STREAM because the
+        // [RFC 9250, Section 4.3.1] forbids a second RESET_STREAM because the
         // server already reset the stream for another reason.
-        // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+        //
+        // [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
         let transport = pipe.server.stats();
         assert_eq!(
             transport.reset_stream_count_local, 1,

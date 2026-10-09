@@ -162,13 +162,16 @@ pub struct DoqServerDriver {
 impl DoqServerDriver {
     /// Builds a new [`DoqServerDriver`] and its paired [`DoqController`].
     ///
-    /// The driver should then be passed to
-    /// [`InitialQuicConnection`](crate::quic::InitialQuicConnection)'s
-    /// `start` method. Unlike [`H3Driver`](crate::http3::driver::H3Driver),
-    /// this takes no general settings: DoQ's other connection-level knob
-    /// (`max_idle_timeout`) is an existing
-    /// [`QuicSettings`](crate::settings::QuicSettings) field, set before
-    /// this driver is created.
+    /// Pass the driver to
+    /// [`InitialQuicConnection::start`](crate::InitialQuicConnection::start).
+    /// Configure the transport before listener creation with
+    /// [`QuicSettings`](crate::settings::QuicSettings): advertise
+    /// [`DOQ_ALPN`](super::DOQ_ALPN) through `alpn`, set connection and stream
+    /// flow-control limits, and choose `max_idle_timeout` and
+    /// `enable_early_data`. Supply server TLS credentials through
+    /// [`ConnectionParams::new_server`](crate::settings::ConnectionParams::new_server).
+    /// These settings belong to the transport; this constructor only chooses
+    /// event-channel capacity.
     ///
     /// `event_capacity` is the maximum number of events in the queue at once.
     /// The caller chooses this limit. For example, a capacity of 10 allows
@@ -334,15 +337,16 @@ impl DoqServerDriver {
         }
     }
 
-    /// Resets `stream_id` with `error` per RFC 9250, Section 4.3.2, stopping
+    /// Resets `stream_id` with `error` per [RFC 9250, Section 4.3.2], stopping
     /// the driver from sending any more of the response.
-    /// https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     ///
     /// Two errors are treated as benign no-ops rather than fatal:
     /// `UnknownStream` is a stale race with the peer, and
     /// `InvalidStreamState` means quiche already collected the stream,
     /// matching the `H3Driver` write-path precedent
     /// (`http3/driver/mod.rs`'s `InvalidStreamState` handling).
+    ///
+    /// [RFC 9250, Section 4.3.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
     fn reset_stream(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64, error: DoqError,
     ) -> QuicResult<()> {
@@ -484,9 +488,10 @@ impl DoqServerDriver {
             },
 
             // Stop sending when requested by the peer.
-            // See RFC 9250, Section 4.3.1.
-            // https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+            // See [RFC 9250, Section 4.3.1].
             // Close the query before attempting the cancellation enqueue.
+            //
+            // [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
             doq::Error::TransportError(quiche::Error::StreamStopped(code)) => {
                 drop(rx);
                 self.streams.remove(&stream_id);
@@ -547,6 +552,16 @@ impl DoqServerDriver {
 /// [`DoqCommand`]s to it. Per-query operations (sending responses,
 /// resetting a transaction) go through the [`DoqResponder`] attached to each
 /// [`DoqEvent::Query`]. Peer cancellation codes arrive as [`DoqEvent`]s.
+///
+/// The controller initially owns the event receiver. Use
+/// [`take_event_receiver`](Self::take_event_receiver) to move it to another
+/// task while retaining connection commands here. Dropping the controller
+/// also drops the receiver if it is still held here. Dropping the receiver
+/// makes the driver initiate connection close with [`DoqError::NoError`].
+/// Keep the receiver alive and drain it while serving the connection.
+///
+/// After receiver extraction, dropping the controller only closes its command
+/// channel. The driver can continue serving the extracted receiver.
 pub struct DoqController {
     /// Sends [`DoqCommand`]s to the paired [`DoqServerDriver`].
     cmd_sender: mpsc::UnboundedSender<DoqCommand>,
@@ -567,11 +582,17 @@ impl DoqController {
 
     /// Takes the [`DoqEvent`] receiver for the paired [`DoqServerDriver`],
     /// or `None` if it has already been taken.
+    ///
+    /// The caller owns the returned receiver and must keep draining it while
+    /// query tasks run. Dropping it initiates connection close with
+    /// [`DoqError::NoError`], even if this controller remains alive.
     pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<DoqEvent>> {
         self.event_recv.take()
     }
 
-    /// Closes the whole connection. See [`DoqCommand::CloseConnection`].
+    /// Queues a request to close the whole connection. See
+    /// [`DoqCommand::CloseConnection`]. This method does not wait for transport
+    /// close or report whether the worker accepted the command.
     pub fn close_connection(&self, error: DoqError, reason: Vec<u8>) {
         let _ = self
             .cmd_sender
@@ -593,8 +614,7 @@ impl ApplicationOverQuic for DoqServerDriver {
     }
 
     /// Polls the underlying [`doq::Connection`] for events, translating each
-    /// into the corresponding [`DoqEvent`] via
-    /// [`process_read_event`](Self::process_read_event).
+    /// into the corresponding [`DoqEvent`].
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         self.conn_mut()?;
         loop {
@@ -614,10 +634,11 @@ impl ApplicationOverQuic for DoqServerDriver {
                 // `poll()` never returns `MessageTooLarge` or
                 // `UnknownStream`; those come only from `send_response` or
                 // `reset_stream`. Any other `TransportError` is
-                // connection-fatal by default, per RFC 9000, Section 11.
-                // https://datatracker.ietf.org/doc/html/rfc9000#section-11
+                // connection-fatal by default, per [RFC 9000, Section 11].
                 // transport-level errors are connection-scoped, and only
                 // application-level errors can be isolated to one stream.
+                //
+                // [RFC 9000, Section 11]: https://datatracker.ietf.org/doc/html/rfc9000#section-11
                 Err(err) => return Err(err.into()),
             }
         }
@@ -859,9 +880,15 @@ impl WaitForResponder {
     }
 }
 
+/// A query's response, reset, or channel closure, ready for the driver.
+///
+/// [`WaitForResponder`] returns this value with ownership of the receiver.
 struct ResponderReady {
+    /// Identifies the query stream.
     stream_id: u64,
+    /// Receiver transferred from the completed wait.
     rx: mpsc::Receiver<ResponderMessage>,
+    /// The next message, or `None` when the channel is closed and drained.
     message: Option<ResponderMessage>,
 }
 
