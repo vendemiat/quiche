@@ -1624,9 +1624,10 @@ mod doq_close_tests {
 
     #[tokio::test]
     async fn doq_cleanup_precedes_pending_final_close_flush() {
-        // Check that shutdown closes active query channels while the final socket
-        // send is pending and the event queue is full. Cover both a buffered
-        // response and a query waiting for the application to send a response.
+        // Check that shutdown closes active query channels while the final
+        // socket send is pending and the event queue is full. Cover both a
+        // buffered response and a query waiting for the application to send
+        // a response.
         let mut config = default_quiche_config();
         config.set_initial_max_streams_bidi(3);
         config.set_initial_max_stream_data_bidi_local(2);

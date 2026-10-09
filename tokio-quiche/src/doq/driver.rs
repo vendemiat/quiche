@@ -1004,7 +1004,8 @@ mod tests {
         // Test a complete query and a reset after a partial stream write.
         for reset in [false, true] {
             let mut helper = DoqDriverTestHelper::new().unwrap();
-            // Keep one query active to check that queue saturation preserves it.
+            // Keep one query active to check that queue saturation
+            // preserves it.
             helper.peer_send_query(b"active").unwrap();
             helper.advance_and_run_loop().unwrap();
             let (_, _, active) = helper.expect_query_event();
@@ -1146,8 +1147,9 @@ mod tests {
     async fn waiting_and_parked_queries(
     ) -> (DoqDriverTestHelper, DoqResponder, DoqResponder) {
         let mut config = default_quiche_config();
-        // Use a 20-byte receive window so the 200-byte final response cannot
-        // be sent in full. The remaining bytes must stay in the core DoQ buffer.
+        // Use a 20-byte receive window so the 200-byte final response
+        // cannot be sent in full. The remaining bytes must stay in the core
+        // DoQ buffer.
         config.set_initial_max_stream_data_bidi_local(20);
         let mut helper = DoqDriverTestHelper::with_pipe(
             Pipe::with_config_and_buf(&mut config).unwrap(),
@@ -1277,7 +1279,8 @@ mod tests {
             .wait_for_data(&mut helper.pipe.server)
             .await
             .unwrap();
-        // Deliver the response and check its exact bytes and final stream state.
+        // Deliver the response and check its exact bytes and final
+        // stream state.
         helper.pipe.advance().unwrap();
         assert_eq!(
             helper.peer.poll(&mut helper.pipe.client),
