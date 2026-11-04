@@ -36,11 +36,12 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 
+use bytes::BufMut;
+
 use crate::buffers::BufFactory;
 use crate::stream::is_bidi;
 use crate::stream::is_local;
 
-use super::read_dns_message;
 use super::write_dns_message;
 use super::DnsWireError;
 use super::DoqError;
@@ -50,6 +51,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// An error while driving a [`Connection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// There is no more work to do right now.
     Done,
@@ -66,6 +68,9 @@ pub enum Error {
 
     /// Client specific functions were called on a server-role connection.
     ClientOnly,
+
+    /// Server specific functions were called on a client-role connection.
+    ServerOnly,
 
     /// There are no more client-initiated bidirectional stream IDs.
     StreamIdExhausted,
@@ -85,6 +90,9 @@ impl fmt::Display for Error {
             Error::MessageTooLarge => write!(f, "DNS message is too large"),
             Error::ClientOnly => {
                 write!(f, "operation requires a client connection")
+            },
+            Error::ServerOnly => {
+                write!(f, "operation requires a server connection")
             },
             Error::StreamIdExhausted => write!(f, "client stream IDs exhausted"),
             Error::UnknownStream => write!(f, "unknown or already-closed stream"),
@@ -121,6 +129,7 @@ impl From<DnsWireError> for Error {
 
 /// A DoQ transport event, returned by [`Connection::poll`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A complete DNS query was received on a client-initiated
     /// bidirectional stream (server-role `Connection` only). Emitted once
@@ -144,26 +153,47 @@ pub enum Event {
         is_0rtt: bool,
     },
 
-    /// A complete DNS response message was received on a stream the local,
-    /// client-role `Connection` initiated. Emitted once per completed
-    /// message: a zone-transfer stream carrying multiple responses emits
-    /// this event once per message, followed by a single [`Event::Finished`]
-    /// once STREAM FIN arrives.
-    Response {
-        /// The raw DNS message bytes, with the 2-octet length prefix
-        /// already stripped.
-        data: Vec<u8>,
-    },
+    /// A stream the client-role `Connection` opened has something to read
+    /// (client-role `Connection` only). Call
+    /// [`recv_response`](Connection::recv_response) for this stream until it
+    /// returns `Err(Error::Done)`. `poll` emits this event once per stream
+    /// and emits it again only after `recv_response` returned
+    /// `Err(Error::Done)` for that stream. `poll` reads no response bytes.
+    Data,
 
-    /// The server finished sending responses on this stream.
+    /// The peer reset the stream (`RESET_STREAM`). Server-role `Connection`
+    /// only. The client role reports a reset as [`ClientRead::Reset`]. The
+    /// raw wire error code is passed through unmapped. A caller that needs
+    /// the unknown-code mapping in [RFC 9250, Section 4.3.4] must do it
+    /// itself.
+    ///
+    /// [RFC 9250, Section 4.3.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
+    Reset(u64),
+}
+
+/// One item read from a client-role query stream by
+/// [`Connection::recv_response`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientRead {
+    /// A complete DNS response message, with the 2-octet length prefix
+    /// already stripped. A zone-transfer stream carries several messages.
+    /// Each message is one item, followed by a single [`ClientRead::Finished`]
+    /// after STREAM FIN.
+    Response(Vec<u8>),
+
+    /// The server finished sending responses on this stream. The stream state
+    /// is dropped.
     Finished,
 
-    /// The peer reset the stream (`RESET_STREAM`). The raw wire error code is
-    /// passed through unmapped; a caller that needs the unknown-code mapping
-    /// in [RFC 9250, Section 4.3.4] must do it itself. A client receiving
-    /// `STOP_SENDING` instead gets [`Error::ProtocolError`] because RFC 9250,
-    /// Section 4.3.3 makes that fatal.
+    /// The peer reset the stream (`RESET_STREAM`) with this raw wire error
+    /// code. The code is not mapped. A caller that needs the unknown-code
+    /// mapping in [RFC 9250, Section 4.3.4] must do it itself. The stream
+    /// state is dropped. A client that receives `STOP_SENDING` instead gets
+    /// [`Error::ProtocolError`], because [RFC 9250, Section 4.3.3] makes that
+    /// fatal.
     ///
+    /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     /// [RFC 9250, Section 4.3.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.4
     Reset(u64),
 }
@@ -171,8 +201,14 @@ pub enum Event {
 /// Per-stream reassembly state owned by [`Connection`].
 #[derive(Default)]
 struct StreamState {
-    /// Bytes received so far that have not yet been consumed by a complete
-    /// framed DNS message.
+    /// The 2-octet length field of the message in `recv_buf`, as read so far.
+    recv_buf_len: [u8; 2],
+
+    /// Number of bytes read into `recv_buf_len`.
+    recv_buf_len_read: usize,
+
+    /// Content of the current incoming message read so far. This `Vec` is
+    /// returned to the caller when it is complete.
     recv_buf: Vec<u8>,
 
     /// Whether STREAM FIN has been observed on the receive side.
@@ -187,12 +223,11 @@ struct StreamState {
     /// Whether this `Connection` opened the stream itself, as opposed to
     /// discovering it by reading peer-initiated bytes. Only
     /// [`Connection::send_query`] sets this, so it is never true on a server.
-    /// [`Connection::flush_query`] and [`Connection::query_pending`] use it to
-    /// recognize locally opened query streams.
+    /// Client-role methods use it to recognize locally opened query streams.
     is_local: bool,
 
-    /// Whether at least one DNS message event has been surfaced on this
-    /// stream: [`Event::Query`] on a server, [`Event::Response`] on a client.
+    /// Whether at least one DNS message has been surfaced on this stream:
+    /// [`Event::Query`] on a server, [`ClientRead::Response`] on a client.
     /// This latches, and is never cleared once set: a zone-transfer stream
     /// sets it on its first response and keeps it set across the rest.
     ///
@@ -207,6 +242,10 @@ struct StreamState {
     /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
     /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     event_triggered: bool,
+
+    /// Client role only. Whether `poll` has emitted [`Event::Data`] for this
+    /// stream since `recv_response` last returned `Err(Error::Done)`.
+    data_event_triggered: bool,
 
     /// Framed outgoing query or response bytes that QUIC has not yet accepted.
     /// A partial write drains accepted bytes from the front, retaining the
@@ -226,6 +265,129 @@ impl StreamState {
             ..Default::default()
         }
     }
+
+    /// Returns the announced length of the message in `recv_buf`. Returns
+    /// `None` until its 2-octet length field is read.
+    fn recv_len(&self) -> Option<usize> {
+        (self.recv_buf_len_read == 2)
+            .then(|| usize::from(u16::from_be_bytes(self.recv_buf_len)))
+    }
+
+    /// Returns true if the current incoming message has been read completely.
+    fn message_complete(&self) -> bool {
+        self.recv_len() == Some(self.recv_buf.len())
+    }
+
+    /// Returns true if any byte of the current incoming message has been read.
+    fn message_started(&self) -> bool {
+        self.recv_buf_len_read > 0
+    }
+
+    /// Moves the complete message out, ready for the next message.
+    fn take_message(&mut self) -> Vec<u8> {
+        self.recv_buf_len_read = 0;
+        std::mem::take(&mut self.recv_buf)
+    }
+
+    /// Reads the current framed message of `stream_id` into `recv_buf`. It
+    /// never reads past the end of the message. It returns when the message
+    /// is complete, when STREAM FIN is read, or when the QUIC layer has no
+    /// more bytes.
+    ///
+    /// [RFC 9250, Section 4.2]: "All DNS messages (queries and responses)
+    /// sent over DoQ connections MUST be encoded as a 2-octet length field
+    /// followed by the message content as specified in [RFC1035]."
+    ///
+    /// After STREAM FIN, the QUIC layer may collect the stream. Thus this
+    /// never calls the QUIC layer again once `fin_received` is set.
+    ///
+    /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// [RFC1035]: https://datatracker.ietf.org/doc/html/rfc1035
+    fn read_message<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> crate::Result<()> {
+        while !self.message_complete() && !self.fin_received {
+            let (read, fin) = match self.recv_len() {
+                // Content can arrive over many reads. Ask only for the bytes
+                // that are still missing, so the next message stays in the
+                // QUIC layer.
+                Some(len) => {
+                    let missing = len - self.recv_buf.len();
+                    let out = (&mut self.recv_buf).limit(missing);
+                    stream_read(conn, stream_id, out)?
+                },
+
+                // The 2-octet length field can also arrive over two reads.
+                None => {
+                    let out = &mut self.recv_buf_len[self.recv_buf_len_read..];
+                    let (read, fin) = stream_read(conn, stream_id, out)?;
+
+                    self.recv_buf_len_read += read;
+
+                    // The length field is complete. Read the content into a
+                    // new buffer of exactly that size.
+                    if let Some(len) = self.recv_len() {
+                        self.recv_buf = Vec::with_capacity(len);
+                    }
+
+                    (read, fin)
+                },
+            };
+
+            self.fin_received = fin;
+
+            if read == 0 {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Reads from `stream_id` into `out`. Returns no bytes and no FIN when the
+/// QUIC layer has no bytes for now.
+fn stream_read<F: BufFactory, B: BufMut>(
+    conn: &mut crate::Connection<F>, stream_id: u64, out: B,
+) -> crate::Result<(usize, bool)> {
+    match conn.stream_recv_buf(stream_id, out) {
+        Ok(v) => Ok(v),
+
+        Err(crate::Error::Done) => Ok((0, false)),
+
+        Err(e) => Err(e),
+    }
+}
+
+/// Checks the send-side status of a locally opened query stream.
+fn probe_query_stream<F: BufFactory>(
+    conn: &mut crate::Connection<F>, stream_id: u64,
+) -> Result<()> {
+    match conn.stream_capacity(stream_id) {
+        Ok(_) => Ok(()),
+
+        // Fatal for the client role, as in `flush_query`.
+        // [RFC 9250, Section 4.3.3] lists "a client receives a STOP_SENDING
+        // request" among the fatal error conditions.
+        //
+        // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+        Err(crate::Error::StreamStopped(_)) => fail_protocol_error(conn),
+
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Closes the connection with `DOQ_PROTOCOL_ERROR` and returns
+/// [`Error::ProtocolError`].
+fn fail_protocol_error<T, F: BufFactory>(
+    conn: &mut crate::Connection<F>,
+) -> Result<T> {
+    conn.close(
+        true,
+        DoqError::ProtocolError.to_wire(),
+        b"DoQ protocol error",
+    )?;
+    Err(Error::ProtocolError)
 }
 
 /// A synchronous, IO-less DoQ transport connection.
@@ -267,6 +429,13 @@ impl Connection {
     /// Returns `Err(Error::Done)` when there is currently no event to
     /// report. A returned [`Error::ProtocolError`] has already initiated a
     /// connection close with `DoqError::ProtocolError`.
+    ///
+    /// The server role reads each readable stream and returns
+    /// [`Event::Query`] and [`Event::Reset`]. The client role reads no
+    /// response bytes. It returns [`Event::Data`] once per readable query
+    /// stream. Call [`recv_response`](Self::recv_response) to read the stream.
+    /// Before it reports a client stream, `poll` checks that the peer did not
+    /// send `STOP_SENDING`, which is fatal for a client.
     pub fn poll<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>,
     ) -> Result<(u64, Event)> {
@@ -281,8 +450,12 @@ impl Connection {
         }
 
         for stream_id in conn.readable() {
-            if !self.is_server && self.streams.contains_key(&stream_id) {
-                self.probe_query_stream(conn, stream_id)?;
+            if !self.is_server {
+                if let Some(ev) = self.poll_client_stream(conn, stream_id)? {
+                    return Ok((stream_id, ev));
+                }
+
+                continue;
             }
 
             match self.process_readable_stream(conn, stream_id) {
@@ -301,8 +474,7 @@ impl Connection {
                     return Ok((stream_id, first));
                 },
 
-                Err(Error::ProtocolError) =>
-                    return self.fail_protocol_error(conn),
+                Err(Error::ProtocolError) => return fail_protocol_error(conn),
 
                 Err(e) => return Err(e),
             }
@@ -320,7 +492,7 @@ impl Connection {
     ///
     /// Call [`flush_query`](Self::flush_query) for every writable notification
     /// on a tracked query stream, including when
-    /// [`query_pending`](Self::query_pending) returns `false`.
+    /// [`send_pending`](Self::send_pending) returns `false`.
     ///
     /// # Errors
     ///
@@ -359,7 +531,7 @@ impl Connection {
             Ok(_) => (),
             Err(crate::Error::StreamStopped(_)) => {
                 self.streams.remove(&stream_id);
-                return self.fail_protocol_error(conn);
+                return fail_protocol_error(conn);
             },
             Err(e) => {
                 self.streams.remove(&stream_id);
@@ -367,18 +539,29 @@ impl Connection {
             },
         }
 
+        // The transport stream exists. Its ID is consumed even if the
+        // flush below fails, so a later query never reuses it.
+        let next_stream_id = stream_id.checked_add(4);
+
+        if let Some(next_stream_id) = next_stream_id {
+            self.next_query_stream_id = next_stream_id;
+        }
+
         if let Err(e) = self.flush_query(conn, stream_id) {
             // `stream_send` reports accepted bytes only through `Ok(sent)`.
-            // Every error path above returns before accepting query bytes;
-            // `ProtocolError` additionally attempts to close the connection.
+            // The failed flush leaves the created stream open without a
+            // fin. Reset both directions on a best-effort basis, so the peer
+            // does not wait for a query that never completes.
             self.streams.remove(&stream_id);
+
+            let code = DoqError::InternalError.to_wire();
+            let _ = conn.stream_shutdown(stream_id, crate::Shutdown::Read, code);
+            let _ = conn.stream_shutdown(stream_id, crate::Shutdown::Write, code);
+
             return Err(e);
         }
 
-        self.next_query_stream_id = self
-            .next_query_stream_id
-            .checked_add(4)
-            .ok_or(Error::StreamIdExhausted)?;
+        next_stream_id.ok_or(Error::StreamIdExhausted)?;
 
         Ok(stream_id)
     }
@@ -411,7 +594,7 @@ impl Connection {
             return Err(Error::UnknownStream);
         }
 
-        self.probe_query_stream(conn, stream_id)?;
+        probe_query_stream(conn, stream_id)?;
 
         let Some(state) = self.streams.get_mut(&stream_id) else {
             return Err(Error::UnknownStream);
@@ -430,7 +613,7 @@ impl Connection {
             },
 
             // The stream had no send capacity, so no byte moved. The queued
-            // bytes stay in `send_buf`, where `query_pending` reports them
+            // bytes stay in `send_buf`, where `send_pending` reports them
             // until a later call drains them. Catch this before the arm
             // below, which would surface backpressure as `Error::Done`.
             Err(crate::Error::Done) => Ok(()),
@@ -443,17 +626,10 @@ impl Connection {
             //
             // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
             // [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
-            Err(crate::Error::StreamStopped(_)) => self.fail_protocol_error(conn),
+            Err(crate::Error::StreamStopped(_)) => fail_protocol_error(conn),
 
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Returns whether a query still has bytes waiting for QUIC send capacity.
-    pub fn query_pending(&self, stream_id: u64) -> bool {
-        self.streams
-            .get(&stream_id)
-            .is_some_and(|s| s.is_local && !s.send_buf.is_empty())
     }
 
     /// Cancels the outstanding query on `stream_id`.
@@ -470,7 +646,8 @@ impl Connection {
     /// sent, in which case the client will simply discard the incoming
     /// response.  The corresponding DNS transaction MUST be abandoned."
     /// The stream state is dropped, so a response already in flight is
-    /// discarded instead of being surfaced as an [`Event`].
+    /// discarded instead of being returned by
+    /// [`recv_response`](Self::recv_response).
     ///
     /// # Errors
     ///
@@ -546,13 +723,14 @@ impl Connection {
     /// which reassembles the length prefix and body from the ordered byte
     /// stream exactly as DNS over TCP does ([RFC 9250, Section 4.2];
     /// [RFC 1035, Section 4.2.2]).
-    /// Use [`response_pending`](Self::response_pending) to tell whether queued
+    /// Use [`send_pending`](Self::send_pending) to tell whether queued
     /// bytes remain.
     ///
-    /// Returns `Err(Error::UnknownStream)` if `stream_id` was never seen as a
-    /// query stream, has already been completed (its final response was
-    /// queued with `fin = true`), or has been reset — a normal race with the
-    /// peer, not a bug, to be treated as a no-op. Returns
+    /// Returns `Err(Error::ServerOnly)` on a client. Returns
+    /// `Err(Error::UnknownStream)` if `stream_id` was never seen as a query
+    /// stream, has already been completed (its final response was queued
+    /// with `fin = true`), or has been reset — a normal race with the peer,
+    /// not a bug, to be treated as a no-op. Returns
     /// `Err(Error::MessageTooLarge)` if `data` is larger than the 65535 bytes
     /// the 2-octet length prefix can represent.
     ///
@@ -562,6 +740,10 @@ impl Connection {
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64, data: &[u8],
         fin: bool,
     ) -> Result<()> {
+        if !self.is_server {
+            return Err(Error::ServerOnly);
+        }
+
         let state = match self.streams.get_mut(&stream_id) {
             // A stream whose final response is already queued is treated as
             // completed and no longer accepts responses.
@@ -589,9 +771,10 @@ impl Connection {
     /// the whole remaining buffer on each call delivers the FIN exactly when
     /// the last byte is accepted.
     ///
-    /// Returns `Ok(())` whether or not any bytes were written (a stream with
-    /// no capacity is a normal, retryable condition); use
-    /// [`response_pending`](Self::response_pending) to tell whether data
+    /// Returns `Err(Error::ServerOnly)` on a client. Returns `Ok(())`
+    /// whether or not any bytes were written (a stream with no capacity is
+    /// a normal, retryable condition); use
+    /// [`send_pending`](Self::send_pending) to tell whether data
     /// remains queued. Returns `Err(Error::UnknownStream)` if the stream
     /// isn't tracked, or a [`Error::TransportError`] if the peer stopped the
     /// stream (`STOP_SENDING`) as described by [RFC 9250, Section 4.3.1].
@@ -600,6 +783,10 @@ impl Connection {
     pub fn flush_response<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<()> {
+        if !self.is_server {
+            return Err(Error::ServerOnly);
+        }
+
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return Err(Error::UnknownStream),
@@ -635,13 +822,14 @@ impl Connection {
         }
     }
 
-    /// Returns `true` if `stream_id` has queued response bytes not yet
-    /// accepted by the QUIC layer.
+    /// Returns `true` if `stream_id` has queued bytes not yet accepted by the
+    /// QUIC layer. On a client, these are query bytes. On a server, these are
+    /// response bytes.
     ///
     /// A driver uses this to decide whether to wait for the stream to become
-    /// writable before pulling the next response from the application, so the
-    /// per-stream buffer stays bounded to roughly one in-flight message.
-    pub fn response_pending(&self, stream_id: u64) -> bool {
+    /// writable before it produces the next message, so the per-stream buffer
+    /// stays bounded to roughly one in-flight message.
+    pub fn send_pending(&self, stream_id: u64) -> bool {
         self.streams
             .get(&stream_id)
             .is_some_and(|s| !s.send_buf.is_empty())
@@ -658,7 +846,13 @@ impl Connection {
     /// errors are propagated, except [`crate::Error::Done`], which is treated
     /// as success. A shutdown error does not restore local state.
     ///
+    /// On a client, this resets only the query direction. The server can
+    /// still send its response, and the client no longer reads it. To
+    /// cancel a query, call [`cancel_query`](Self::cancel_query), which
+    /// sends `STOP_SENDING` as described by [RFC 9250, Section 4.3.1].
+    ///
     /// [RFC 9250, Section 4.3.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.2
+    /// [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
     pub fn reset_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64, error: u64,
     ) -> Result<()> {
@@ -672,64 +866,226 @@ impl Connection {
         }
     }
 
-    /// Classifies `stream_id` per the DoQ stream-usage rules and, if it's a
-    /// stream this `Connection` is responsible for, reads and reassembles
-    /// any newly available bytes and returns the resulting events (possibly
-    /// more than one, for a client-role multi-response stream; possibly
-    /// none, if no complete message is ready yet).
+    /// Client-role readiness check for one readable stream.
+    ///
+    /// Returns `Ok(Some(Event::Data))` when the stream is a tracked query
+    /// stream that has not been reported since the last
+    /// `Err(Error::Done)` from [`recv_response`](Self::recv_response).
+    /// Returns `Ok(None)` for a stream that needs no event. Reads no bytes.
+    fn poll_client_stream<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> Result<Option<Event>> {
+        // A client-role `Connection` only ever reads on the bidirectional
+        // streams it opened itself to send queries; servers never initiate
+        // streams in DoQ per [RFC 9250, Section 3.4] and
+        // [RFC 9250, Section 4.3.3].
+        //
+        // [RFC 9250, Section 3.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-3.4
+        // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+        if !is_local(stream_id, self.is_server) {
+            return fail_protocol_error(conn);
+        }
+
+        let Some(state) = self.streams.get_mut(&stream_id) else {
+            return Ok(None);
+        };
+
+        if !state.is_local || !is_bidi(stream_id) {
+            return Ok(None);
+        }
+
+        // After FIN the transport may have collected the stream, so its send
+        // side can no longer be probed.
+        if !state.fin_received {
+            probe_query_stream(conn, stream_id)?;
+        }
+
+        if state.data_event_triggered {
+            return Ok(None);
+        }
+
+        state.data_event_triggered = true;
+
+        Ok(Some(Event::Data))
+    }
+
+    /// Reads at most one item from a query stream the client-role
+    /// `Connection` opened.
+    ///
+    /// Returns [`ClientRead::Response`] for each complete response message,
+    /// then [`ClientRead::Finished`] after STREAM FIN, or
+    /// [`ClientRead::Reset`] if the peer reset the stream. Returns
+    /// `Err(Error::Done)` when no complete item is available yet. That also
+    /// re-arms the [`Event::Data`] readiness event for the stream. Call this
+    /// until it returns `Err(Error::Done)`, `Finished`, or `Reset`.
+    ///
+    /// This is the only source of client responses and resets. It reads only
+    /// the 2-octet length prefix and then exactly the announced message
+    /// length, directly into the buffer that is returned. The per-stream
+    /// buffer therefore holds at most 65,535 bytes, and unread bytes stay in
+    /// the QUIC layer under flow control. A received STREAM FIN is served
+    /// without calling the QUIC layer.
+    ///
+    /// [RFC 9250, Section 4.2] requires a server response before STREAM FIN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ClientOnly`] on a server and [`Error::UnknownStream`]
+    /// if the stream is not a tracked local query. A completed, reset, or
+    /// cancelled query is not tracked. Returns `Err(Error::Done)` if the
+    /// connection has a local close error.
+    ///
+    /// Returns [`Error::ProtocolError`] after a close with
+    /// `DOQ_PROTOCOL_ERROR` in these cases:
+    ///
+    /// 1. The peer sent `STOP_SENDING` for the query stream ([RFC 9250, Section
+    ///    4.3.3]).
+    /// 2. STREAM FIN arrived before any response.
+    /// 3. STREAM FIN arrived inside a message or after bytes that do not form a
+    ///    message.
+    ///
+    /// Other transport errors are propagated.
+    ///
+    /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+    pub fn recv_response<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> Result<ClientRead> {
+        if self.is_server {
+            return Err(Error::ClientOnly);
+        }
+
+        if conn.local_error().is_some() {
+            return Err(Error::Done);
+        }
+
+        match self.streams.get(&stream_id) {
+            Some(state) if state.is_local => (),
+            _ => return Err(Error::UnknownStream),
+        }
+
+        match self.read_response(conn, stream_id) {
+            Err(Error::Done) => {
+                if let Some(state) = self.streams.get_mut(&stream_id) {
+                    state.data_event_triggered = false;
+                }
+
+                Err(Error::Done)
+            },
+
+            // The STOP_SENDING probe has already closed the connection. Any
+            // other protocol error is detected here, and this call closes it.
+            Err(Error::ProtocolError) if conn.local_error().is_some() =>
+                Err(Error::ProtocolError),
+
+            Err(Error::ProtocolError) => fail_protocol_error(conn),
+
+            Ok(result) => Ok(result),
+
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Body of [`recv_response`](Self::recv_response). A protocol error
+    /// detected here is returned without closing the connection. The caller
+    /// closes it.
+    fn read_response<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
+    ) -> Result<ClientRead> {
+        // After FIN the transport may have collected the stream, so its send
+        // side can no longer be probed.
+        match self.streams.get(&stream_id) {
+            Some(state) if !state.fin_received =>
+                probe_query_stream(conn, stream_id)?,
+
+            Some(_) => (),
+
+            None => return Err(Error::UnknownStream),
+        }
+
+        let Some(state) = self.streams.get_mut(&stream_id) else {
+            return Err(Error::UnknownStream);
+        };
+
+        match state.read_message(conn, stream_id) {
+            Ok(()) => (),
+
+            Err(crate::Error::StreamReset(error)) => {
+                self.streams.remove(&stream_id);
+                return Ok(ClientRead::Reset(error));
+            },
+
+            Err(e) => return Err(e.into()),
+        }
+
+        if state.message_complete() {
+            state.event_triggered = true;
+            return Ok(ClientRead::Response(state.take_message()));
+        }
+
+        if !state.fin_received {
+            return Err(Error::Done);
+        }
+
+        // FIN is a protocol error in two cases:
+        // 1. No response was surfaced before FIN.
+        // 2. FIN arrived inside a message.
+        //
+        // [RFC 9250, Section 4.2]: "The server MUST send the response(s) on
+        // the same stream and MUST indicate, after the last response, through
+        // the STREAM FIN mechanism that no further data will be sent on that
+        // stream."
+        //
+        // [RFC 9250, Section 4.3.3] lists these protocol errors: "a client or
+        // server receives a STREAM FIN before receiving all the bytes for a
+        // message indicated in the 2-octet length field" and "a client
+        // receives a STREAM FIN before receiving all the expected responses".
+        //
+        // [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+        // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+        if !state.event_triggered || state.message_started() {
+            return Err(Error::ProtocolError);
+        }
+
+        self.streams.remove(&stream_id);
+        Ok(ClientRead::Finished)
+    }
+
+    /// Server-role stream classification and reassembly. Reads and
+    /// reassembles any newly available bytes on `stream_id` and returns the
+    /// resulting events (possibly none, if no complete message is ready yet).
     fn process_readable_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<Vec<Event>> {
-        let peer_initiated = !is_local(stream_id, self.is_server);
+        // DoQ servers never open streams of their own; a readable
+        // locally-initiated stream can't happen in practice and isn't
+        // ours to process.
+        if is_local(stream_id, self.is_server) {
+            return Ok(Vec::new());
+        }
 
-        if self.is_server {
-            // DoQ servers never open streams of their own; a readable
-            // locally-initiated stream can't happen in practice and isn't
-            // ours to process.
-            if !peer_initiated {
-                return Ok(Vec::new());
-            }
-
-            // Clients MUST send queries on a bidirectional stream per
-            // [RFC 9250, Section 4.3.3].
-            //
-            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-            if !is_bidi(stream_id) {
-                return Err(Error::ProtocolError);
-            }
-        } else {
-            // A client-role `Connection` only ever reads on the
-            // bidirectional streams it opened itself to send queries;
-            // servers never initiate streams in DoQ per [RFC 9250, Section
-            // 3.4] and [RFC 9250, Section 4.3.3].
-            //
-            // [RFC 9250, Section 3.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-3.4
-            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-            if peer_initiated {
-                return Err(Error::ProtocolError);
-            }
-
-            if !is_bidi(stream_id) {
-                return Ok(Vec::new());
-            }
+        // Clients MUST send queries on a bidirectional stream per
+        // [RFC 9250, Section 4.3.3].
+        //
+        // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+        if !is_bidi(stream_id) {
+            return Err(Error::ProtocolError);
         }
 
         if let Some(error) = self.read_stream(conn, stream_id)? {
             return Ok(vec![Event::Reset(error)]);
         }
 
-        if self.is_server {
-            self.drain_server_stream(stream_id)
-        } else {
-            self.drain_client_stream(stream_id)
-        }
+        self.drain_server_stream(stream_id)
     }
 
-    /// Drains all currently-available bytes for `stream_id` from the QUIC
-    /// layer into the stream's reassembly buffer.
+    /// Reads the query on `stream_id` from the QUIC layer into the stream
+    /// state, then reads until STREAM FIN. Server role only. It reads the
+    /// query directly into its final buffer. After a complete query, it reads
+    /// one more byte, so it can tell STREAM FIN from a second query.
     ///
     /// Returns `Ok(Some(error))` if the peer reset the stream with the given
-    /// wire error code, dropping the stream's state and not draining any
+    /// wire error code, dropping the stream's state and not reading any
     /// further; the caller should surface this as `Event::Reset(error)`. If
     /// the server's own reset below fails instead, this returns that error.
     /// [RFC 9250, Section 4.3.1] requires the following behavior:
@@ -740,96 +1096,97 @@ impl Connection {
     /// done so for another reason or it has already both sent the
     /// response and indicated the STREAM FIN."
     ///
+    /// Returns [`Error::ProtocolError`] if a byte follows the complete query.
+    /// [RFC 9250, Section 4.3.3] makes a second query on the same stream a
+    /// protocol error.
+    ///
     /// [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    /// [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
     fn read_stream<F: BufFactory>(
         &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
     ) -> Result<Option<u64>> {
-        let mut buf = [0; 4096];
+        let created = !self.streams.contains_key(&stream_id);
 
-        loop {
-            // Sampled before `stream_recv` so a handshake that completes
-            // between data arrival and this call doesn't make 0-RTT data
-            // look like it arrived after the handshake was confirmed. Only
-            // matters for the first read on a stream (`or_insert_with`
-            // below), but that's exactly the read that sets the flag.
-            let is_0rtt = conn.is_in_early_data();
+        // Sampled before the first `stream_recv` so a handshake that
+        // completes between data arrival and this call doesn't make 0-RTT
+        // data look like it arrived after the handshake was confirmed. Only
+        // the call that creates the stream state uses the sample.
+        let is_0rtt = conn.is_in_early_data();
 
-            match conn.stream_recv(stream_id, &mut buf) {
-                Ok((len, fin)) => {
-                    let state = self
-                        .streams
-                        .entry(stream_id)
-                        .or_insert_with(|| StreamState::new(is_0rtt));
+        let state = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamState::new(is_0rtt));
 
-                    state.recv_buf.extend_from_slice(&buf[..len]);
+        let mut result = state.read_message(conn, stream_id);
 
-                    if self.is_server &&
-                        state.recv_buf.len() > super::MAX_DOQ_MESSAGE_LEN
-                    {
-                        self.streams.remove(&stream_id);
-                        return Err(Error::ProtocolError);
-                    }
+        // A complete query must be followed by STREAM FIN. Read one more byte
+        // to tell the two cases apart: 1. STREAM FIN. 2. A byte of a second
+        // query.
+        if result.is_ok() && state.message_complete() && !state.fin_received {
+            let mut probe = [0; 1];
 
-                    if fin {
-                        // Once FIN is delivered, quiche may immediately
-                        // collect the stream if the local send side is also
-                        // already complete (e.g. we already sent our query
-                        // with `fin = true`, or our response with
-                        // `fin = true`). Calling `stream_recv` again after
-                        // that returns `InvalidStreamState`, so stop here
-                        // rather than looping once more.
-                        state.fin_received = true;
-                        break;
-                    }
-
-                    if len == 0 {
-                        break;
-                    }
+            result = match conn.stream_recv(stream_id, &mut probe) {
+                Ok((0, fin)) => {
+                    state.fin_received = fin;
+                    Ok(())
                 },
 
-                Err(crate::Error::Done) => break,
+                Ok(_) => return Err(Error::ProtocolError),
 
-                Err(crate::Error::StreamReset(error)) => {
-                    // A reset after the complete query and FIN have been read
-                    // can be suppressed by the transport. Such a reset does
-                    // not reach this branch.
-                    //
-                    // We don't check whether this stream was already
-                    // reset (e.g. via `reset_stream`) because calling
-                    // `stream_shutdown` again below is a no-op.
-                    //
-                    // We only check whether the server already sent the
-                    // response with FIN. `self.streams` no longer has an
-                    // entry for it in that case (`flush_response` removes
-                    // it once fully drained), so we ask `conn` directly
-                    // instead: the RESET_STREAM being handled here always
-                    // finishes the receive side, so for this
-                    // bidirectional stream `stream_closed` (both
-                    // directions finished) is true here exactly when the
-                    // send side had already finished too.
-                    let fin_sent = conn.stream_closed(stream_id);
+                Err(crate::Error::Done) => Ok(()),
 
-                    self.streams.remove(&stream_id);
-
-                    if self.is_server && !fin_sent {
-                        match conn.stream_shutdown(
-                            stream_id,
-                            crate::Shutdown::Write,
-                            error,
-                        ) {
-                            Ok(()) | Err(crate::Error::Done) => (),
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-
-                    return Ok(Some(error));
-                },
-
-                Err(e) => return Err(e.into()),
-            }
+                Err(e) => Err(e),
+            };
         }
 
-        Ok(None)
+        match result {
+            Ok(()) => {
+                // Do not keep state for a stream that gave no bytes.
+                if created && !state.message_started() && !state.fin_received {
+                    self.streams.remove(&stream_id);
+                }
+
+                Ok(None)
+            },
+
+            Err(crate::Error::StreamReset(error)) => {
+                // A reset after the complete query and FIN have been read
+                // can be suppressed by the transport. Such a reset does not
+                // reach this branch.
+                //
+                // We don't check whether this stream was already reset (e.g.
+                // via `reset_stream`) because calling `stream_shutdown` again
+                // below is a no-op.
+                //
+                // We only check whether the server already sent the response
+                // with FIN. `self.streams` no longer has an entry for it in
+                // that case (`flush_response` removes it once fully drained),
+                // so we ask `conn` directly instead: the RESET_STREAM being
+                // handled here always finishes the receive side, so for this
+                // bidirectional stream `stream_closed` (both directions
+                // finished) is true here exactly when the send side had
+                // already finished too.
+                let fin_sent = conn.stream_closed(stream_id);
+
+                self.streams.remove(&stream_id);
+
+                if !fin_sent {
+                    match conn.stream_shutdown(
+                        stream_id,
+                        crate::Shutdown::Write,
+                        error,
+                    ) {
+                        Ok(()) | Err(crate::Error::Done) => (),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                Ok(Some(error))
+            },
+
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Server-role reassembly: at most one `Event::Query` per stream, held
@@ -842,136 +1199,25 @@ impl Connection {
             None => return Ok(Vec::new()),
         };
 
-        if state.event_triggered {
-            if !state.recv_buf.is_empty() {
-                return Err(Error::ProtocolError);
-            }
-
+        if state.event_triggered || !state.fin_received {
             return Ok(Vec::new());
         }
 
-        match read_dns_message(&state.recv_buf) {
-            Ok((data, consumed)) => {
-                // Bytes beyond the first complete message are a second
-                // query framed on the same stream per [RFC 9250, Section
-                // 4.3.3], regardless of whether FIN has arrived yet.
-                //
-                // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-                if consumed < state.recv_buf.len() {
-                    return Err(Error::ProtocolError);
-                }
-
-                if !state.fin_received {
-                    return Ok(Vec::new());
-                }
-
-                let data = data.to_vec();
-                let is_0rtt = state.is_0rtt;
-                state.event_triggered = true;
-                state.recv_buf.clear();
-
-                Ok(vec![Event::Query { data, is_0rtt }])
-            },
-
-            Err(DnsWireError::LenDataIncomplete) |
-            Err(DnsWireError::DnsMessageIncomplete) => {
-                // STREAM FIN before a full message arrived is a truncated
-                // message per [RFC 9250, Section 4.3.3].
-                //
-                // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-                if state.fin_received {
-                    return Err(Error::ProtocolError);
-                }
-
-                Ok(Vec::new())
-            },
-
-            // Neither variant is currently reachable from
-            // `read_dns_message` on this path, but match them explicitly
-            // rather than falling through a catch-all: a future
-            // `DnsWireError` variant added there must be treated as a real
-            // error here, not silently as "no events yet".
-            Err(DnsWireError::DnsMessageTooLarge) |
-            Err(DnsWireError::IoError(_)) => Err(Error::ProtocolError),
-        }
-    }
-
-    /// Client-role reassembly: extracts every currently-complete response
-    /// message (a zone-transfer stream may have several buffered at once),
-    /// followed by `Event::Finished` once STREAM FIN arrives with no
-    /// trailing partial message left in the buffer.
-    fn drain_client_stream(&mut self, stream_id: u64) -> Result<Vec<Event>> {
-        let state = match self.streams.get_mut(&stream_id) {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut events = Vec::new();
-
-        loop {
-            match read_dns_message(&state.recv_buf) {
-                Ok((data, consumed)) => {
-                    events.push(Event::Response {
-                        data: data.to_vec(),
-                    });
-                    state.event_triggered = true;
-                    state.recv_buf.drain(..consumed);
-                },
-
-                Err(DnsWireError::LenDataIncomplete) |
-                Err(DnsWireError::DnsMessageIncomplete) => break,
-
-                Err(_) => break,
-            }
+        // STREAM FIN before a full message arrived is a truncated message per
+        // [RFC 9250, Section 4.3.3].
+        //
+        // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
+        if !state.message_complete() {
+            return Err(Error::ProtocolError);
         }
 
-        if state.fin_received {
-            // [RFC 9250, Section 4.2] requires a server response before FIN.
-            // [RFC 9250, Section 4.3.3] makes a FIN before a response a
-            // protocol error.
-            //
-            // [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-            if !state.event_triggered || !state.recv_buf.is_empty() {
-                return Err(Error::ProtocolError);
-            }
+        let data = state.take_message();
+        state.event_triggered = true;
 
-            events.push(Event::Finished);
-            self.streams.remove(&stream_id);
-        }
-
-        Ok(events)
-    }
-
-    /// Checks the send-side status of a locally opened query stream.
-    fn probe_query_stream<F: BufFactory>(
-        &mut self, conn: &mut crate::Connection<F>, stream_id: u64,
-    ) -> Result<()> {
-        match conn.stream_capacity(stream_id) {
-            Ok(_) => Ok(()),
-
-            // Fatal for the client role, as in `flush_query`.
-            // [RFC 9250, Section 4.3.3] lists "a client receives a STOP_SENDING
-            // request" among the fatal error conditions.
-            //
-            // [RFC 9250, Section 4.3.3]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.3
-            Err(crate::Error::StreamStopped(_)) => self.fail_protocol_error(conn),
-
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Closes the connection with `DOQ_PROTOCOL_ERROR` and returns
-    /// [`Error::ProtocolError`].
-    fn fail_protocol_error<T, F: BufFactory>(
-        &self, conn: &mut crate::Connection<F>,
-    ) -> Result<T> {
-        conn.close(
-            true,
-            DoqError::ProtocolError.to_wire(),
-            b"DoQ protocol error",
-        )?;
-        Err(Error::ProtocolError)
+        Ok(vec![Event::Query {
+            data,
+            is_0rtt: state.is_0rtt,
+        }])
     }
 }
 
@@ -1012,6 +1258,38 @@ mod tests {
         );
     }
 
+    /// Calls `recv_response` for `stream_id` until it returns `Done`,
+    /// `Finished`, or `Reset`, and returns every item read, including that
+    /// terminal item.
+    fn read_stream_items(
+        client: &mut Connection, transport: &mut crate::Connection,
+        stream_id: u64,
+    ) -> Vec<ClientRead> {
+        let mut items = Vec::new();
+
+        loop {
+            match client.recv_response(transport, stream_id) {
+                Ok(item) => {
+                    let terminal = matches!(
+                        item,
+                        ClientRead::Finished | ClientRead::Reset(_)
+                    );
+                    items.push(item);
+
+                    if terminal {
+                        return items;
+                    }
+                },
+
+                Err(Error::Done) => return items,
+
+                Err(e) => panic!("unexpected recv_response error: {e:?}"),
+            }
+
+            assert!(items.len() < 100, "read loop did not terminate");
+        }
+    }
+
     #[test]
     fn send_query_allocates_and_frames_client_streams() {
         let mut config = doq_config();
@@ -1023,9 +1301,9 @@ mod tests {
         assert_eq!(client.send_query(&mut pipe.client, b"zero"), Ok(0));
         assert_eq!(client.send_query(&mut pipe.client, b"four"), Ok(4));
         assert_eq!(client.send_query(&mut pipe.client, b"eight"), Ok(8));
-        assert!(!client.query_pending(0));
-        assert!(!client.query_pending(4));
-        assert!(!client.query_pending(8));
+        assert!(!client.send_pending(0));
+        assert!(!client.send_pending(4));
+        assert!(!client.send_pending(8));
 
         pipe.advance().unwrap();
 
@@ -1047,14 +1325,28 @@ mod tests {
         pipe.server.stream_send(4, &framed(b"four"), true).unwrap();
         pipe.advance().unwrap();
 
-        let mut responses = Vec::new();
-        for _ in 0..6 {
+        // `poll` reports one readiness event per stream and reads nothing.
+        let mut ready = Vec::new();
+        for _ in 0..3 {
             match client.poll(&mut pipe.client).unwrap() {
-                (stream_id, Event::Response { data }) => {
-                    responses.push((stream_id, data));
-                },
-                (_, Event::Finished) => (),
+                (stream_id, Event::Data) => ready.push(stream_id),
                 (_, event) => panic!("unexpected event: {event:?}"),
+            }
+        }
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+        ready.sort_unstable();
+        assert_eq!(ready, vec![0, 4, 8]);
+
+        let mut responses = Vec::new();
+        for stream_id in ready {
+            let items =
+                read_stream_items(&mut client, &mut pipe.client, stream_id);
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[1], ClientRead::Finished);
+            match items.into_iter().next() {
+                Some(ClientRead::Response(data)) =>
+                    responses.push((stream_id, data)),
+                item => panic!("unexpected item: {item:?}"),
             }
         }
         responses.sort_unstable_by_key(|(stream_id, _)| *stream_id);
@@ -1095,7 +1387,7 @@ mod tests {
         let query = vec![0xAB; 200];
         let mut client = Connection::with_transport(&pipe.client).unwrap();
         assert_eq!(client.send_query(&mut pipe.client, &query), Ok(0));
-        assert!(client.query_pending(0));
+        assert!(client.send_pending(0));
 
         let mut received = Vec::new();
         let mut fin = false;
@@ -1114,7 +1406,7 @@ mod tests {
                 }
             }
 
-            if !client.query_pending(0) {
+            if !client.send_pending(0) {
                 break;
             }
 
@@ -1134,7 +1426,7 @@ mod tests {
             }
         }
 
-        assert!(!client.query_pending(0));
+        assert!(!client.send_pending(0));
         assert!(fin);
         assert_eq!(received, framed(&query));
     }
@@ -1210,7 +1502,7 @@ mod tests {
 
         let mut client = Connection::with_transport(&pipe.client).unwrap();
         assert_eq!(client.send_query(&mut pipe.client, &[b'q'; 64]), Ok(0));
-        assert!(client.query_pending(0));
+        assert!(client.send_pending(0));
         pipe.advance().unwrap();
 
         assert_eq!(
@@ -1284,7 +1576,7 @@ mod tests {
 
         let mut client = Connection::with_transport(&pipe.client).unwrap();
         assert_eq!(client.send_query(&mut pipe.client, &[0; 200]), Ok(0));
-        assert!(client.query_pending(0));
+        assert!(client.send_pending(0));
 
         pipe.advance().unwrap();
 
@@ -1308,7 +1600,7 @@ mod tests {
 
         let mut client = Connection::with_transport(&pipe.client).unwrap();
         assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
-        assert!(!client.query_pending(0));
+        assert!(!client.send_pending(0));
         pipe.advance().unwrap();
 
         let mut buf = [0; 65_535];
@@ -1368,13 +1660,13 @@ mod tests {
         });
 
         assert_eq!(
-            client.probe_query_stream(&mut pipe.client, 0),
+            probe_query_stream(&mut pipe.client, 0),
             Err(Error::TransportError(crate::Error::InvalidStreamState(0)))
         );
     }
 
     #[test]
-    fn server_reset_on_opened_query_surfaces_as_event() {
+    fn server_reset_on_opened_query_surfaces_as_client_read() {
         let mut config = doq_config();
         let mut pipe = Pipe::with_config(&mut config).unwrap();
         pipe.handshake().unwrap();
@@ -1388,7 +1680,18 @@ mod tests {
             .unwrap();
         pipe.advance().unwrap();
 
-        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Reset(42))));
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Reset(42))
+        );
+
+        // The reset is delivered once and the stream state is dropped.
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::UnknownStream)
+        );
+        assert!(pipe.client.local_error().is_none());
     }
 
     #[test]
@@ -1404,7 +1707,7 @@ mod tests {
             Err(Error::TransportError(crate::Error::StreamLimit))
         );
         assert_eq!(client.next_query_stream_id, 0);
-        assert!(!client.query_pending(0));
+        assert!(!client.send_pending(0));
     }
 
     #[test]
@@ -1424,7 +1727,7 @@ mod tests {
 
         let mut client = Connection::with_transport(&pipe.client).unwrap();
         assert_eq!(client.send_query(&mut pipe.client, b"early"), Ok(0));
-        assert!(!client.query_pending(0));
+        assert!(!client.send_pending(0));
     }
 
     #[test]
@@ -1546,6 +1849,314 @@ mod tests {
     }
 
     #[test]
+    fn query_second_message_in_later_packet_is_protocol_error() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // The first query is complete, but FIN has not arrived. The server
+        // holds the query back.
+        pipe.client
+            .stream_send(0, &framed(b"hello"), false)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+
+        // One byte of a second query arrives in a later packet. The 1-byte
+        // read after the complete query gets it.
+        pipe.client.stream_send(0, &[0], false).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.server);
+    }
+
+    #[test]
+    fn query_fin_in_later_packet_surfaces_query() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // The read takes exactly the query, and FIN is not known yet.
+        pipe.client
+            .stream_send(0, &framed(b"hello"), false)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+
+        // FIN arrives alone. The 1-byte read sees it and the query surfaces.
+        pipe.client.stream_send(0, b"", true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"hello".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+    }
+
+    #[test]
+    fn query_split_into_single_bytes() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        let wire = framed(b"hello");
+
+        // Each byte arrives in its own packet. No query surfaces before FIN.
+        for (i, byte) in wire.iter().enumerate() {
+            let fin = i == wire.len() - 1;
+            pipe.client.stream_send(0, &[*byte], fin).unwrap();
+            pipe.advance().unwrap();
+
+            if !fin {
+                assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+            }
+        }
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: b"hello".to_vec(),
+                is_0rtt: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn query_zero_length_message_surfaces_empty_query() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // The length prefix is zero, so the message is complete after the
+        // prefix.
+        pipe.client.stream_send(0, &framed(b""), true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(
+            server.poll(&mut pipe.server),
+            Ok((0, Event::Query {
+                data: Vec::new(),
+                is_0rtt: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn query_fin_without_bytes_is_protocol_error() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // The stream carries only FIN, so it holds no message.
+        pipe.client.stream_send(0, b"", true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.server);
+    }
+
+    #[test]
+    fn query_truncated_inside_length_prefix_is_protocol_error() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // FIN arrives after only 1 byte of the 2-octet length prefix.
+        pipe.client
+            .stream_send(0, &framed(b"hello")[..1], true)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::ProtocolError));
+        assert_protocol_close(&pipe.server);
+    }
+
+    #[test]
+    fn query_reset_after_partial_length_prefix_surfaces_as_event() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // The server reads 1 byte of the length prefix.
+        pipe.client
+            .stream_send(0, &framed(b"hello")[..1], false)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(server.poll(&mut pipe.server), Err(Error::Done));
+
+        // The client then abandons the query with RESET_STREAM.
+        pipe.client
+            .stream_shutdown(0, crate::Shutdown::Write, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(server.poll(&mut pipe.server), Ok((0, Event::Reset(42))));
+        assert_eq!(
+            server.send_response(&mut pipe.server, 0, b"too late", true),
+            Err(Error::UnknownStream)
+        );
+    }
+
+    /// Returns a config whose windows hold one framed message of the maximum
+    /// size.
+    fn max_message_config() -> crate::Config {
+        let mut config = doq_config();
+        config.set_initial_max_data(200_000);
+        config.set_initial_max_stream_data_bidi_local(100_000);
+        config.set_initial_max_stream_data_bidi_remote(100_000);
+        config
+    }
+
+    #[test]
+    fn query_of_maximum_size_surfaces() {
+        let mut config = max_message_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+
+        // The length prefix announces 65,535 bytes, the largest u16 value.
+        // The congestion window limits each flight, so the client sends the
+        // rest after each `advance`. The query surfaces only after FIN.
+        let query = vec![7; usize::from(u16::MAX)];
+        let wire = framed(&query);
+        let mut sent = 0;
+        let mut event = None;
+
+        for _ in 0..100 {
+            if sent < wire.len() {
+                if let Ok(n) = pipe.client.stream_send(0, &wire[sent..], true) {
+                    sent += n;
+                }
+            }
+
+            pipe.advance().unwrap();
+
+            match server.poll(&mut pipe.server) {
+                Ok(item) => {
+                    event = Some(item);
+                    break;
+                },
+
+                Err(Error::Done) => (),
+
+                Err(e) => panic!("unexpected poll error: {e:?}"),
+            }
+        }
+
+        assert_eq!(sent, wire.len());
+        assert_eq!(
+            event,
+            Some((0, Event::Query {
+                data: query,
+                is_0rtt: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn client_reads_response_of_maximum_size() {
+        let mut config = max_message_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        // The length prefix announces 65,535 bytes, the largest u16 value.
+        // The congestion window limits each flight, so the server sends the
+        // rest after each `advance`.
+        let response = vec![9; usize::from(u16::MAX)];
+        let wire = framed(&response);
+        let mut sent = 0;
+        let mut items = Vec::new();
+
+        for _ in 0..100 {
+            if sent < wire.len() {
+                if let Ok(n) = pipe.server.stream_send(0, &wire[sent..], true) {
+                    sent += n;
+                }
+            }
+
+            pipe.advance().unwrap();
+            items.extend(read_stream_items(&mut client, &mut pipe.client, 0));
+
+            if items.last() == Some(&ClientRead::Finished) {
+                break;
+            }
+        }
+
+        assert_eq!(sent, wire.len());
+        assert_eq!(items, vec![
+            ClientRead::Response(response),
+            ClientRead::Finished
+        ]);
+    }
+
+    #[test]
+    fn client_reads_response_split_into_single_bytes() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        let wire = framed(b"answer");
+
+        // Each byte arrives in its own packet. The response is returned only
+        // when its last byte is read.
+        for (i, byte) in wire.iter().enumerate() {
+            let fin = i == wire.len() - 1;
+            pipe.server.stream_send(0, &[*byte], fin).unwrap();
+            pipe.advance().unwrap();
+
+            if !fin {
+                assert_eq!(
+                    client.recv_response(&mut pipe.client, 0),
+                    Err(Error::Done)
+                );
+            }
+        }
+
+        assert_eq!(read_stream_items(&mut client, &mut pipe.client, 0), vec![
+            ClientRead::Response(b"answer".to_vec()),
+            ClientRead::Finished
+        ]);
+    }
+
+    #[test]
+    fn client_reads_zero_length_last_response() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        // The last message before FIN has a zero length prefix.
+        let mut wire = framed(b"answer");
+        wire.extend_from_slice(&framed(b""));
+        pipe.server.stream_send(0, &wire, true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(read_stream_items(&mut client, &mut pipe.client, 0), vec![
+            ClientRead::Response(b"answer".to_vec()),
+            ClientRead::Response(Vec::new()),
+            ClientRead::Finished
+        ]);
+        assert!(pipe.client.local_error().is_none());
+    }
+
+    #[test]
     fn client_initiated_unidirectional_stream_is_protocol_error() {
         let mut config = doq_config();
         let mut pipe = Pipe::with_config(&mut config).unwrap();
@@ -1589,7 +2200,13 @@ mod tests {
         pipe.server.stream_send(0, b"", true).unwrap();
         pipe.advance().unwrap();
 
-        assert_eq!(client.poll(&mut pipe.client), Err(Error::ProtocolError));
+        // `poll` only reports readiness. `recv_response` detects the FIN
+        // that arrived before any response.
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::ProtocolError)
+        );
         assert_protocol_close(&pipe.client);
     }
 
@@ -1611,25 +2228,26 @@ mod tests {
         pipe.server.stream_send(0, &wire, true).unwrap();
         pipe.advance().unwrap();
 
+        // The query FIN was acknowledged by `advance`, so the transport may
+        // collect the stream once the client reads the response FIN.
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+
+        // One `recv_response` call returns one item.
+        for answer in [b"answer 1", b"answer 2", b"answer 3"] {
+            assert_eq!(
+                client.recv_response(&mut pipe.client, 0),
+                Ok(ClientRead::Response(answer.to_vec()))
+            );
+        }
         assert_eq!(
-            client.poll(&mut pipe.client),
-            Ok((0, Event::Response {
-                data: b"answer 1".to_vec()
-            }))
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Finished)
         );
         assert_eq!(
-            client.poll(&mut pipe.client),
-            Ok((0, Event::Response {
-                data: b"answer 2".to_vec()
-            }))
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::UnknownStream)
         );
-        assert_eq!(
-            client.poll(&mut pipe.client),
-            Ok((0, Event::Response {
-                data: b"answer 3".to_vec()
-            }))
-        );
-        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Finished)));
         assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
     }
 
@@ -1682,6 +2300,13 @@ mod tests {
         let mut server = Connection::with_transport(&pipe.server).unwrap();
         let mut client = Connection::with_transport(&pipe.client).unwrap();
 
+        // Track stream 0 as a local query stream. The test writes the
+        // partial query below through the transport directly.
+        client.streams.insert(0, StreamState {
+            is_local: true,
+            ..Default::default()
+        });
+
         // The client abandons a query before sending STREAM FIN.
         pipe.client
             .stream_send(0, &framed(b"hello")[..3], false)
@@ -1698,7 +2323,11 @@ mod tests {
         // locally.
         pipe.advance().unwrap();
 
-        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Reset(42))));
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Reset(42))
+        );
     }
 
     #[test]
@@ -1840,13 +2469,15 @@ mod tests {
             .unwrap();
         pipe.advance().unwrap();
 
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
         assert_eq!(
-            client.poll(&mut pipe.client),
-            Ok((0, Event::Response {
-                data: b"world".to_vec()
-            }))
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Response(b"world".to_vec()))
         );
-        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Finished)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Finished)
+        );
 
         // The transaction is complete; a second response is now unknown.
         assert_eq!(
@@ -1878,15 +2509,15 @@ mod tests {
 
     /// Drains `server`'s buffered response on `stream_id` across as many
     /// `flush_response`/`Pipe::advance` round trips as it takes for the
-    /// small window in [`small_window_config`] to grow enough, polling
-    /// `client` after each round trip and collecting every event it
-    /// produces along the way. Bounded so a regression that never drains
-    /// fails the test instead of hanging it.
+    /// small window in [`small_window_config`] to grow enough. After each
+    /// round trip, `client` reads the stream on every readiness event and
+    /// the helper collects every item along the way. Bounded so a regression
+    /// that never drains fails the test instead of hanging it.
     fn drain_response(
         pipe: &mut Pipe, server: &mut Connection, client: &mut Connection,
         stream_id: u64,
-    ) -> Vec<Event> {
-        let mut events = Vec::new();
+    ) -> Vec<ClientRead> {
+        let mut items = Vec::new();
         let mut iterations = 0;
 
         loop {
@@ -1894,7 +2525,12 @@ mod tests {
 
             loop {
                 match client.poll(&mut pipe.client) {
-                    Ok((_, ev)) => events.push(ev),
+                    Ok((id, Event::Data)) => items.extend(read_stream_items(
+                        client,
+                        &mut pipe.client,
+                        id,
+                    )),
+                    Ok((_, ev)) => panic!("unexpected client event: {ev:?}"),
                     Err(Error::Done) => break,
                     Err(e) => panic!("unexpected client poll error: {e:?}"),
                 }
@@ -1902,7 +2538,7 @@ mod tests {
 
             pipe.advance().unwrap();
 
-            if !server.response_pending(stream_id) {
+            if !server.send_pending(stream_id) {
                 break;
             }
 
@@ -1912,7 +2548,7 @@ mod tests {
             assert!(iterations < 50, "drain loop did not terminate");
         }
 
-        events
+        items
     }
 
     #[test]
@@ -1924,7 +2560,7 @@ mod tests {
         let mut server = Connection::with_transport(&pipe.server).unwrap();
         let mut client = Connection::with_transport(&pipe.client).unwrap();
 
-        pipe.client.stream_send(0, &framed(b"query"), true).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
         pipe.advance().unwrap();
 
         assert_eq!(
@@ -1942,16 +2578,16 @@ mod tests {
             Ok(())
         );
         assert!(
-            server.response_pending(0),
+            server.send_pending(0),
             "200 bytes shouldn't fit in the 20-byte window in one write"
         );
 
         let events = drain_response(&mut pipe, &mut server, &mut client, 0);
 
-        assert!(!server.response_pending(0));
+        assert!(!server.send_pending(0));
         assert_eq!(events, vec![
-            Event::Response { data: body },
-            Event::Finished,
+            ClientRead::Response(body),
+            ClientRead::Finished,
         ]);
         assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
     }
@@ -1965,7 +2601,7 @@ mod tests {
         let mut server = Connection::with_transport(&pipe.server).unwrap();
         let mut client = Connection::with_transport(&pipe.client).unwrap();
 
-        pipe.client.stream_send(0, &framed(b"query"), true).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
         pipe.advance().unwrap();
 
         assert_eq!(
@@ -1982,7 +2618,7 @@ mod tests {
             .send_response(&mut pipe.server, 0, &body, true)
             .unwrap();
         assert!(
-            server.response_pending(0),
+            server.send_pending(0),
             "200 bytes shouldn't fit in the 20-byte window in one write"
         );
 
@@ -1991,14 +2627,15 @@ mod tests {
         // cleared the QUIC-level FIN flag on the truncated write, the
         // client must not report `Finished` yet.
         pipe.advance().unwrap();
-        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(client.recv_response(&mut pipe.client, 0), Err(Error::Done));
 
         let events = drain_response(&mut pipe, &mut server, &mut client, 0);
 
-        assert!(!server.response_pending(0));
+        assert!(!server.send_pending(0));
         assert_eq!(events, vec![
-            Event::Response { data: body },
-            Event::Finished,
+            ClientRead::Response(body),
+            ClientRead::Finished,
         ]);
         assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
     }
@@ -2028,7 +2665,7 @@ mod tests {
             .send_response(&mut pipe.server, 0, &body, true)
             .unwrap();
         assert!(
-            server.response_pending(0),
+            server.send_pending(0),
             "200 bytes shouldn't fit in the 20-byte window in one write"
         );
 
@@ -2073,17 +2710,372 @@ mod tests {
         server
             .send_response(&mut pipe.server, 0, &body3, true)
             .unwrap();
-        assert!(server.response_pending(0));
+        assert!(server.send_pending(0));
 
         let events = drain_response(&mut pipe, &mut server, &mut client, 0);
 
-        assert!(!server.response_pending(0));
+        assert!(!server.send_pending(0));
         assert_eq!(events, vec![
-            Event::Response { data: body1 },
-            Event::Response { data: body2 },
-            Event::Response { data: body3 },
-            Event::Finished,
+            ClientRead::Response(body1),
+            ClientRead::Response(body2),
+            ClientRead::Response(body3),
+            ClientRead::Finished,
         ]);
         assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+    }
+
+    /// Sets up a handshaken pipe with a DoQ client and one query on stream 0.
+    fn client_with_query(config: &mut crate::Config) -> (Pipe, Connection) {
+        let mut pipe = Pipe::with_config(config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        pipe.advance().unwrap();
+
+        (pipe, client)
+    }
+
+    #[test]
+    fn client_readiness_is_emitted_once_until_rearmed() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        // The first response message arrives without FIN.
+        pipe.server
+            .stream_send(0, &framed(b"answer 1"), false)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+
+        // The stream is still readable, but it is not reported again.
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+
+        // More data arrives while the first message is unread. `poll` reads
+        // no bytes and emits nothing.
+        pipe.server
+            .stream_send(0, &framed(b"answer 2"), false)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+        assert!(!client.streams[&0].message_started());
+
+        // A read that returns an item does not re-arm the event.
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Response(b"answer 1".to_vec()))
+        );
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Response(b"answer 2".to_vec()))
+        );
+
+        // `Done` re-arms the event.
+        assert_eq!(client.recv_response(&mut pipe.client, 0), Err(Error::Done));
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+
+        pipe.server
+            .stream_send(0, &framed(b"answer 3"), true)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(read_stream_items(&mut client, &mut pipe.client, 0), vec![
+            ClientRead::Response(b"answer 3".to_vec()),
+            ClientRead::Finished
+        ]);
+    }
+
+    #[test]
+    fn client_reads_all_messages_after_stream_is_collectable() {
+        let mut config = doq_config();
+        config.set_initial_max_data(10_000);
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        // The query FIN is acknowledged. Several responses and the response
+        // FIN arrive in one flight. The client reads the FIN with the last
+        // message. After that quiche may collect the stream, so `Finished`
+        // comes from DoQ state.
+        let mut wire = Vec::new();
+        for i in 0..5u8 {
+            wire.extend_from_slice(&framed(&[i; 50]));
+        }
+        pipe.server.stream_send(0, &wire, true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+
+        let items = read_stream_items(&mut client, &mut pipe.client, 0);
+        let mut expected: Vec<ClientRead> = (0..5u8)
+            .map(|i| ClientRead::Response(vec![i; 50]))
+            .collect();
+        expected.push(ClientRead::Finished);
+        assert_eq!(items, expected);
+        assert!(pipe.client.local_error().is_none());
+    }
+
+    #[test]
+    fn client_serves_fin_without_transport() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        pipe.server
+            .stream_send(0, &framed(b"answer"), true)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        // The body read takes the last byte, so it also reads the FIN. After
+        // that the transport collects the stream.
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Response(b"answer".to_vec()))
+        );
+        assert!(client.streams[&0].fin_received);
+        assert!(pipe.client.stream_closed(0));
+
+        // `stream_capacity` fails on a collected stream, so this call
+        // succeeds only if it does not reach the transport.
+        assert_eq!(
+            pipe.client.stream_capacity(0),
+            Err(crate::Error::InvalidStreamState(0))
+        );
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Finished)
+        );
+    }
+
+    #[test]
+    fn client_recv_buf_is_bounded_and_flow_control_stalls_the_server() {
+        let mut config = doq_config();
+        // The server's send window on stream 0 is the client's `bidi_local`
+        // limit.
+        config.set_initial_max_stream_data_bidi_local(1_000);
+        config.set_initial_max_data(10_000);
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        let messages: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 600]).collect();
+        let mut wire = Vec::new();
+        for message in &messages {
+            wire.extend_from_slice(&framed(message));
+        }
+
+        // The server writes until the stream window is full.
+        let sent = pipe.server.stream_send(0, &wire, true).unwrap();
+        assert_eq!(sent, 1_000);
+        pipe.advance().unwrap();
+        assert_eq!(pipe.server.stream_capacity(0), Ok(0));
+
+        // A slow client reads nothing in `poll`. The server stays stalled.
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert!(!client.streams[&0].message_started());
+        pipe.advance().unwrap();
+        assert_eq!(pipe.server.stream_capacity(0), Ok(0));
+
+        // The client reads one message at a time. The buffer never holds
+        // more than one message body, and it is allocated with the
+        // announced length of that body.
+        let mut offset = sent;
+        let mut received = Vec::new();
+        let mut finished = false;
+        for _ in 0..50 {
+            match client.recv_response(&mut pipe.client, 0) {
+                Ok(ClientRead::Response(data)) => received.push(data),
+                Ok(ClientRead::Finished) => {
+                    finished = true;
+                    break;
+                },
+                Ok(item) => panic!("unexpected item: {item:?}"),
+                Err(Error::Done) => (),
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+
+            if let Some(state) = client.streams.get(&0) {
+                assert!(state.recv_buf.len() <= 600);
+                assert!(state.recv_buf.capacity() <= 600);
+            }
+
+            // The consumed bytes return credit, and the server continues.
+            pipe.advance().unwrap();
+
+            if offset < wire.len() {
+                if let Ok(n) = pipe.server.stream_send(0, &wire[offset..], true) {
+                    offset += n;
+                }
+            }
+
+            pipe.advance().unwrap();
+        }
+
+        // All four messages arrive in order, and the server's FIN ends the
+        // stream before the loop runs out.
+        assert_eq!(received, messages);
+        assert!(finished);
+    }
+
+    #[test]
+    fn client_stop_sending_with_unread_response_is_fatal_in_recv_response() {
+        let mut config = doq_config();
+        config.set_initial_max_stream_data_bidi_remote(20);
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, &[0; 200]), Ok(0));
+        pipe.advance().unwrap();
+
+        pipe.server
+            .stream_send(0, &framed(b"response"), false)
+            .unwrap();
+        pipe.server
+            .stream_shutdown(0, crate::Shutdown::Read, 42)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        // The caller reads the stream without a prior `poll`. The response
+        // is buffered in the transport and unread, and `STOP_SENDING` wins.
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::ProtocolError)
+        );
+        assert_protocol_close(&pipe.client);
+        assert_eq!(client.poll(&mut pipe.client), Err(Error::Done));
+        assert_eq!(client.recv_response(&mut pipe.client, 0), Err(Error::Done));
+    }
+
+    #[test]
+    fn client_reset_while_response_unread_yields_reset() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        pipe.server
+            .stream_send(0, &framed(b"answer")[..4], false)
+            .unwrap();
+        pipe.server
+            .stream_shutdown(0, crate::Shutdown::Write, 7)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Reset(7))
+        );
+        assert!(!client.streams.contains_key(&0));
+    }
+
+    #[test]
+    fn client_truncated_fin_is_protocol_error_in_recv_response() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        let wire = framed(b"answer");
+        pipe.server
+            .stream_send(0, &wire[..wire.len() - 1], true)
+            .unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::ProtocolError)
+        );
+        assert_protocol_close(&pipe.client);
+    }
+
+    #[test]
+    fn client_bytes_after_last_message_at_fin_are_protocol_error() {
+        let mut config = doq_config();
+        let (mut pipe, mut client) = client_with_query(&mut config);
+
+        // A complete message, then one stray byte, then FIN.
+        let mut wire = framed(b"answer");
+        wire.push(0);
+        pipe.server.stream_send(0, &wire, true).unwrap();
+        pipe.advance().unwrap();
+
+        assert_eq!(client.poll(&mut pipe.client), Ok((0, Event::Data)));
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Response(b"answer".to_vec()))
+        );
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::ProtocolError)
+        );
+        assert_protocol_close(&pipe.client);
+    }
+
+    #[test]
+    fn recv_response_rejects_server_role_and_unknown_streams() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        let mut server = Connection::with_transport(&pipe.server).unwrap();
+        assert_eq!(
+            server.recv_response(&mut pipe.server, 0),
+            Err(Error::ClientOnly)
+        );
+
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Err(Error::UnknownStream)
+        );
+    }
+
+    #[test]
+    fn response_methods_on_client_are_server_only() {
+        let mut config = doq_config();
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        // The client sends a complete query on stream 0.
+        let mut client = Connection::with_transport(&pipe.client).unwrap();
+        assert_eq!(client.send_query(&mut pipe.client, b"query"), Ok(0));
+        pipe.advance().unwrap();
+
+        // `send_response` fails with `ServerOnly` before it checks the
+        // stream or the data: on the query stream, on an untracked stream,
+        // and with a message that is too large.
+        assert_eq!(
+            client.send_response(&mut pipe.client, 0, b"response", true),
+            Err(Error::ServerOnly)
+        );
+        assert_eq!(
+            client.send_response(&mut pipe.client, 4, b"response", true),
+            Err(Error::ServerOnly)
+        );
+        assert_eq!(
+            client.send_response(&mut pipe.client, 0, &[0; 65_536], true),
+            Err(Error::ServerOnly)
+        );
+
+        // `flush_response` fails with `ServerOnly` and keeps the query
+        // state.
+        assert_eq!(
+            client.flush_response(&mut pipe.client, 0),
+            Err(Error::ServerOnly)
+        );
+
+        // The server answers. The client still tracks the query, so it
+        // reads the response and then the end of the stream.
+        assert_eq!(
+            pipe.server.stream_send(0, &framed(b"response"), true),
+            Ok(10)
+        );
+        pipe.advance().unwrap();
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Response(b"response".to_vec()))
+        );
+        assert_eq!(
+            client.recv_response(&mut pipe.client, 0),
+            Ok(ClientRead::Finished)
+        );
     }
 }

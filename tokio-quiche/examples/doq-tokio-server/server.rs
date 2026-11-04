@@ -649,7 +649,7 @@ mod tests {
             .expect("UDP response task should finish")
             .unwrap();
         assert_eq!(events.len(), 2);
-        let quiche::doq::Event::Response { data } = events.remove(0) else {
+        let quiche::doq::ClientRead::Response(data) = events.remove(0) else {
             panic!("expected DoQ response");
         };
         let response = Message::from_octets(Bytes::from(data)).unwrap();
@@ -696,7 +696,7 @@ mod tests {
             assert_eq!(*additional[0].data(), A::from_octets(192, 0, 2, 2));
             assert_eq!(additional[0].ttl(), Ttl::from_secs(302));
         }
-        assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
         tokio::time::timeout(TEST_TIMEOUT, server_task)
             .await
             .expect("server should stop after client closes")
@@ -794,12 +794,12 @@ mod tests {
                 .unwrap();
             assert_eq!(events.len(), 2);
             // The DoQ client receives the response forwarded by the server.
-            let quiche::doq::Event::Response { data } = events.remove(0) else {
+            let quiche::doq::ClientRead::Response(data) = events.remove(0) else {
                 panic!("expected DoQ response");
             };
             // Compare the received DoQ bytes with the expected response.
             assert_eq!(&data[..], &expected_response[..]);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
                 .unwrap()
@@ -910,7 +910,7 @@ mod tests {
                     Rcode::SERVFAIL,
                     (network && edns).then_some(ExtendedErrorCode::NETWORK_ERROR),
                 );
-                assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+                assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
                 if matches!(failure, Failure::Timeout) {
                     // Stop the peer still waiting past the server deadline.
                     peer.abort();
@@ -1197,17 +1197,39 @@ mod tests {
     async fn collect_until_finished(
         socket: &UdpSocket, conn: &mut quiche::Connection,
         doq: &mut quiche::doq::Connection, server_addr: SocketAddr,
-        deadline: Instant, events: &mut HashMap<u64, Vec<quiche::doq::Event>>,
-        stream_id: u64,
+        deadline: Instant,
+        events: &mut HashMap<u64, Vec<quiche::doq::ClientRead>>, stream_id: u64,
     ) {
-        while !events
-            .get(&stream_id)
-            .is_some_and(|events| events.contains(&quiche::doq::Event::Finished))
-        {
+        while !events.get(&stream_id).is_some_and(|events| {
+            events.contains(&quiche::doq::ClientRead::Finished)
+        }) {
             receive_packet(socket, conn, deadline).await;
             loop {
                 match doq.poll(conn) {
-                    Ok((id, event)) => events.entry(id).or_default().push(event),
+                    Ok((id, quiche::doq::Event::Data)) => {
+                        // Read the stream to `Done` or a terminal item.
+                        loop {
+                            match doq.recv_response(conn, id) {
+                                Ok(item) => {
+                                    let terminal = matches!(
+                                        item,
+                                        quiche::doq::ClientRead::Finished |
+                                            quiche::doq::ClientRead::Reset(_)
+                                    );
+                                    events.entry(id).or_default().push(item);
+
+                                    if terminal {
+                                        break;
+                                    }
+                                },
+                                Err(quiche::doq::Error::Done) => break,
+                                Err(error) => {
+                                    panic!("unexpected DoQ error: {error:?}")
+                                },
+                            }
+                        }
+                    },
+                    Ok((_, event)) => panic!("unexpected DoQ event: {event:?}"),
                     Err(quiche::doq::Error::Done) => break,
                     Err(error) => panic!("unexpected DoQ error: {error:?}"),
                 }
@@ -1225,7 +1247,7 @@ mod tests {
         socket: &UdpSocket, conn: &mut quiche::Connection,
         doq: &mut quiche::doq::Connection, server_addr: SocketAddr,
         deadline: Instant, stream_id: u64,
-    ) -> Vec<quiche::doq::Event> {
+    ) -> Vec<quiche::doq::ClientRead> {
         let mut events = HashMap::new();
         collect_until_finished(
             socket,
@@ -1264,7 +1286,7 @@ mod tests {
     /// Send a query after a fresh handshake and collect its DoQ events.
     async fn send_raw_query(
         server_addr: SocketAddr, query: &Bytes,
-    ) -> Vec<quiche::doq::Event> {
+    ) -> Vec<quiche::doq::ClientRead> {
         let deadline = Instant::now() + TEST_TIMEOUT;
         let (socket, mut conn, mut doq) =
             raw_established_client(server_addr, deadline).await;
@@ -1298,10 +1320,10 @@ mod tests {
 
     /// Check DNS response fields and EDE against the expected values.
     fn assert_dns_response(
-        event: quiche::doq::Event, query: &Bytes, rcode: Rcode,
+        event: quiche::doq::ClientRead, query: &Bytes, rcode: Rcode,
         ede: Option<ExtendedErrorCode>,
     ) {
-        let quiche::doq::Event::Response { data } = event else {
+        let quiche::doq::ClientRead::Response(data) = event else {
             panic!("expected DoQ response, got {event:?}");
         };
         let response = Message::from_octets(Bytes::from(data)).unwrap();
@@ -1329,7 +1351,7 @@ mod tests {
     /// Returns the events and the client's BoringSSL early data reason.
     async fn send_raw_resumed_query(
         server_addr: SocketAddr, session: &[u8], query: &Bytes, early_data: bool,
-    ) -> (Vec<quiche::doq::Event>, u32) {
+    ) -> (Vec<quiche::doq::ClientRead>, u32) {
         let deadline = Instant::now() + TEST_TIMEOUT;
         let (socket, mut conn, mut doq) =
             raw_client_after_retry(server_addr, Some(session), deadline).await;
@@ -1371,7 +1393,7 @@ mod tests {
                 Rcode::SERVFAIL,
                 edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 
             tokio::time::timeout(TEST_TIMEOUT, server_task)
@@ -1397,7 +1419,7 @@ mod tests {
                 Rcode::SERVFAIL,
                 edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
                 .expect("server should stop after client closes")
@@ -1426,7 +1448,7 @@ mod tests {
                 Rcode::SERVFAIL,
                 edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             let mut buffer = [0; 1400];
             let (len, _) = tokio::time::timeout(
                 TEST_TIMEOUT,
@@ -1461,7 +1483,7 @@ mod tests {
         let mut events = send_raw_query(server_addr, &query).await;
         assert_eq!(events.len(), 2);
         assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
-        assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
         tokio::time::timeout(TEST_TIMEOUT, response_task)
             .await
             .expect("UDP upstream should send its invalid response")
@@ -1534,7 +1556,7 @@ mod tests {
             let mut events = send_raw_query(server_addr, &query).await;
             assert_eq!(events.len(), 2);
             assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             tokio::time::timeout(TEST_TIMEOUT, response_task)
                 .await
                 .expect("UDP response task should finish")
@@ -1630,14 +1652,14 @@ mod tests {
                 .unwrap();
             assert_eq!(upstream_response.len() == 1400, fill_buffer);
             assert_eq!(events.len(), 2);
-            let quiche::doq::Event::Response { data } = events.remove(0) else {
+            let quiche::doq::ClientRead::Response(data) = events.remove(0) else {
                 panic!("expected DoQ response");
             };
             // The DoQ response is the UDP response with DNS ID zero.
             let mut expected = upstream_response.to_vec();
             expected[..2].copy_from_slice(&[0, 0]);
             assert_eq!(&data[..], &expected[..]);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_no_tcp_connection(&listener);
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
@@ -1695,7 +1717,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
             assert_eq!(events.len(), 2);
-            let quiche::doq::Event::Response { data } = events.remove(0) else {
+            let quiche::doq::ClientRead::Response(data) = events.remove(0) else {
                 panic!("expected DoQ response");
             };
             let response = Message::from_octets(Bytes::from(data)).unwrap();
@@ -1711,7 +1733,7 @@ mod tests {
                 assert!(response.opt().is_none());
                 assert_eq!(response.header_counts().ancount(), 1);
             }
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             // The peer task accepted the first TCP connection with
             // `accept_tcp` and answered the retried query on it. Check that no
             // second TCP connection waits on the listener.
@@ -1802,7 +1824,7 @@ mod tests {
                 matches!(failure, Failure::Timeout)
                     .then_some(ExtendedErrorCode::NETWORK_ERROR),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_no_tcp_connection(&listener);
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
@@ -1888,7 +1910,7 @@ mod tests {
                 (!matches!(failure, Failure::Mismatched))
                     .then_some(ExtendedErrorCode::NETWORK_ERROR),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_no_tcp_connection(&listener);
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
@@ -2003,7 +2025,7 @@ mod tests {
                 Rcode::SERVFAIL,
                 edns.then_some(ExtendedErrorCode::NETWORK_ERROR),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 
             tokio::time::timeout(TEST_TIMEOUT, server_task)
@@ -2026,7 +2048,7 @@ mod tests {
             let mut events = send_raw_query(server_addr, &query).await;
             assert_eq!(events.len(), 2);
             assert_dns_response(events.remove(0), &query, Rcode::SERVFAIL, None);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
 
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
@@ -2057,7 +2079,7 @@ mod tests {
             let query = test_query(Rtype::A, Opcode::QUERY, edns);
             let mut events = send_raw_query(server_addr, &query).await;
             assert_eq!(events.len(), 2);
-            let quiche::doq::Event::Response { data } = events.remove(0) else {
+            let quiche::doq::ClientRead::Response(data) = events.remove(0) else {
                 panic!("expected DoQ response");
             };
             let response = Message::from_octets(Bytes::from(data)).unwrap();
@@ -2066,7 +2088,7 @@ mod tests {
             assert!(response.is_answer(&query));
             assert_eq!(response.opt_rcode(), expected_rcode);
             assert_eq!(response.opt().is_some(), edns);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
 
             tokio::time::timeout(TEST_TIMEOUT, server_task)
                 .await
@@ -2095,7 +2117,7 @@ mod tests {
                     Rcode::NOTIMP,
                     None,
                 );
-                assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+                assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
                 assert_eq!(upstream.calls.load(Ordering::Relaxed), 0);
 
                 tokio::time::timeout(TEST_TIMEOUT, server_task)
@@ -2127,7 +2149,7 @@ mod tests {
                 Rcode::REFUSED,
                 edns.then_some(ExtendedErrorCode::from_int(26)),
             );
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_eq!(upstream.calls.load(Ordering::Relaxed), 0);
 
             // End the listener after checking the ticket and resumed response.
@@ -2152,7 +2174,7 @@ mod tests {
             assert_eq!(early_data_reason, EARLY_DATA_ACCEPTED);
             assert_eq!(events.len(), 2);
             assert_dns_response(events.remove(0), &query, Rcode::NOERROR, None);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 
             // End the listener after checking the ticket and resumed response.
@@ -2184,7 +2206,7 @@ mod tests {
             assert_eq!(early_data_reason, EARLY_DATA_UNSUPPORTED_FOR_SESSION);
             assert_eq!(events.len(), 2);
             assert_dns_response(events.remove(0), &query, Rcode::NOERROR, None);
-            assert_eq!(events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(events.remove(0), quiche::doq::ClientRead::Finished);
             assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 
             // End the listener after checking the ticket and resumed response.
@@ -2284,7 +2306,10 @@ mod tests {
                 Rcode::NOERROR,
                 None,
             );
-            assert_eq!(stream_events.remove(0), quiche::doq::Event::Finished);
+            assert_eq!(
+                stream_events.remove(0),
+                quiche::doq::ClientRead::Finished
+            );
         }
 
         tokio::time::timeout(TEST_TIMEOUT, server_task)
@@ -2325,7 +2350,7 @@ mod tests {
             Rcode::SERVFAIL,
             Some(ExtendedErrorCode::NOT_READY),
         );
-        assert_eq!(overloaded.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(overloaded.remove(0), quiche::doq::ClientRead::Finished);
 
         let non_edns_query = test_query(Rtype::AAAA, Opcode::QUERY, false);
         let non_edns_id = doq.send_query(&mut conn, &non_edns_query).unwrap();
@@ -2350,7 +2375,7 @@ mod tests {
             Rcode::SERVFAIL,
             None,
         );
-        assert_eq!(overloaded.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(overloaded.remove(0), quiche::doq::ClientRead::Finished);
         assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 
         upstream.release.notify_one();
@@ -2364,7 +2389,7 @@ mod tests {
         )
         .await;
         assert_dns_response(held.remove(0), &held_query, Rcode::NOERROR, None);
-        assert_eq!(held.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(held.remove(0), quiche::doq::ClientRead::Finished);
         let permit =
             tokio::time::timeout(TEST_TIMEOUT, concurrent_transactions.acquire())
                 .await
@@ -2380,7 +2405,7 @@ mod tests {
             Rcode::NOERROR,
             None,
         );
-        assert_eq!(accepted.remove(0), quiche::doq::Event::Finished);
+        assert_eq!(accepted.remove(0), quiche::doq::ClientRead::Finished);
         assert_eq!(upstream.calls.load(Ordering::Relaxed), 2);
         tokio::time::timeout(TEST_TIMEOUT, server_task)
             .await

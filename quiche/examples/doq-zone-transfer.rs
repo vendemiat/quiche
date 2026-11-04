@@ -35,6 +35,7 @@ use ring::rand::*;
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::BufWriter;
 use std::io::Write;
 
@@ -57,6 +58,8 @@ use doq_common::*;
 use domain::base::iana::Rcode;
 use domain::base::iana::Rtype;
 use domain::base::message::Message;
+use domain::base::zonefile_fmt::DisplayKind;
+use domain::base::zonefile_fmt::ZonefileFmt;
 use domain::rdata::AllRecordData;
 
 struct ZoneTransfer {
@@ -119,6 +122,11 @@ fn main() {
 
     let server_str = args.next().unwrap();
     let zone = args.next().unwrap();
+
+    let Some(out_path) = zone_file_name(&zone) else {
+        eprintln!("Zone name '{}' cannot be used as a file name", zone);
+        return;
+    };
 
     // Resolve the server address (accepts IPs, bracketed IPv6, and host names)
     // and derive the TLS SNI server name, defaulting to the DoQ port.
@@ -203,7 +211,7 @@ fn main() {
         panic!("send() failed: {:?}", e);
     }
 
-    let mut transfer_sent = false;
+    let mut transfer_started = false;
     let mut active_transfers: HashMap<u64, ZoneTransfer> = HashMap::new();
 
     loop {
@@ -261,8 +269,9 @@ fn main() {
             break;
         }
 
-        // Send zone transfer request once connected.
-        if conn.is_established() && !transfer_sent {
+        // Start the zone transfer once connected. It is started at most once.
+        if conn.is_established() && !transfer_started {
+            transfer_started = true;
             info!("Connection established, sending AXFR request");
 
             // Build the zone transfer query.
@@ -274,54 +283,62 @@ fn main() {
                 },
             };
 
-            match doq_conn.send_query(&mut conn, &query) {
-                Ok(stream_id) => {
-                    info!("Sent AXFR request on stream {}", stream_id);
+            // Stream received records straight to a zone file so the full
+            // zone is written out without buffering it in memory.
+            // `create_new` fails if the path already exists, also as a
+            // symlink or a directory. So this run never truncates, writes or
+            // removes a file that it did not create.
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_path)
+            {
+                Ok(file) => match doq_conn.send_query(&mut conn, &query) {
+                    Ok(stream_id) => {
+                        info!("Sent AXFR request on stream {}", stream_id);
 
-                    // Stream received records straight to a zone file so the
-                    // full zone is written out without buffering it in memory.
-                    let stem = zone.trim_end_matches('.');
-                    let stem = if stem.is_empty() { "root" } else { stem };
-                    let out_path = format!("{stem}.zone");
-                    let file = match File::create(&out_path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to create zone file {}: {}",
-                                out_path, e
-                            );
-                            break;
-                        },
-                    };
-
-                    active_transfers.insert(stream_id, ZoneTransfer {
-                        zone: zone.clone(),
-                        start_time: std::time::Instant::now(),
-                        messages_received: 0,
-                        total_bytes: 0,
-                        records_written: 0,
-                        failed: false,
-                        soa_seen: 0,
-                        complete: false,
-                        complete_at: None,
-                        protocol_error: false,
-                        out_path,
-                        out: BufWriter::new(file),
-                    });
-                    transfer_sent = true;
+                        active_transfers.insert(stream_id, ZoneTransfer {
+                            zone: zone.clone(),
+                            start_time: std::time::Instant::now(),
+                            messages_received: 0,
+                            total_bytes: 0,
+                            records_written: 0,
+                            failed: false,
+                            soa_seen: 0,
+                            complete: false,
+                            complete_at: None,
+                            protocol_error: false,
+                            out_path: out_path.clone(),
+                            out: BufWriter::new(file),
+                        });
+                    },
+                    Err(e) => {
+                        error!("Failed to send query: {:?}", e);
+                        let _ = std::fs::remove_file(&out_path);
+                        break;
+                    },
                 },
                 Err(e) => {
-                    error!("Failed to send query: {:?}", e);
-                    break;
+                    // No query is sent. The packets sent below in this loop
+                    // pass carry the close.
+                    eprintln!("Failed to create zone file {}: {}", out_path, e);
+                    conn.close(
+                        true,
+                        DoqError::NoError.to_wire(),
+                        b"zone file error",
+                    )
+                    .ok();
                 },
             }
         }
 
-        // Process DoQ events. `Connection` reassembles the stream and removes
-        // the DNS length prefix before returning each complete response.
-        loop {
-            let (stream_id, event) = match doq_conn.poll(&mut conn) {
-                Ok(event) => event,
+        // Process DoQ events. `poll` reports the readable AXFR stream.
+        // `recv_response` reassembles the stream and removes the DNS length
+        // prefix before returning each complete response.
+        'doq: loop {
+            let stream_id = match doq_conn.poll(&mut conn) {
+                Ok((stream_id, Event::Data)) => stream_id,
+                Ok(_) => unreachable!("client received unexpected event"),
                 Err(Error::Done) => break,
                 Err(Error::ProtocolError) => {
                     error!("DoQ protocol error; connection close is pending");
@@ -333,139 +350,211 @@ fn main() {
                 },
             };
 
-            let is_fin = match event {
-                Event::Response { data } => {
-                    if let Some(transfer) = active_transfers.get_mut(&stream_id) {
-                        transfer.messages_received += 1;
-                        transfer.total_bytes += data.len() + 2;
+            // Read until `recv_response` returns `Done`, `Finished`, or
+            // `Reset`. `poll` reports the stream again only after `Done`.
+            loop {
+                let item = match doq_conn.recv_response(&mut conn, stream_id) {
+                    Ok(item) => item,
+                    Err(Error::Done) => break,
+                    Err(Error::ProtocolError) => {
+                        error!("DoQ protocol error; connection close is pending");
+                        break 'doq;
+                    },
+                    Err(e) => {
+                        // `poll` does not report the stream again after this
+                        // error, so close the connection.
+                        error!("DoQ response processing failed: {:?}", e);
+                        conn.close(
+                            true,
+                            DoqError::InternalError.to_wire(),
+                            b"response read failed",
+                        )
+                        .ok();
+                        break 'doq;
+                    },
+                };
 
-                        match write_message_records(transfer, &data) {
-                            Ok(rcode) if rcode == Rcode::NOERROR => {},
-                            Ok(rcode) => {
-                                eprintln!("Transfer failed with rcode: {rcode}");
-                                transfer.failed = true;
-                            },
-                            Err(e) => {
-                                eprintln!("Failed to process DNS message: {}", e);
-                                transfer.failed = true;
-                            },
+                // `Finished` and `Reset` are the last item of the stream:
+                // `recv_response` stops tracking the stream, and another call
+                // for it returns `Error::UnknownStream`. The check at the end
+                // of this loop uses `stream_end` to stop reading after `item`
+                // is handled.
+                let stream_end =
+                    matches!(item, ClientRead::Finished | ClientRead::Reset(_));
+
+                let is_fin = match item {
+                    ClientRead::Response(data) => {
+                        if let Some(transfer) =
+                            active_transfers.get_mut(&stream_id)
+                        {
+                            transfer.messages_received += 1;
+                            transfer.total_bytes += data.len() + 2;
+
+                            match write_message_records(transfer, &data) {
+                                Ok(rcode) if rcode == Rcode::NOERROR => {},
+                                Ok(rcode) => {
+                                    eprintln!(
+                                        "Transfer failed with rcode: {rcode}"
+                                    );
+                                    transfer.failed = true;
+                                },
+                                Err(e) => {
+                                    eprintln!(
+                                        "Failed to process DNS message: {}",
+                                        e
+                                    );
+                                    transfer.failed = true;
+                                },
+                            }
+                        }
+                        false
+                    },
+                    ClientRead::Finished => true,
+                    ClientRead::Reset(code) => {
+                        error!("AXFR stream {} was reset: {}", stream_id, code);
+                        if let Some(transfer) =
+                            active_transfers.get_mut(&stream_id)
+                        {
+                            transfer.failed = true;
+                        }
+                        false
+                    },
+                    _ => unreachable!("client received unexpected item"),
+                };
+
+                // A transfer ends only on the QUIC STREAM FIN — which the
+                // server MUST send after the last response — or on a DNS
+                // failure / DoQ protocol error. The closing SOA confirms the
+                // zone DATA is complete but is NOT itself the end of the DoQ
+                // response, so we never finalize on it alone; the "dangling"
+                // case (closing SOA seen, FIN missing) is bounded by the grace
+                // timer in the main loop.
+                // See [RFC 9250, Section 4.2].
+                //
+                // [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+                let done = active_transfers
+                    .get(&stream_id)
+                    .map(|t| is_fin || t.failed || t.protocol_error)
+                    .unwrap_or(false);
+                if done {
+                    // Stream finished: flush the zone file and finalize the
+                    // transfer.
+                    if let Some(mut transfer) =
+                        active_transfers.remove(&stream_id)
+                    {
+                        if let Err(e) = transfer.out.flush() {
+                            eprintln!("Failed to flush zone file: {}", e);
+                        }
+
+                        let elapsed = transfer.start_time.elapsed();
+                        if transfer.failed {
+                            // DNS-level failure (non-zero RCODE) or malformed
+                            // message; a transaction failure, not a DoQ
+                            // protocol error.
+                            let _ = std::fs::remove_file(&transfer.out_path);
+                            println!("\nAXFR Transfer FAILED:");
+                            println!("  Zone: {}", transfer.zone);
+                            println!(
+                                "  Messages received: {}",
+                                transfer.messages_received
+                            );
+                            println!("  Duration: {:?}", elapsed);
+                            conn.close(
+                                true,
+                                DoqError::NoError.to_wire(),
+                                b"done",
+                            )
+                            .ok();
+                        } else if transfer.protocol_error {
+                            // Data after the closing SOA is forbidden: a fatal
+                            // DoQ protocol error.
+                            // See [RFC 5936, Section 2.2].
+                            //
+                            // [RFC 5936, Section 2.2]: https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
+                            let _ = std::fs::remove_file(&transfer.out_path);
+                            println!("\nAXFR Transfer FAILED (protocol error):");
+                            println!("  Zone: {}", transfer.zone);
+                            println!(
+                                "  Reason: data received after the closing SOA"
+                            );
+                            println!("  Duration: {:?}", elapsed);
+                            conn.close(
+                                true,
+                                DoqError::ProtocolError.to_wire(),
+                                b"data after soa",
+                            )
+                            .ok();
+                        } else if !transfer.complete {
+                            // STREAM FIN before the closing SOA: truncated
+                            // transfer ("STREAM FIN before receiving all the
+                            // expected responses") -> DOQ_PROTOCOL_ERROR.
+                            let _ = std::fs::remove_file(&transfer.out_path);
+                            println!("\nAXFR Transfer INCOMPLETE (truncated):");
+                            println!("  Zone: {}", transfer.zone);
+                            println!(
+                                "  Messages received: {}",
+                                transfer.messages_received
+                            );
+                            println!(
+                                "  Records written: {}",
+                                transfer.records_written
+                            );
+                            println!(
+                                "  Reason: STREAM FIN before the closing SOA"
+                            );
+                            println!("  Duration: {:?}", elapsed);
+                            conn.close(
+                                true,
+                                DoqError::ProtocolError.to_wire(),
+                                b"truncated",
+                            )
+                            .ok();
+                        } else {
+                            // closing SOA + STREAM FIN: a clean, complete
+                            // transfer.
+                            println!("\nAXFR Transfer Complete:");
+                            println!("  Zone: {}", transfer.zone);
+                            println!(
+                                "  Messages received: {}",
+                                transfer.messages_received
+                            );
+                            println!(
+                                "  Records written: {}",
+                                transfer.records_written
+                            );
+                            println!("  Zone file: {}", transfer.out_path);
+                            println!("  Total bytes: {}", transfer.total_bytes);
+                            println!("  Duration: {:?}", elapsed);
+                            println!(
+                                "  Throughput: {:.2} KB/s",
+                                (transfer.total_bytes as f64 / 1024.0) /
+                                    elapsed.as_secs_f64()
+                            );
+
+                            // Client is done; close with DOQ_NO_ERROR once
+                            // nothing else is in flight.
+                            // See [RFC 9250, Section 4.4].
+                            //
+                            // [RFC 9250, Section 4.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.4
+                            if active_transfers.is_empty() {
+                                info!(
+                                    "All transfers complete, closing connection"
+                                );
+                                conn.close(
+                                    true,
+                                    DoqError::NoError.to_wire(),
+                                    b"done",
+                                )
+                                .ok();
+                            }
                         }
                     }
-                    false
-                },
-                Event::Finished => true,
-                Event::Reset(code) => {
-                    error!("AXFR stream {} was reset: {}", stream_id, code);
-                    if let Some(transfer) = active_transfers.get_mut(&stream_id) {
-                        transfer.failed = true;
-                    }
-                    false
-                },
-                Event::Query { .. } => unreachable!("client received query"),
-            };
-
-            // A transfer ends only on the QUIC STREAM FIN — which the server
-            // MUST send after the last response — or on a DNS failure / DoQ
-            // protocol error. The closing SOA confirms the zone DATA is
-            // complete but is NOT itself the end of the DoQ response, so we
-            // never finalize on it alone; the "dangling" case (closing
-            // SOA seen, FIN missing) is bounded by the grace timer in the main
-            // loop.
-            // See [RFC 9250, Section 4.2].
-            //
-            // [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
-            let done = active_transfers
-                .get(&stream_id)
-                .map(|t| is_fin || t.failed || t.protocol_error)
-                .unwrap_or(false);
-            if !done {
-                continue;
-            }
-
-            // Stream finished: flush the zone file and finalize the transfer.
-            if let Some(mut transfer) = active_transfers.remove(&stream_id) {
-                if let Err(e) = transfer.out.flush() {
-                    eprintln!("Failed to flush zone file: {}", e);
                 }
 
-                let elapsed = transfer.start_time.elapsed();
-                if transfer.failed {
-                    // DNS-level failure (non-zero RCODE) or malformed message;
-                    // a transaction failure, not a DoQ protocol error.
-                    let _ = std::fs::remove_file(&transfer.out_path);
-                    println!("\nAXFR Transfer FAILED:");
-                    println!("  Zone: {}", transfer.zone);
-                    println!(
-                        "  Messages received: {}",
-                        transfer.messages_received
-                    );
-                    println!("  Duration: {:?}", elapsed);
-                    conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
-                } else if transfer.protocol_error {
-                    // Data after the closing SOA is forbidden: a fatal DoQ
-                    // protocol error.
-                    // See [RFC 5936, Section 2.2].
-                    //
-                    // [RFC 5936, Section 2.2]: https://datatracker.ietf.org/doc/html/rfc5936#section-2.2
-                    let _ = std::fs::remove_file(&transfer.out_path);
-                    println!("\nAXFR Transfer FAILED (protocol error):");
-                    println!("  Zone: {}", transfer.zone);
-                    println!("  Reason: data received after the closing SOA");
-                    println!("  Duration: {:?}", elapsed);
-                    conn.close(
-                        true,
-                        DoqError::ProtocolError.to_wire(),
-                        b"data after soa",
-                    )
-                    .ok();
-                } else if !transfer.complete {
-                    // STREAM FIN before the closing SOA: truncated transfer
-                    // ("STREAM FIN before receiving all the expected
-                    // responses") -> DOQ_PROTOCOL_ERROR.
-                    let _ = std::fs::remove_file(&transfer.out_path);
-                    println!("\nAXFR Transfer INCOMPLETE (truncated):");
-                    println!("  Zone: {}", transfer.zone);
-                    println!(
-                        "  Messages received: {}",
-                        transfer.messages_received
-                    );
-                    println!("  Records written: {}", transfer.records_written);
-                    println!("  Reason: STREAM FIN before the closing SOA");
-                    println!("  Duration: {:?}", elapsed);
-                    conn.close(
-                        true,
-                        DoqError::ProtocolError.to_wire(),
-                        b"truncated",
-                    )
-                    .ok();
-                } else {
-                    // closing SOA + STREAM FIN: a clean, complete transfer.
-                    println!("\nAXFR Transfer Complete:");
-                    println!("  Zone: {}", transfer.zone);
-                    println!(
-                        "  Messages received: {}",
-                        transfer.messages_received
-                    );
-                    println!("  Records written: {}", transfer.records_written);
-                    println!("  Zone file: {}", transfer.out_path);
-                    println!("  Total bytes: {}", transfer.total_bytes);
-                    println!("  Duration: {:?}", elapsed);
-                    println!(
-                        "  Throughput: {:.2} KB/s",
-                        (transfer.total_bytes as f64 / 1024.0) /
-                            elapsed.as_secs_f64()
-                    );
-
-                    // Client is done; close with DOQ_NO_ERROR once nothing
-                    // else is in flight.
-                    // See [RFC 9250, Section 4.4].
-                    //
-                    // [RFC 9250, Section 4.4]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.4
-                    if active_transfers.is_empty() {
-                        info!("All transfers complete, closing connection");
-                        conn.close(true, DoqError::NoError.to_wire(), b"done")
-                            .ok();
-                    }
+                // `Finished` and `Reset` end the stream, so it has nothing more
+                // to read.
+                if stream_end {
+                    break;
                 }
             }
         }
@@ -473,10 +562,11 @@ fn main() {
         // Probe every writable stream. A tracked query must be flushed even
         // after its bytes drain, because this detects a later STOP_SENDING.
         for stream_id in conn.writable() {
-            let pending = doq_conn.query_pending(stream_id);
+            let pending = doq_conn.send_pending(stream_id);
             match doq_conn.flush_query(&mut conn, stream_id) {
-                Ok(()) if pending =>
-                    debug!("Flushed pending query on stream {}", stream_id),
+                Ok(()) if pending => {
+                    debug!("Flushed pending query on stream {}", stream_id)
+                },
                 Ok(()) => {},
                 Err(Error::UnknownStream) => {},
                 Err(Error::ProtocolError) => {
@@ -619,10 +709,31 @@ fn write_message_records(
         }
 
         if let Some(record) = record.into_record::<AllRecordData<_, _>>()? {
-            writeln!(transfer.out, "{record}")?;
+            // `Display` is not zone-file format: it writes an SRV target
+            // without its trailing dot, and the root target as nothing.
+            writeln!(
+                transfer.out,
+                "{}",
+                record.display_zonefile(DisplayKind::Simple)
+            )?;
             transfer.records_written += 1;
         }
     }
 
     Ok(rcode)
+}
+
+/// Returns the zone file name for `zone` in the current directory: `zone`
+/// without its trailing dots, or `root` for the root zone, followed by
+/// `.zone`. Returns `None` if `zone` has a path separator (`/` or `\`) or a
+/// NUL, so the name cannot point outside the current directory.
+fn zone_file_name(zone: &str) -> Option<String> {
+    if zone.contains(['/', '\\', '\0']) {
+        return None;
+    }
+
+    let stem = zone.trim_end_matches('.');
+    let stem = if stem.is_empty() { "root" } else { stem };
+
+    Some(format!("{stem}.zone"))
 }

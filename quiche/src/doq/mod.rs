@@ -111,7 +111,9 @@
 //! [`Connection::poll`] until it returns [`Error::Done`]. DoQ reads the QUIC
 //! streams and joins message fragments. Each returned event has a stream ID
 //! and a complete DNS message where applicable. The length prefix is removed.
-//! This helper collects the events ready after a packet or timeout:
+//! A client reads no response bytes in `poll`. It gets [`Event::Data`] once
+//! per readable query stream. This helper collects the events ready after a
+//! packet or timeout:
 //!
 //! ```
 //! use quiche::doq;
@@ -130,10 +132,32 @@
 //! }
 //! ```
 //!
-//! On the client, process each [`Event::Response`] for its query. Continue
-//! reading until [`Event::Finished`] ends that response stream. One query can
-//! receive several responses. The application decides whether that response
-//! sequence is valid for the DNS transaction.
+//! On the client, call [`Connection::recv_response`] for the stream of each
+//! [`Event::Data`]. It returns one [`ClientRead`] item per call. Call it
+//! until it returns [`Error::Done`], which re-arms [`Event::Data`] for that
+//! stream. [`ClientRead::Finished`] ends the response stream.
+//! [`ClientRead::Reset`] reports a peer reset. One query can receive several
+//! responses. The application decides whether that response sequence is valid
+//! for the DNS transaction. Stop calling it to apply backpressure. The
+//! unread bytes stay in QUIC under flow control:
+//!
+//! ```
+//! use quiche::doq;
+//!
+//! fn read_stream(
+//!     connection: &mut doq::Connection, transport: &mut quiche::Connection,
+//!     stream_id: u64,
+//! ) -> doq::Result<Vec<doq::ClientRead>> {
+//!     let mut items = Vec::new();
+//!     loop {
+//!         match connection.recv_response(transport, stream_id) {
+//!             Ok(item) => items.push(item),
+//!             Err(doq::Error::Done) => return Ok(items),
+//!             Err(error) => return Err(error),
+//!         }
+//!     }
+//! }
+//! ```
 //!
 //! # Answer a query on the server
 //!
@@ -170,7 +194,7 @@
 //! 2. Poll DoQ until [`Error::Done`] and process the returned events.
 //! 3. Check [`crate::Connection::writable`]. For each tracked client query
 //!    stream reported writable, call [`Connection::flush_query`] even if
-//!    [`Connection::query_pending`] is false. This also checks for a peer stop
+//!    [`Connection::send_pending`] is false. This also checks for a peer stop
 //!    after the query buffer drains. On the server, call
 //!    [`Connection::flush_response`] for writable streams with buffered
 //!    responses.
@@ -185,8 +209,8 @@
 //! the data. A successful final response can also leave buffered bytes;
 //! continue flushing until they drain.
 //!
-//! Before producing another message, check [`Connection::query_pending`] or
-//! [`Connection::response_pending`] to limit data still buffered in DoQ.
+//! Before producing another message, check [`Connection::send_pending`] to
+//! limit data still buffered in DoQ.
 //! Stop tracking a query when it finishes or is cancelled. Keep the connection
 //! pair for other active queries and for later queries.
 //!
@@ -194,8 +218,9 @@
 //!
 //! If a client no longer needs a response, call [`Connection::cancel_query`].
 //! To abandon a tracked transaction, call [`Connection::reset_stream`].
-//! [`Event::Reset`] carries the peer's raw error code; application code decides
-//! how to report it. A server observes peer stops through response writes or
+//! [`Event::Reset`] on a server and [`ClientRead::Reset`] on a client carry
+//! the peer's raw error code; application code decides how to report it. A
+//! server observes peer stops through response writes or
 //! flushes. The transport can suppress a reset after the complete query and
 //! FIN have been read. See [`Connection::flush_response`] and [`Event::Reset`]
 //! for these visibility limits.
@@ -224,6 +249,7 @@ use std::io::Write;
 
 mod connection;
 
+pub use connection::ClientRead;
 pub use connection::Connection;
 pub use connection::Error;
 pub use connection::Event;
@@ -327,12 +353,15 @@ pub enum DnsWireError {
 impl fmt::Display for DnsWireError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            DnsWireError::LenDataIncomplete =>
-                write!(f, "length is less than 2 bytes"),
-            DnsWireError::DnsMessageIncomplete =>
-                write!(f, "DNS message is less than specified length"),
-            DnsWireError::DnsMessageTooLarge =>
-                write!(f, "DNS message is too large (max 65535 bytes)"),
+            DnsWireError::LenDataIncomplete => {
+                write!(f, "length is less than 2 bytes")
+            },
+            DnsWireError::DnsMessageIncomplete => {
+                write!(f, "DNS message is less than specified length")
+            },
+            DnsWireError::DnsMessageTooLarge => {
+                write!(f, "DNS message is too large (max 65535 bytes)")
+            },
             DnsWireError::IoError(e) => write!(f, "IO error: {e}"),
         }
     }

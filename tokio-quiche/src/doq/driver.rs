@@ -274,21 +274,22 @@ impl DoqServerDriver {
             },
 
             // Only resets exposed by the transport reach this path. A reset
-            // after the complete query and FIN have been read can be suppressed.
-            // Close any tracked receiver before queuing the peer code.
+            // after the complete query and FIN have been read can be
+            // suppressed. Close any tracked receiver before queuing the peer
+            // code.
             doq::Event::Reset(code) => {
                 self.cancel_responder(stream_id);
                 permit.send(DoqEvent::PeerReset { stream_id, code });
                 Ok(())
             },
 
-            // `Connection`'s server role never emits these; they're
-            // client-role-only (see `quiche::doq::Event`'s docs). Guarded
-            // here instead of matched away so a future change to that
-            // invariant fails loudly instead of silently dropping events.
-            doq::Event::Response { .. } | doq::Event::Finished => unreachable!(
+            // `Connection`'s server role emits only `Query` and `Reset`.
+            // Guarded here instead of matched away so a future change to
+            // that invariant fails loudly instead of silently dropping
+            // events.
+            other => unreachable!(
                 "a server-role quiche::doq::Connection only emits Query \
-                     and Reset events"
+                     and Reset events, got {other:?}"
             ),
         }
     }
@@ -450,7 +451,7 @@ impl DoqServerDriver {
         &mut self, stream_id: u64, rx: mpsc::Receiver<ResponderMessage>,
         fin: bool,
     ) -> QuicResult<()> {
-        if self.conn_mut()?.response_pending(stream_id) {
+        if self.conn_mut()?.send_pending(stream_id) {
             let Some(state) = self.streams.get_mut(&stream_id) else {
                 return Err(DoqConnectionError::UnknownStream.into());
             };
@@ -966,7 +967,7 @@ mod tests {
             .unwrap()
             .send_response(&mut helper.pipe.server, id, &vec![b'x'; 20_000], true)
             .unwrap();
-        assert!(helper.driver.conn_mut().unwrap().response_pending(id));
+        assert!(helper.driver.conn_mut().unwrap().send_pending(id));
         // Remove driver tracking while the core still has buffered bytes.
         // Updating this stream must return the boxed UnknownStream variant.
         helper.driver.streams.remove(&id);
@@ -1232,7 +1233,7 @@ mod tests {
             .unwrap();
         // Keep the buffered bytes and responder until a stop event can be sent.
         assert!(parked.closed().now_or_never().is_none());
-        assert!(helper.driver.conn_mut().unwrap().response_pending(id));
+        assert!(helper.driver.conn_mut().unwrap().send_pending(id));
         // Free one slot so the flush can detect and report the peer stop.
         helper.try_recv_event().unwrap();
         helper
@@ -1283,15 +1284,10 @@ mod tests {
         // stream state.
         helper.pipe.advance().unwrap();
         assert_eq!(
-            helper.peer.poll(&mut helper.pipe.client),
-            Ok((id, doq::Event::Response {
-                data: b"response".to_vec()
-            }))
+            helper.peer_next(),
+            Ok((id, doq::ClientRead::Response(b"response".to_vec())))
         );
-        assert_eq!(
-            helper.peer.poll(&mut helper.pipe.client),
-            Ok((id, doq::Event::Finished))
-        );
+        assert_eq!(helper.peer_next(), Ok((id, doq::ClientRead::Finished)));
         assert!(responder.closed().now_or_never().is_some());
         assert!(helper.pipe.server.local_error().is_none());
     }
@@ -1384,20 +1380,14 @@ mod tests {
         waiting.send(Bytes::from_static(b"ok"), true).await.unwrap();
         helper.advance_and_run_loop().unwrap();
         assert_eq!(
-            helper.peer.poll(&mut helper.pipe.client),
-            Ok((waiting_id, doq::Event::Response {
-                data: b"ok".to_vec()
-            }))
+            helper.peer_next(),
+            Ok((waiting_id, doq::ClientRead::Response(b"ok".to_vec())))
         );
         assert_eq!(
-            helper.peer.poll(&mut helper.pipe.client),
-            Ok((waiting_id, doq::Event::Finished))
+            helper.peer_next(),
+            Ok((waiting_id, doq::ClientRead::Finished))
         );
-        assert!(helper
-            .driver
-            .conn_mut()
-            .unwrap()
-            .response_pending(parked_id));
+        assert!(helper.driver.conn_mut().unwrap().send_pending(parked_id));
         assert!(parked.closed().now_or_never().is_none());
     }
 

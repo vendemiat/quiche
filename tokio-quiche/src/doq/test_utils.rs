@@ -27,6 +27,7 @@
 //! Test-only helpers for the DoQ driver's unit tests, mirroring
 //! `http3::driver::test_utils`'s `DriverTestHelper`.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -71,6 +72,9 @@ pub struct DoqDriverTestHelper {
     pub driver: DoqServerDriver,
     pub controller: DoqController,
     pub peer: doq::Connection,
+    /// Peer streams that `peer.poll` reported and `peer_next` has not read to
+    /// `Done`.
+    peer_ready: VecDeque<u64>,
 }
 
 impl DoqDriverTestHelper {
@@ -107,6 +111,7 @@ impl DoqDriverTestHelper {
             driver,
             controller,
             peer,
+            peer_ready: VecDeque::new(),
         })
     }
 
@@ -159,6 +164,42 @@ impl DoqDriverTestHelper {
     /// [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
     pub fn peer_send_query(&mut self, data: &[u8]) -> anyhow::Result<u64> {
         Ok(self.peer.send_query(&mut self.pipe.client, data)?)
+    }
+
+    /// Returns the next item the client-role peer reads, as a stream ID and
+    /// a `ClientRead`. The peer polls for readiness, then reads one stream
+    /// with `recv_response`. Returns `Err(Done)` when no stream has an item.
+    pub fn peer_next(&mut self) -> doq::Result<(u64, doq::ClientRead)> {
+        loop {
+            let Some(&stream_id) = self.peer_ready.front() else {
+                match self.peer.poll(&mut self.pipe.client)? {
+                    (stream_id, doq::Event::Data) =>
+                        self.peer_ready.push_back(stream_id),
+                    (_, event) => panic!("unexpected peer event: {event:?}"),
+                }
+
+                continue;
+            };
+
+            match self.peer.recv_response(&mut self.pipe.client, stream_id) {
+                Ok(item) => {
+                    if matches!(
+                        item,
+                        doq::ClientRead::Finished | doq::ClientRead::Reset(_)
+                    ) {
+                        self.peer_ready.pop_front();
+                    }
+
+                    return Ok((stream_id, item));
+                },
+
+                Err(doq::Error::Done) => {
+                    self.peer_ready.pop_front();
+                },
+
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Returns an explicit client-initiated bidirectional stream ID for tests

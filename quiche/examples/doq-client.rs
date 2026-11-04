@@ -34,26 +34,23 @@ extern crate log;
 
 use ring::rand::*;
 
-use std::collections::HashMap;
+use std::time::Instant;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 use quiche::doq::*;
 
 use core::str::FromStr;
+use domain::base::iana::Rcode;
 use domain::base::iana::Rtype;
+use domain::base::zonefile_fmt::DisplayKind;
+use domain::base::zonefile_fmt::ZonefileFmt;
 use domain::base::Message;
+use domain::rdata::AllRecordData;
 
 mod doq_common;
 use doq_common::build_dns_query;
 use doq_common::resolve_server;
-
-struct PendingQuery {
-    domain: String,
-    qtype: Rtype,
-    start_time: std::time::Instant,
-    response_received: bool,
-}
 
 fn main() {
     env_logger::builder().format_timestamp_nanos().init();
@@ -175,9 +172,29 @@ fn main() {
     }
     debug!("written {}", write);
 
-    let mut queries_sent = false;
-    let mut pending_queries = HashMap::new();
-    let query_start = std::time::Instant::now();
+    // The time the single DNS query was sent, or `None` before it is sent.
+    let mut sent_at: Option<Instant> = None;
+    let mut response_received = false;
+    let query_start = Instant::now();
+
+    // Only a zone transfer query accepts more than one response.
+    //
+    // [RFC 9250, Section 4.2]: "DNS query/response traffic [RFC1034]
+    // [RFC1035] follows a simple pattern in which the client sends a query,
+    // and the server provides one or more responses (multiple responses can
+    // occur in zone transfers)."
+    //
+    // [RFC 9250, Section 4.2]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.2
+    // [RFC1034]: https://datatracker.ietf.org/doc/html/rfc1034
+    // [RFC1035]: https://datatracker.ietf.org/doc/html/rfc1035
+    let multi_response = qtype == Rtype::AXFR || qtype == Rtype::IXFR;
+
+    // A zone transfer is printed as one listing: the answer records of each
+    // NOERROR message, then one summary when the stream finishes.
+    let mut xfr_messages = 0;
+    let mut xfr_records = 0;
+    let mut xfr_bytes = 0;
+    let mut xfr_failed = false;
 
     loop {
         poll.poll(&mut events, conn.timeout()).unwrap();
@@ -223,14 +240,14 @@ fn main() {
 
         if conn.is_closed() {
             info!("connection closed, {:?}", conn.stats());
-            if !queries_sent {
+            if sent_at.is_none() {
                 eprintln!("Connection closed before sending query");
             }
             break;
         }
 
         // Send DNS query once connected.
-        if conn.is_established() && !queries_sent {
+        if conn.is_established() && sent_at.is_none() {
             info!("Connection established, sending DNS query");
 
             // Build the DNS query.
@@ -245,13 +262,7 @@ fn main() {
             match doq_conn.send_query(&mut conn, &query) {
                 Ok(stream_id) => {
                     info!("Sent DNS query on stream {}", stream_id);
-                    pending_queries.insert(stream_id, PendingQuery {
-                        domain: domain.clone(),
-                        qtype,
-                        start_time: std::time::Instant::now(),
-                        response_received: false,
-                    });
-                    queries_sent = true;
+                    sent_at = Some(Instant::now());
                 },
                 Err(e) => {
                     error!("Failed to send query: {:?}", e);
@@ -260,61 +271,88 @@ fn main() {
             }
         }
 
-        // Process DoQ responses. `Connection` owns stream reassembly and
-        // framing, returning one event per complete DNS message.
-        loop {
-            match doq_conn.poll(&mut conn) {
-                Ok((stream_id, Event::Response { data })) => {
-                    let Some(query_info) = pending_queries.get_mut(&stream_id)
-                    else {
-                        continue;
-                    };
-                    if query_info.response_received {
-                        error!(
-                            "Received more than one DNS response on stream {}",
-                            stream_id
-                        );
-                        conn.close(
-                            true,
-                            DoqError::ProtocolError.to_wire(),
-                            b"multiple responses",
-                        )
-                        .ok();
-                        break;
-                    }
-                    query_info.response_received = true;
-                    let elapsed = query_info.start_time.elapsed();
-
-                    debug!(
-                        "Received response on stream {} in {:?}",
-                        stream_id, elapsed
-                    );
-
-                    // Parse the DNS response.
-                    match Message::from_octets(data) {
-                        Ok(msg) => {
-                            let id = msg.header().id();
-                            if id != 0 {
-                                warn!(
-                                    "Received DNS response with non-zero ID: {}",
-                                    id
-                                );
-                            }
-                            info!(
-                                "\nDNS Response for {} {}:",
-                                query_info.domain, query_info.qtype
-                            );
-                            println!("{}", msg.display_dig_style());
-                        },
-                        Err(e) => {
-                            error!("Failed to parse DNS message: {}", e);
-                        },
-                    }
-
-                    println!(";; Response time: {:?}", elapsed);
+        // Process DoQ responses. `poll` reports the readable query stream.
+        // `recv_response` owns stream reassembly and framing, returning one
+        // item per complete DNS message.
+        'doq: loop {
+            let stream_id = match doq_conn.poll(&mut conn) {
+                Ok((stream_id, Event::Data)) => stream_id,
+                Ok(_) => unreachable!("client received unexpected event"),
+                Err(Error::Done) => break,
+                Err(Error::ProtocolError) => {
+                    error!("DoQ protocol error; connection close is pending");
+                    break;
                 },
-                Ok((stream_id, Event::Reset(code))) => {
-                    if pending_queries.remove(&stream_id).is_some() {
+                Err(e) => {
+                    error!("DoQ response processing failed: {:?}", e);
+                    break;
+                },
+            };
+
+            // Read until `recv_response` returns `Done`, `Finished`, or
+            // `Reset`. `poll` reports the stream again only after `Done`.
+            loop {
+                match doq_conn.recv_response(&mut conn, stream_id) {
+                    Ok(ClientRead::Response(data)) => {
+                        if response_received && !multi_response {
+                            error!(
+                                "Received more than one DNS response on stream {}",
+                                stream_id
+                            );
+                            conn.close(
+                                true,
+                                DoqError::ProtocolError.to_wire(),
+                                b"multiple responses",
+                            )
+                            .ok();
+                            break 'doq;
+                        }
+                        response_received = true;
+                        let elapsed = sent_at
+                            .expect("a response arrives only after the query")
+                            .elapsed();
+
+                        debug!(
+                            "Received response on stream {} in {:?}",
+                            stream_id, elapsed
+                        );
+
+                        // Parse the DNS response.
+                        let len = data.len();
+                        match Message::from_octets(data) {
+                            Ok(msg) => {
+                                let id = msg.header().id();
+                                if id != 0 {
+                                    warn!(
+                                        "Received DNS response with non-zero ID: {}",
+                                        id
+                                    );
+                                }
+                                if multi_response &&
+                                    msg.header().rcode() == Rcode::NOERROR
+                                {
+                                    xfr_records += print_answer_records(&msg);
+                                    xfr_messages += 1;
+                                    xfr_bytes += len;
+                                    continue;
+                                }
+                                if multi_response {
+                                    xfr_failed = true;
+                                }
+                                info!("\nDNS Response for {} {}:", domain, qtype);
+                                println!("{}", msg.display_dig_style());
+                            },
+                            Err(e) => {
+                                error!("Failed to parse DNS message: {}", e);
+                                if multi_response {
+                                    xfr_failed = true;
+                                }
+                            },
+                        }
+
+                        println!(";; Response time: {:?}", elapsed);
+                    },
+                    Ok(ClientRead::Reset(code)) => {
                         error!(
                             "DNS query stream {} was reset: {}",
                             stream_id, code
@@ -325,53 +363,63 @@ fn main() {
                             b"query reset",
                         )
                         .ok();
-                    }
-                },
-                Ok((stream_id, Event::Finished)) => {
-                    let Some(query_info) = pending_queries.remove(&stream_id)
-                    else {
-                        continue;
-                    };
-                    if !query_info.response_received {
-                        error!(
-                            "DNS query stream {} finished without a response",
+                        break 'doq;
+                    },
+                    Ok(ClientRead::Finished) => {
+                        if multi_response && xfr_messages > 0 {
+                            if xfr_failed {
+                                println!("; Transfer failed.");
+                            } else {
+                                let elapsed = sent_at
+                                    .expect(
+                                        "a response arrives only after the query",
+                                    )
+                                    .elapsed();
+                                println!(";; Query time: {:?}", elapsed);
+                                println!(
+                                    ";; XFR size: {} records (messages {}, bytes {})",
+                                    xfr_records, xfr_messages, xfr_bytes
+                                );
+                            }
+                        }
+                        info!(
+                            "DNS response stream {} finished, closing connection",
                             stream_id
                         );
+                        conn.close(true, DoqError::NoError.to_wire(), b"done")
+                            .ok();
+                        break 'doq;
+                    },
+                    Ok(_) => unreachable!("client received unexpected item"),
+                    Err(Error::Done) => break,
+                    Err(Error::ProtocolError) => {
+                        error!("DoQ protocol error; connection close is pending");
+                        break 'doq;
+                    },
+                    Err(e) => {
+                        // `poll` does not report the stream again after this
+                        // error, so close the connection.
+                        error!("DoQ response processing failed: {:?}", e);
                         conn.close(
                             true,
-                            DoqError::ProtocolError.to_wire(),
-                            b"missing response",
+                            DoqError::InternalError.to_wire(),
+                            b"response read failed",
                         )
                         .ok();
-                        break;
-                    }
-                    info!(
-                        "DNS response stream {} finished, closing connection",
-                        stream_id
-                    );
-                    conn.close(true, DoqError::NoError.to_wire(), b"done").ok();
-                },
-                Ok((_, Event::Query { .. })) =>
-                    unreachable!("client received query"),
-                Err(Error::Done) => break,
-                Err(Error::ProtocolError) => {
-                    error!("DoQ protocol error; connection close is pending");
-                    break;
-                },
-                Err(e) => {
-                    error!("DoQ response processing failed: {:?}", e);
-                    break;
-                },
+                        break 'doq;
+                    },
+                }
             }
         }
 
         // Probe every writable stream. A tracked query must be flushed even
         // after its bytes drain, because this detects a later STOP_SENDING.
         for stream_id in conn.writable() {
-            let pending = doq_conn.query_pending(stream_id);
+            let pending = doq_conn.send_pending(stream_id);
             match doq_conn.flush_query(&mut conn, stream_id) {
-                Ok(()) if pending =>
-                    debug!("Flushed pending query on stream {}", stream_id),
+                Ok(()) if pending => {
+                    debug!("Flushed pending query on stream {}", stream_id)
+                },
                 Ok(()) => {},
                 Err(Error::UnknownStream) => {},
                 Err(Error::ProtocolError) => {
@@ -424,7 +472,31 @@ fn main() {
         }
     }
 
-    if !queries_sent {
+    if sent_at.is_none() {
         eprintln!("Failed to establish connection or send query");
     }
+}
+
+/// Prints the answer records of one zone transfer message in zone file
+/// format and returns the number of records printed. Stops at the first
+/// record that does not parse.
+fn print_answer_records(msg: &Message<Vec<u8>>) -> usize {
+    let Ok(answer) = msg.answer() else {
+        println!("; <invalid message>");
+        return 0;
+    };
+
+    let mut count = 0;
+    for record in answer {
+        let Ok(record) =
+            record.and_then(|r| r.into_any_record::<AllRecordData<_, _>>())
+        else {
+            println!("; <invalid message>");
+            break;
+        };
+        println!("{}", record.display_zonefile(DisplayKind::Simple));
+        count += 1;
+    }
+
+    count
 }

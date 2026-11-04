@@ -74,19 +74,14 @@ async fn query_event_and_response_roundtrip() {
     helper.advance_and_run_loop().unwrap();
 
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Response {
-            data: b"world".to_vec()
-        }))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Response(b"world".to_vec())))
     );
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Finished))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Finished))
     );
-    assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Err(doq::Error::Done)
-    );
+    assert_eq!(helper.peer_next(), Err(doq::Error::Done));
 }
 
 #[tokio::test]
@@ -136,19 +131,14 @@ async fn zero_rtt_query_event_and_response_roundtrip() {
     helper.advance_and_run_loop().unwrap();
 
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Response {
-            data: b"response".to_vec()
-        }))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Response(b"response".to_vec())))
     );
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Finished))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Finished))
     );
-    assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Err(doq::Error::Done)
-    );
+    assert_eq!(helper.peer_next(), Err(doq::Error::Done));
     assert!(responder.closed().now_or_never().is_some());
 }
 
@@ -171,15 +161,13 @@ async fn multi_response_zone_transfer() {
 
     for chunk in [&b"r1"[..], &b"r2"[..], &b"r3"[..]] {
         assert_eq!(
-            helper.peer.poll(&mut helper.pipe.client),
-            Ok((stream_id, doq::Event::Response {
-                data: chunk.to_vec()
-            }))
+            helper.peer_next(),
+            Ok((stream_id, doq::ClientRead::Response(chunk.to_vec())))
         );
     }
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Finished))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Finished))
     );
 }
 
@@ -243,14 +231,12 @@ async fn concurrent_out_of_order_responses() {
     helper.advance_and_run_loop().unwrap();
 
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_q2, doq::Event::Response {
-            data: b"resp-q2".to_vec()
-        }))
+        helper.peer_next(),
+        Ok((stream_q2, doq::ClientRead::Response(b"resp-q2".to_vec())))
     );
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_q2, doq::Event::Finished))
+        helper.peer_next(),
+        Ok((stream_q2, doq::ClientRead::Finished))
     );
 
     responder_q1
@@ -260,14 +246,12 @@ async fn concurrent_out_of_order_responses() {
     helper.advance_and_run_loop().unwrap();
 
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_q1, doq::Event::Response {
-            data: b"resp-q1".to_vec()
-        }))
+        helper.peer_next(),
+        Ok((stream_q1, doq::ClientRead::Response(b"resp-q1".to_vec())))
     );
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_q1, doq::Event::Finished))
+        helper.peer_next(),
+        Ok((stream_q1, doq::ClientRead::Finished))
     );
 }
 
@@ -336,9 +320,10 @@ async fn client_reset_before_query_completes_is_noop() {
     // RESET_STREAM; the raw client-role peer connection observes it here.
     //
     // [RFC 9250, Section 4.3.1]: https://datatracker.ietf.org/doc/html/rfc9250#section-4.3.1
+    let mut buf = [0; 16];
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((abandoned, doq::Event::Reset(42)))
+        helper.pipe.client.stream_recv(abandoned, &mut buf),
+        Err(quiche::Error::StreamReset(42))
     );
 
     assert!(matches!(
@@ -364,10 +349,8 @@ async fn client_reset_before_query_completes_is_noop() {
         .unwrap();
     helper.advance_and_run_loop().unwrap();
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Response {
-            data: b"ok".to_vec()
-        }))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Response(b"ok".to_vec())))
     );
 }
 
@@ -474,9 +457,10 @@ async fn peer_reset_preserves_codes_once() {
             helper.try_recv_event(),
             Ok(super::DoqEvent::HandshakeConfirmed)
         ));
+        let mut buf = [0; 16];
         assert_eq!(
-            helper.peer.poll(&mut helper.pipe.client),
-            Ok((0, doq::Event::Reset(code)))
+            helper.pipe.client.stream_recv(0, &mut buf),
+            Err(quiche::Error::StreamReset(code))
         );
         helper.advance_and_run_loop().unwrap();
         assert!(matches!(helper.try_recv_event(), Err(TryRecvError::Empty)));
@@ -512,14 +496,12 @@ async fn reset_after_complete_query_fin_is_not_observed() {
         .unwrap();
     helper.advance_and_run_loop().unwrap();
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Response {
-            data: b"resp".to_vec()
-        }))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Response(b"resp".to_vec())))
     );
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
-        Ok((stream_id, doq::Event::Finished))
+        helper.peer_next(),
+        Ok((stream_id, doq::ClientRead::Finished))
     );
     assert!(responder.closed().now_or_never().is_some());
 }
@@ -584,10 +566,10 @@ async fn message_too_large_resets_stream() {
     // The driver maps `MessageTooLarge` to a stream reset with the wire
     // error `DoqError::InternalError`, which the peer observes here.
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
+        helper.peer_next(),
         Ok((
             stream_id,
-            doq::Event::Reset(DoqError::InternalError.to_wire())
+            doq::ClientRead::Reset(DoqError::InternalError.to_wire())
         ))
     );
     assert!(responder.closed().now_or_never().is_some());
@@ -711,8 +693,8 @@ async fn partial_write_parks_and_flushes_on_writable() {
         helper.advance_and_run_loop().unwrap();
 
         loop {
-            match helper.peer.poll(&mut helper.pipe.client) {
-                Ok((id, doq::Event::Response { data })) => {
+            match helper.peer_next() {
+                Ok((id, doq::ClientRead::Response(data))) => {
                     assert_eq!(id, stream_id);
                     assert!(
                         got_response.is_none(),
@@ -720,7 +702,7 @@ async fn partial_write_parks_and_flushes_on_writable() {
                     );
                     got_response = Some(data);
                 },
-                Ok((id, doq::Event::Finished)) => {
+                Ok((id, doq::ClientRead::Finished)) => {
                     assert_eq!(id, stream_id);
                     // Finished is emitted once, after all response bytes drain.
                     got_finished = true;
@@ -753,10 +735,10 @@ async fn responder_reset_sends_reset_stream() {
     helper.advance_and_run_loop().unwrap();
 
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
+        helper.peer_next(),
         Ok((
             stream_id,
-            doq::Event::Reset(DoqError::RequestCancelled.to_wire())
+            doq::ClientRead::Reset(DoqError::RequestCancelled.to_wire())
         ))
     );
     assert!(responder.closed().now_or_never().is_some());
@@ -777,10 +759,10 @@ async fn dropped_responder_without_final_call_resets_stream() {
     helper.advance_and_run_loop().unwrap();
 
     assert_eq!(
-        helper.peer.poll(&mut helper.pipe.client),
+        helper.peer_next(),
         Ok((
             stream_id,
-            doq::Event::Reset(DoqError::InternalError.to_wire())
+            doq::ClientRead::Reset(DoqError::InternalError.to_wire())
         ))
     );
 }
